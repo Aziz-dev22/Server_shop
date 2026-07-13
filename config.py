@@ -12,7 +12,7 @@ class Config:
     BACKUP_DIR = os.getenv("BACKUP_DIR", "backups")
     
     SECRET_KEY = os.getenv("SECRET_KEY", "super-secret-dev-key")
-    PANEL_PORT = int(os.getenv("PANEL_PORT", 5000))
+    PANEL_PORT = int(os.getenv("PANEL_PORT", 1085))
     PANEL_ADMIN_USER = os.getenv("PANEL_ADMIN_USER", "admin")
     PANEL_ADMIN_PASS = os.getenv("PANEL_ADMIN_PASS")
 
@@ -25,4 +25,3 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("ServerShop")
-
