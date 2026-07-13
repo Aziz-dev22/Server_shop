@@ -1,24 +1,36 @@
 import threading
-from config import Config, logger
+import time
 from database import init_db
-from scheduler import start_scheduler
 from bot import bot
 from web_panel import app
+from config import logger
 
-def run_web():
-    logger.info(f"Starting Web Panel on port {Config.PANEL_PORT}...")
-    app.run(host='0.0.0.0', port=Config.PANEL_PORT, use_reloader=False, debug=False)
+def run_web_panel():
+    """اجرای پنل وب روی پورت مشخص شده در تنظیمات"""
+    try:
+        logger.info(f"Starting Web Panel on port {app.config.get('PORT', 5000)}...")
+        app.run(host='0.0.0.0', port=1085, debug=False, use_reloader=False)
+    except Exception as e:
+        logger.error(f"Web Panel failed to start: {e}")
+
+def run_telegram_bot():
+    """اجرای ربات تلگرام"""
+    try:
+        logger.info("Starting Telegram Bot...")
+        bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    except Exception as e:
+        logger.error(f"Bot failed to start: {e}")
+        time.sleep(5)
+        run_telegram_bot() # تلاش مجدد در صورت خطا
 
 if __name__ == "__main__":
-    logger.info("Initializing Server Shop Production Environment...")
+    # 1. مقداردهی اولیه دیتابیس
     init_db()
-    
-    start_scheduler()
-    logger.info("Scheduler Started.")
+    logger.info("Database initialized.")
 
-    # اجرای پنل وب در ترد پس‌زمینه
-    threading.Thread(target=run_web, daemon=True).start()
-    
-    # اجرای ربات در ترد اصلی (که باعث می‌شود پردازش ترمینال را زنده نگه دارد)
-    logger.info("Starting Telegram Bot...")
-    bot.infinity_polling()
+    # 2. اجرای پنل وب در یک ترد (Thread) جداگانه
+    web_thread = threading.Thread(target=run_web_panel, daemon=True)
+    web_thread.start()
+
+    # 3. اجرای ربات تلگرام در ترد اصلی
+    run_telegram_bot()
