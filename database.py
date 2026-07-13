@@ -1,34 +1,25 @@
-import os
-import shutil
+import os, shutil
 from datetime import datetime, timezone
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Index
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship, scoped_session
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Boolean
+from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
 from werkzeug.security import generate_password_hash
-from config import Config, logger
+from config import Config
 
-engine = create_engine(Config.DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in Config.DATABASE_URL else {})
-db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
-
+engine = create_engine(Config.DATABASE_URL, connect_args={"check_same_thread": False})
+db_session = scoped_session(sessionmaker(bind=engine))
 Base = declarative_base()
-Base.query = db_session.query_property()
-
-class Admin(Base):
-    __tablename__ = 'admins'
-    id = Column(Integer, primary_key=True)
-    username = Column(String(50), unique=True, nullable=False)
-    password_hash = Column(String(255), nullable=False)
 
 class User(Base):
     __tablename__ = 'users'
     id = Column(Integer, primary_key=True)
-    username = Column(String(100), nullable=True)
+    username = Column(String(100))
     wallet = relationship("Wallet", uselist=False, back_populates="user")
     servers = relationship("Server", back_populates="user")
 
 class Wallet(Base):
     __tablename__ = 'wallets'
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('users.id'), unique=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
     balance = Column(Float, default=0.0)
     user = relationship("User", back_populates="wallet")
     transactions = relationship("WalletTransaction", back_populates="wallet")
@@ -38,10 +29,33 @@ class WalletTransaction(Base):
     id = Column(Integer, primary_key=True)
     wallet_id = Column(Integer, ForeignKey('wallets.id'))
     amount = Column(Float, nullable=False)
-    tx_type = Column(String(20), nullable=False)
     description = Column(String(255))
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     wallet = relationship("Wallet", back_populates="transactions")
+
+class Server(Base):
+    __tablename__ = 'servers'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    hetzner_account_id = Column(Integer, ForeignKey('hetzner_accounts.id'))
+    ip_address = Column(String(50))
+    status = Column(String(20))
+    name = Column(String(100))
+    user = relationship("User", back_populates="servers")
+
+class HetznerAccount(Base):
+    __tablename__ = 'hetzner_accounts'
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100))
+    api_token = Column(String(255))
+    is_active = Column(Boolean, default=True)
+
+class Plan(Base):
+    __tablename__ = 'plans'
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100))
+    server_type = Column(String(50))
+    final_price = Column(Float)
 
 class Setting(Base):
     __tablename__ = 'settings'
@@ -49,35 +63,5 @@ class Setting(Base):
     key = Column(String(50), unique=True)
     value = Column(String(1000))
 
-class HetznerAccount(Base):
-    __tablename__ = 'hetzner_accounts'
-    id = Column(Integer, primary_key=True)
-    name = Column(String(100), nullable=False)
-    api_token = Column(String(255), nullable=False)
-    is_active = Column(Boolean, default=True)
-
-class Plan(Base):
-    __tablename__ = 'plans'
-    id = Column(Integer, primary_key=True)
-    name = Column(String(100), nullable=False)
-    server_type = Column(String(50), nullable=False)
-    base_price = Column(Float, nullable=False)
-    final_price = Column(Float, nullable=False)
-    is_available = Column(Boolean, default=True)
-
-class Server(Base):
-    __tablename__ = 'servers'
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('users.id'))
-    ip_address = Column(String(50))
-    status = Column(String(20), default="running")
-    expires_at = Column(DateTime, nullable=False)
-    user = relationship("User", back_populates="servers")
-
 def init_db():
     Base.metadata.create_all(bind=engine)
-    if not Admin.query.filter_by(username=Config.PANEL_ADMIN_USER).first():
-        hashed_pass = generate_password_hash(Config.PANEL_ADMIN_PASS)
-        db_session.add(Admin(username=Config.PANEL_ADMIN_USER, password_hash=hashed_pass))
-    db_session.commit()
-
