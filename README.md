@@ -53,7 +53,7 @@ python3 main.py
 ### نصب
 کد تک‌خطی زیر را کپی کرده و در ترمینال سرور لینوکسی خود (اوبونتو/دبیان) اجرا کنید:
 ```bash
-git clone [https://github.com/Aziz-dev22/server_shop.git](https://github.com/Aziz-dev22/server_shop.git) && cd server_shop && chmod +x install.sh && ./install.sh
+git clone https://github.com/Aziz-dev22/server_shop.git && cd server_shop && chmod +x install.sh && ./install.sh
 
 ```
 ### نحوه اجرا
