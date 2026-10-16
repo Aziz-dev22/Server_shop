@@ -21,6 +21,32 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# تشخیص یک نسخه پایتون سازگار (پایتون‌های خیلی جدید مثل ۳.۱۳/۳.۱۴ هنوز با
+# کتابخانه‌های این ربات مثل pydantic-core سازگار نیستند و باعث خطای کامپایل می‌شوند)
+# ---------------------------------------------------------------------------
+detect_python_bin() {
+  for candidate in python3.12 python3.11 python3.10; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      apt-get install -y "${candidate}-venv" >/dev/null 2>&1 || true
+      echo "$candidate"
+      return
+    fi
+  done
+  apt-get install -y python3.11 python3.11-venv >/dev/null 2>&1 || true
+  if ! command -v python3.11 >/dev/null 2>&1; then
+    apt-get install -y software-properties-common >/dev/null 2>&1 || true
+    add-apt-repository -y ppa:deadsnakes/ppa >/dev/null 2>&1 || true
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y python3.11 python3.11-venv >/dev/null 2>&1 || true
+  fi
+  if command -v python3.11 >/dev/null 2>&1; then
+    echo "python3.11"
+  else
+    echo "python3"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # عملیات: نصب
 # ---------------------------------------------------------------------------
 do_install() {
@@ -64,7 +90,9 @@ EOF
 
   echo
   echo "[4/5] ساخت محیط مجازی پایتون و نصب کتابخانه‌ها..."
-  python3 -m venv venv
+  PYTHON_BIN="$(detect_python_bin)"
+  echo "پایتون انتخاب‌شده: ${PYTHON_BIN}"
+  "$PYTHON_BIN" -m venv venv
   ./venv/bin/pip install --upgrade pip
   ./venv/bin/pip install -r requirements.txt
 
@@ -121,8 +149,22 @@ do_update() {
 
   echo "[3/4] بروزرسانی کتابخانه‌ها..."
   cd "$APP_DIR"
-  ./venv/bin/pip install --upgrade pip -q
-  ./venv/bin/pip install -r requirements.txt -q
+  if [ ! -f "venv/bin/pip" ]; then
+    echo "محیط مجازی قبلی ناقص/خراب بود؛ در حال بازسازی با یک نسخه پایتون سازگار..."
+    rm -rf venv
+    PYTHON_BIN="$(detect_python_bin)"
+    echo "پایتون انتخاب‌شده: ${PYTHON_BIN}"
+    "$PYTHON_BIN" -m venv venv
+  fi
+  if ! ./venv/bin/pip install --upgrade pip -q || ! ./venv/bin/pip install -r requirements.txt -q; then
+    echo "نصب کتابخانه‌ها با پایتون فعلی venv ناموفق بود؛ تلاش مجدد با یک نسخه پایتون سازگار..."
+    rm -rf venv
+    PYTHON_BIN="$(detect_python_bin)"
+    echo "پایتون انتخاب‌شده: ${PYTHON_BIN}"
+    "$PYTHON_BIN" -m venv venv
+    ./venv/bin/pip install --upgrade pip -q
+    ./venv/bin/pip install -r requirements.txt -q
+  fi
 
   # اگر از نسخه قدیمی‌تر بدون پنل تحت وب آپدیت می‌کنید، تنظیمات پنل را اضافه کن
   if ! grep -q "^PANEL_USERNAME=" .env 2>/dev/null; then
