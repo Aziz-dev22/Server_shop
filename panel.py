@@ -14,6 +14,7 @@ import zipfile
 import sqlite3
 from fastapi import UploadFile, File
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from datetime import datetime, timedelta
 
 import aiosqlite
@@ -30,6 +31,7 @@ PANEL_PASSWORD = os.getenv("PANEL_PASSWORD", "")
 DB_PATH = core.DB_PATH
 
 app = FastAPI()
+app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="static")
 SESSIONS: dict[str, dict] = {}
 SESSION_TTL_HOURS = 12
 
@@ -275,6 +277,85 @@ BASE_CSS = """
   @media (max-width:390px) { .dashboard-hero { align-items:flex-start; } .hero-art { display:none; } }
 
 
+  /* Reference-matched neon dashboard skin; all routes and business logic stay unchanged */
+  .topbar-mini { display:flex;justify-content:space-between;align-items:center;gap:12px;margin:0 0 14px;padding:7px 2px;color:#a9caff;font-size:11px; }.topbar-date {display:flex;align-items:center;gap:8px;}.topbar-sep {color:#3964a3;}.live-dot {width:7px;height:7px;border-radius:50%;background:#00f0bf;box-shadow:0 0 10px #00f0bf;display:inline-block;animation:livePulse 2s infinite;}@keyframes livePulse{50%{opacity:.45;box-shadow:0 0 2px #00f0bf;}}
+
+  :root { --bg-1:#02091b; --bg-2:#06142e; --card:#071b3a; --card-2:#0b2550; --border:rgba(27,105,230,.48); --txt:#f4f7ff; --txt-dim:#a6c7f5; --accent:#5c36ff; --accent-2:#00c8ff; --accent-3:#65eaff; --green:#00f0c8; --red:#ff4f8b; --yellow:#ffbd24; --pink:#d42cff; }
+  body { background:radial-gradient(ellipse at 35% -10%,rgba(22,87,226,.28),transparent 45%),radial-gradient(ellipse at 100% 90%,rgba(139,20,255,.18),transparent 35%),linear-gradient(130deg,#010616,#03112a 55%,#020719); background-attachment:fixed; }
+  .bg-decor { opacity:.65; background-image:radial-gradient(rgba(46,143,255,.24) .8px,transparent .8px); background-size:26px 26px; mask-image:linear-gradient(to bottom,black,transparent 94%); }
+  .bg-decor::before { width:65vw;height:30vw;top:-14%;left:-15%;background:radial-gradient(ellipse,rgba(55,38,255,.24),transparent 70%);filter:blur(48px);animation:nebula 20s ease-in-out infinite; }
+  .bg-decor::after { width:50vw;height:40vw;top:50%;right:-15%;background:radial-gradient(ellipse,rgba(0,174,255,.14),transparent 70%);filter:blur(55px);animation:nebula 25s ease-in-out infinite reverse; }
+  .cloud3 { width:50vw;height:32vw;left:25%;top:80%;background:radial-gradient(ellipse,rgba(190,0,255,.14),transparent 70%);filter:blur(50px);animation:nebula 28s ease-in-out infinite; }
+  @keyframes nebula { 0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(4vw,-3vh) scale(1.12)} }
+  .wrap { direction:ltr; gap:0; }
+  .sidebar { direction:rtl; width:236px; padding:18px 14px; background:linear-gradient(180deg,rgba(2,11,31,.97),rgba(1,8,23,.96));border-left:1px solid rgba(0,150,255,.35);border-right:0;box-shadow:12px 0 42px rgba(0,0,0,.2); }
+  .brand { padding:7px 6px 22px; border-bottom:1px solid rgba(41,115,255,.2); margin-bottom:14px; }
+  .brand-icon { background:linear-gradient(135deg,#ae40ff,#234eff 60%,#00d9ff);border:1px solid rgba(70,205,255,.5);box-shadow:0 0 28px rgba(63,74,255,.6); }
+  .brand-title { text-transform:uppercase;letter-spacing:.5px;background:linear-gradient(90deg,#ff316f,#ff5277 48%,#fff);-webkit-background-clip:text;background-clip:text; }
+  nav { gap:5px; }
+  .nav-link { color:#d4e5ff;padding:11px 12px;border-radius:11px;font-size:13px;border:1px solid transparent;transition:all .22s ease; }
+  .nav-link::before { content:'›';color:#30baff;font-size:20px;margin-left:9px;line-height:12px; }
+  .nav-link:hover { background:linear-gradient(90deg,rgba(37,68,255,.28),rgba(0,192,255,.08));border-color:rgba(38,136,255,.3);transform:translateX(-2px); }
+  .nav-link.active { color:white;background:linear-gradient(100deg,rgba(44,55,255,.88),rgba(0,136,255,.5));border-color:rgba(70,151,255,.75);box-shadow:0 6px 24px rgba(26,72,255,.25),inset 0 0 0 1px rgba(255,255,255,.06); }
+  .nav-link.active::before { color:#fff; }
+  .logout { margin-top:12px;color:#ff7ca9; }
+  .content { direction:rtl;flex:1;min-width:0;max-width:none;padding:20px clamp(14px,1.8vw,28px) 32px; }
+  .content > h1 { border:0;margin:0 0 15px;padding:0;font-size:21px; }
+  .page-icon { background:linear-gradient(135deg,#3b55ff,#00bfff);box-shadow:0 0 22px rgba(0,153,255,.35); }
+  .card,.stat-box,.login-box { background:linear-gradient(145deg,rgba(3,24,56,.94),rgba(2,14,38,.96));border:1px solid rgba(0,113,255,.48);box-shadow:0 12px 28px rgba(0,0,0,.18),inset 0 1px 0 rgba(93,171,255,.08);backdrop-filter:blur(18px); }
+  .card { border-radius:16px;padding:19px;margin-bottom:16px; }
+  .stat-grid { display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:17px; }
+  .stat-box { min-width:0;min-height:126px;position:relative;overflow:hidden;border-radius:16px;padding:16px;display:flex;align-items:flex-start;gap:13px;transition:transform .25s,border-color .25s,box-shadow .25s; }
+  .stat-box::after { content:'';position:absolute;left:-30%;right:-30%;bottom:-38px;height:60px;border-top:1.5px solid var(--glow,#00d9ff);border-radius:50%;filter:drop-shadow(0 0 5px var(--glow,#00d9ff));opacity:.75;transform:rotate(-5deg); }
+  .stat-box:nth-child(1){--glow:#00ffcf;border-color:rgba(0,255,207,.65);background:linear-gradient(135deg,rgba(0,118,104,.28),rgba(1,23,49,.96));}
+  .stat-box:nth-child(2){--glow:#00c8ff;border-color:rgba(0,168,255,.7);background:linear-gradient(135deg,rgba(0,75,154,.3),rgba(1,23,49,.96));}
+  .stat-box:nth-child(3){--glow:#e12cff;border-color:rgba(206,44,255,.7);background:linear-gradient(135deg,rgba(101,19,147,.3),rgba(1,23,49,.96));}
+  .stat-box:nth-child(4){--glow:#ffc21e;border-color:rgba(255,183,0,.7);background:linear-gradient(135deg,rgba(143,91,0,.28),rgba(1,23,49,.96));}
+  .stat-box:nth-child(n+5) { display:none; }
+  .stat-box:hover { transform:translateY(-4px);box-shadow:0 15px 32px rgba(0,88,255,.16); }
+  .stat-box .stat-icon { flex:0 0 52px;width:52px;height:52px;border-radius:14px;display:grid;place-items:center;font-size:24px;border:1px solid currentColor;box-shadow:0 0 22px rgba(0,194,255,.2); }
+  .icon-purple { background:linear-gradient(135deg,rgba(177,31,255,.4),rgba(60,25,255,.5));color:#e4b5ff; }
+  .icon-blue { background:linear-gradient(135deg,rgba(0,196,255,.32),rgba(0,78,255,.55));color:#6be9ff; }
+  .icon-teal,.icon-green { background:linear-gradient(135deg,rgba(0,255,205,.26),rgba(0,133,119,.45));color:#5affdf; }
+  .icon-yellow { background:linear-gradient(135deg,rgba(255,188,30,.34),rgba(190,108,0,.48));color:#ffe18a; }
+  .icon-pink { background:linear-gradient(135deg,rgba(211,37,255,.35),rgba(104,20,255,.48));color:#f3a8ff; }
+  .stat-box .num { font-size:clamp(20px,1.7vw,28px);font-weight:800;color:#68eaff;line-height:1.45;overflow-wrap:anywhere; }
+  .stat-box:nth-child(3) .num { color:#f1a5ff; }.stat-box:nth-child(4) .num { color:#ffe09a;font-size:clamp(16px,1.4vw,23px); }
+  .stat-box .lbl { color:#b8d6ff;font-size:12px; }
+  .dashboard-hero { min-height:165px;margin:0 0 17px;padding:25px 28px;display:flex;align-items:center;position:relative;overflow:hidden;border:1px solid rgba(0,133,255,.65);border-radius:17px;background:linear-gradient(90deg,rgba(1,12,38,.22),rgba(2,10,34,.04) 48%,rgba(2,9,30,.05)),url('/static/dashboard-banner.jpg') center 48%/cover no-repeat;box-shadow:0 10px 30px rgba(0,25,92,.3),inset 0 0 35px rgba(0,18,74,.2); }
+  .dashboard-hero::before { content:'';position:absolute;inset:0;background:linear-gradient(90deg,rgba(1,8,29,.8),rgba(1,8,29,.48) 42%,transparent 100%);pointer-events:none; }
+  .hero-copy { position:relative;z-index:1;max-width:72%; }.hero-kicker { color:#7ceaff;font-size:10px;font-weight:800;letter-spacing:2px;text-shadow:0 0 12px #009dff; }
+  .hero-copy h2 { margin:9px 0 8px;font-size:clamp(20px,2vw,30px);line-height:1.6;color:#fff;text-shadow:0 2px 15px #00123c; }.hero-copy p { margin:0;color:#dcecff;font-size:13px;text-shadow:0 2px 10px #00123c; }
+  .hero-art { display:none; }
+  .dashboard-columns { display:grid;grid-template-columns:minmax(0,1.6fr) minmax(230px,.8fr) minmax(220px,.72fr);gap:15px;align-items:start; }
+  .dashboard-main,.dashboard-middle,.dashboard-side { min-width:0;display:flex;flex-direction:column;gap:15px; }
+  .dash-card-title { display:flex;align-items:center;justify-content:space-between;gap:10px;font-weight:800;font-size:14px;margin-bottom:16px;color:#f3f7ff; }
+  .dash-pill { font-size:10px;border-radius:20px;padding:4px 9px;color:#5bffe0;background:rgba(0,228,188,.1);border:1px solid rgba(0,228,188,.26);white-space:nowrap; }
+  .server-visual { height:170px;position:relative;display:flex;align-items:flex-end;justify-content:space-around;padding:15px 8px 0;border-bottom:1px solid rgba(0,151,255,.45);background:repeating-linear-gradient(to bottom,transparent 0,transparent 37px,rgba(36,113,255,.12) 38px);overflow:hidden; }
+  .server-visual::after { content:'';position:absolute;inset:10px 0 0;background:linear-gradient(180deg,rgba(0,206,255,.03),rgba(0,206,255,.08));clip-path:polygon(0 75%,12% 55%,25% 64%,39% 38%,52% 53%,66% 20%,80% 40%,100% 32%,100% 100%,0 100%);border-top:2px solid #00e9e0;filter:drop-shadow(0 0 8px #00d9ff); }
+  .server-bar { width:8%;max-width:38px;min-width:13px;z-index:1;border-radius:5px 5px 0 0;background:linear-gradient(180deg,#00f1da,#1476ff 90%);box-shadow:0 0 13px rgba(0,194,255,.35);animation:barPulse 5s ease-in-out infinite alternate; }
+  .server-bar:nth-child(even){background:linear-gradient(180deg,#dc2dff,#5b39ff);height:36%!important;animation-delay:-2s;}
+  @keyframes barPulse {from{filter:brightness(.75)}to{filter:brightness(1.25)}}
+  .legend-row { display:flex;gap:16px;flex-wrap:wrap;color:#c8ddff;font-size:11px;margin-top:12px; }.legend-dot { display:inline-block;width:8px;height:8px;border-radius:50%;margin-left:5px;background:#00efd0;box-shadow:0 0 8px currentColor; }.legend-dot.purple { background:#b52aff; }
+  .gauge-wrap { display:grid;place-items:center;padding:5px 0 12px; }.gauge { width:144px;height:144px;border-radius:50%;display:grid;place-items:center;position:relative;background:conic-gradient(#00f3d5 0 42%,#00c8ff 42% 65%,#583cff 65% 82%,rgba(19,69,135,.35) 82% 100%);box-shadow:0 0 24px rgba(0,177,255,.17); }
+  .gauge::before { content:'';position:absolute;inset:10px;border-radius:50%;background:#04132d;border:1px solid rgba(0,191,255,.2); }.gauge-center { position:relative;text-align:center;font-size:22px;font-weight:800;color:#7ffaff; }.gauge-center small { display:block;font-size:10px;font-weight:500;color:#c8dfff; }
+  .quick-list,.activity-list { display:flex;flex-direction:column;gap:8px; }.quick-link,.activity-item { display:flex;align-items:center;gap:10px;min-width:0;padding:10px;border-radius:12px;text-decoration:none;color:#eaf3ff;background:linear-gradient(100deg,rgba(23,55,150,.42),rgba(4,26,60,.72));border:1px solid rgba(37,109,255,.24);transition:all .2s; }.quick-link:hover { transform:translateX(-3px);border-color:rgba(0,203,255,.6);background:linear-gradient(100deg,rgba(57,45,190,.55),rgba(4,43,80,.8)); }
+  .quick-icon { width:38px;height:38px;flex:0 0 38px;display:grid;place-items:center;border-radius:10px;font-size:18px;background:linear-gradient(135deg,rgba(0,190,255,.25),rgba(88,52,255,.45));border:1px solid rgba(0,184,255,.45); }.quick-link strong,.activity-item strong { display:block;font-size:11px; }.quick-link small,.activity-item small { display:block;color:#a9c8f5;font-size:10px;margin-top:3px; }
+  .activity-item { padding:9px;background:rgba(7,33,72,.7); }.activity-icon { width:32px;height:32px;flex:0 0 32px;display:grid;place-items:center;border-radius:9px;background:linear-gradient(135deg,rgba(0,221,184,.3),rgba(0,91,255,.35)); }
+  .recent-table { overflow:auto; } .recent-table table { min-width:510px;font-size:11px; }.recent-table th,.recent-table td { padding:10px 7px; }.recent-table .btn { padding:5px 8px;font-size:10px; }
+  .side-promo { min-height:190px;background:linear-gradient(180deg,rgba(2,10,34,.15),rgba(2,10,34,.75)),url('/static/dashboard-brand.jpg') center/cover no-repeat;border-color:rgba(139,38,255,.5);display:flex;flex-direction:column;justify-content:flex-end;text-align:center; }.side-promo h3 { justify-content:center;font-size:17px;text-shadow:0 0 12px #c13cff; }.side-promo p {font-size:11px;color:#d8dfff;margin:0;}
+  .system-list { display:grid;grid-template-columns:1fr auto;gap:0;font-size:11px; }.system-list span { padding:10px 0;border-bottom:1px solid rgba(40,104,196,.2); }.system-list span:nth-child(even){color:#74eaff;text-align:left;}
+  .btn { background:linear-gradient(110deg,#6937ff,#215eff 60%,#00bce8);border:1px solid rgba(103,178,255,.32);box-shadow:0 5px 18px rgba(42,72,255,.2); }.btn:hover { filter:brightness(1.15);box-shadow:0 8px 22px rgba(0,157,255,.22); }
+  input,select,textarea { background:rgba(1,9,28,.78);border-color:rgba(30,112,230,.48);color:#f2f7ff; } input:focus,select:focus,textarea:focus { border-color:#00caff;box-shadow:0 0 0 3px rgba(0,185,255,.14); }
+  th,td { border-bottom-color:rgba(31,104,214,.24); } tbody tr:hover { background:rgba(0,143,255,.08); }
+  @media (min-width:1500px) { .sidebar { width:250px; } .dashboard-columns { grid-template-columns:minmax(0,1.65fr) minmax(250px,.8fr) minmax(230px,.72fr); } }
+  @media (max-width:1250px) { .sidebar { width:215px; }.dashboard-columns { grid-template-columns:minmax(0,1.4fr) minmax(220px,.8fr); }.dashboard-side { grid-column:1/-1;display:grid;grid-template-columns:repeat(2,minmax(0,1fr)); }.side-promo { min-height:210px; } }
+  @media (max-width:850px) { .wrap { flex-direction:column; }.sidebar { position:relative;width:100%;height:auto;padding:10px 12px 7px;border:0;border-bottom:1px solid rgba(0,150,255,.35); }.brand { padding:2px 4px 10px;margin-bottom:8px; }.brand-icon { width:35px;height:35px;font-size:18px; }.brand-title {font-size:15px;} nav { flex-direction:row;overflow-x:auto;overflow-y:hidden;gap:6px;padding:2px 0 8px;scrollbar-width:thin; } .nav-link { flex:0 0 auto;white-space:nowrap;padding:8px 10px;font-size:12px; }.nav-link::before {display:none;}.logout {margin-top:3px;padding:7px 10px;align-self:flex-start;}.content {width:100%;padding:16px 12px 26px;}.dashboard-columns {grid-template-columns:minmax(0,1fr) minmax(0,1fr);}.dashboard-main {grid-column:1/-1;}.dashboard-side {grid-column:auto;display:flex;}.stat-grid {grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;}.stat-box {min-height:110px;padding:13px;}.dashboard-hero {min-height:150px;background-position:center;}.hero-copy {max-width:88%;} }
+  @media (max-width:560px) { .content {padding:13px 10px 24px;}.content>h1 {font-size:18px;}.dashboard-hero {min-height:145px;padding:18px 15px;background-position:56% center;}.dashboard-hero::before {background:linear-gradient(90deg,rgba(1,8,29,.88),rgba(1,8,29,.62) 70%,rgba(1,8,29,.25));}.hero-copy {max-width:100%;}.hero-copy h2 {font-size:20px;}.hero-copy p {font-size:11px;line-height:1.9;}.hero-kicker {font-size:8px;letter-spacing:1.3px;}.stat-box {gap:9px;padding:11px;min-height:100px;}.stat-box .stat-icon {width:37px;height:37px;flex-basis:37px;font-size:18px;border-radius:10px;}.stat-box .num {font-size:20px;}.stat-box .lbl {font-size:10px;}.dashboard-columns {grid-template-columns:minmax(0,1fr);}.dashboard-main,.dashboard-middle,.dashboard-side {grid-column:auto;}.server-visual {height:135px;}.gauge {width:128px;height:128px;}.card {padding:14px;border-radius:14px;}.side-promo {min-height:180px;} }
+  @media (max-width:350px) { .stat-grid {grid-template-columns:minmax(0,1fr);}.stat-box {min-height:80px;}.stat-box:nth-child(n+5){display:flex;} }
+  @media (prefers-reduced-motion:reduce) { *,*::before,*::after {animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important;} }
+
+
 """
 
 
@@ -365,26 +446,46 @@ async def dashboard(request: Request):
         revenue = (await (await db.execute("SELECT COALESCE(SUM(price),0) FROM orders")).fetchone())[0]
         pending = (await (await db.execute("SELECT COUNT(*) FROM wallet_requests WHERE status='pending'")).fetchone())[0]
         token = await core.get_active_token(db)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT name, ip, status, created_at, id FROM servers ORDER BY id DESC LIMIT 5")
+        recent_servers = await cur.fetchall()
+        cur = await db.execute("SELECT status, COUNT(*) FROM servers GROUP BY status")
+        status_counts = {str(row[0] or "unknown").lower(): row[1] for row in await cur.fetchall()}
+        cur = await db.execute("SELECT COUNT(*) FROM users WHERE COALESCE(is_banned,0)=0")
+        active_users = (await cur.fetchone())[0]
+    server_rows = "".join(
+        f"<tr><td>{i:02d}</td><td>{esc(row[0])}</td><td>{esc(row[1])}</td>"
+        f"<td><span class='badge {'ok' if str(row[2] or '').lower() in ('running','active','on','ready') else 'off'}'>{'فعال' if str(row[2] or '').lower() in ('running','active','on','ready') else esc(row[2] or 'نامشخص')}</span></td>"
+        f"<td>{esc((row[3] or '-')[:10])}</td><td><a class='btn small' href='/servers'>مدیریت</a></td></tr>"
+        for i, row in enumerate(recent_servers, 1)
+    ) or "<tr><td colspan='6'>هنوز سروری ثبت نشده است.</td></tr>"
+    running_count = sum(v for k,v in status_counts.items() if k in ('running','active','on','ready'))
+    stopped_count = max(0, servers_c-running_count)
+    bars = ''.join(f"<span class='server-bar' style='height:{height}%'></span>" for height in (35,51,43,67,56,78,62,88,73,82))
     body = f"""
-    <h1><span class="page-icon icon-purple">📊</span> داشبورد</h1>
-    <section class="dashboard-hero">
-      <div class="hero-copy">
-        <span class="hero-kicker">HETZNER SHOP · CONTROL CENTER</span>
-        <h2>پنل مدیریت سرورها</h2>
-        <p>مدیریت کاربران، سرورها و سرویس‌ها؛ همه‌چیز در یک نگاه.</p>
-      </div>
-      <div class="hero-art" aria-hidden="true"><span>✦</span><div class="hero-orbit"></div><div class="hero-server">▤</div></div>
-    </section>
+    <div class="topbar-mini"><div class="topbar-date"><span class="live-dot"></span> مرکز کنترل مدیریت <span class="topbar-sep">/</span> وضعیت زنده پنل</div><a class="btn small" href="/">⟳ بروزرسانی</a></div>
+    <h1><span class="page-icon icon-purple">⌂</span> داشبورد</h1>
+    <section class="dashboard-hero"><div class="hero-copy"><span class="hero-kicker">HETZNER SHOP · CONTROL CENTER</span><h2>به پنل مدیریت Hetzner خوش آمدید 👑</h2><p>مدیریت سرورها، کاربران و همه سرویس‌ها؛ همه‌چیز در یک نگاه.</p></div></section>
     <div class="stat-grid">
-      <div class="stat-box"><div class="stat-icon icon-purple">👥</div><div><div class="num">{users_c}</div><div class="lbl">کاربران</div></div></div>
-      <div class="stat-box"><div class="stat-icon icon-blue">🖥</div><div><div class="num">{servers_c}</div><div class="lbl">سرورها</div></div></div>
-      <div class="stat-box"><div class="stat-icon icon-teal">📦</div><div><div class="num">{orders_c}</div><div class="lbl">سفارش‌ها</div></div></div>
-      <div class="stat-box"><div class="stat-icon icon-yellow">💰</div><div><div class="num">{core.fmt_price(revenue)}</div><div class="lbl">درآمد کل</div></div></div>
-      <div class="stat-box"><div class="stat-icon icon-pink">💳</div><div><div class="num">{pending}</div><div class="lbl">درخواست شارژ در انتظار</div></div></div>
+      <div class="stat-box"><div class="stat-icon icon-teal">▤</div><div><div class="num">{servers_c}</div><div class="lbl">کل سرورها</div></div></div>
+      <div class="stat-box"><div class="stat-icon icon-blue">♙</div><div><div class="num">{active_users}</div><div class="lbl">کاربران فعال</div></div></div>
+      <div class="stat-box"><div class="stat-icon icon-pink">▣</div><div><div class="num">{orders_c}</div><div class="lbl">کل سفارش‌ها</div></div></div>
+      <div class="stat-box"><div class="stat-icon icon-yellow">＄</div><div><div class="num">{core.fmt_price(revenue)}</div><div class="lbl">درآمد کل</div></div></div>
     </div>
-    <div class="card">
-      <h3><span class="mini-icon icon-blue">🌐</span> وضعیت اتصال Hetzner</h3>
-      <p>{"<span class='badge ok'>✅ متصل</span>" if token else "<span class='badge off'>❌ هیچ API فعالی تنظیم نشده</span> — از بخش «API های Hetzner» اضافه کنید."}</p>
+    <div class="dashboard-columns">
+      <div class="dashboard-main">
+        <section class="card"><div class="dash-card-title"><span>◈ وضعیت سرورها</span><span class="dash-pill">{servers_c} سرور ثبت‌شده</span></div><div class="server-visual" aria-label="نمای گرافیکی سرورها">{bars}</div><div class="legend-row"><span><i class="legend-dot"></i> فعال: {running_count}</span><span><i class="legend-dot purple"></i> متوقف یا نامشخص: {stopped_count}</span></div></section>
+        <section class="card"><div class="dash-card-title"><span>▤ آخرین سرورها</span><a class="btn small" href="/servers">مشاهده همه</a></div><div class="recent-table"><table><thead><tr><th>#</th><th>نام سرور</th><th>IP آدرس</th><th>وضعیت</th><th>تاریخ</th><th>عملیات</th></tr></thead><tbody>{server_rows}</tbody></table></div></section>
+        <section class="card"><div class="dash-card-title"><span>▣ اطلاعات سیستم</span><span class="dash-pill">آنلاین</span></div><div class="system-list"><span>نسخه پنل</span><span>Hetzner Shop</span><span>تعداد کاربران</span><span>{users_c}</span><span>تعداد سرورها</span><span>{servers_c}</span><span>درخواست شارژ در انتظار</span><span>{pending}</span><span>اتصال API</span><span>{'متصل' if token else 'تنظیم نشده'}</span></div></section>
+      </div>
+      <div class="dashboard-middle">
+        <section class="card"><div class="dash-card-title"><span>◉ وضعیت کلی</span></div><div class="gauge-wrap"><div class="gauge"><div class="gauge-center">{round(running_count*100/servers_c) if servers_c else 0}%<small>سرورهای فعال</small></div></div></div><div class="legend-row"><span><i class="legend-dot"></i> فعال {running_count}</span><span><i class="legend-dot purple"></i> دیگر {stopped_count}</span></div></section>
+        <section class="card"><div class="dash-card-title"><span>⚡ عملیات سریع</span></div><div class="quick-list"><a class="quick-link" href="/servers"><span class="quick-icon">☁</span><span><strong>مدیریت سرورها</strong><small>مشاهده و مدیریت سرورها</small></span></a><a class="quick-link" href="/users"><span class="quick-icon">♙</span><span><strong>مدیریت کاربران</strong><small>فهرست کاربران و حساب‌ها</small></span></a><a class="quick-link" href="/providers"><span class="quick-icon">▣</span><span><strong>مدیریت APIها</strong><small>افزودن و تنظیم API جدید</small></span></a><a class="quick-link" href="/backup"><span class="quick-icon">⬡</span><span><strong>تنظیمات بکاپ</strong><small>پشتیبان‌گیری و عضویت اجباری</small></span></a></div></section>
+      </div>
+      <div class="dashboard-side">
+        <section class="card side-promo"><h3>HETZNER SHOP</h3><p>Powering Your Dreams · Fast · Secure · Reliable</p></section>
+        <section class="card"><div class="dash-card-title"><span>◷ آخرین فعالیت‌ها</span></div><div class="activity-list"><div class="activity-item"><span class="activity-icon">✦</span><span><strong>وضعیت پنل</strong><small>پنل مدیریت آماده استفاده است</small></span></div><div class="activity-item"><span class="activity-icon">▤</span><span><strong>سرورها</strong><small>{servers_c} سرور در پایگاه داده</small></span></div><div class="activity-item"><span class="activity-icon">♙</span><span><strong>کاربران</strong><small>{users_c} حساب ثبت‌شده</small></span></div><div class="activity-item"><span class="activity-icon">◈</span><span><strong>بکاپ و امنیت</strong><small>تنظیمات را از بخش بکاپ بررسی کنید</small></span></div></div></section>
+      </div>
     </div>
     """
     return page("داشبورد", body, "/")
