@@ -1831,15 +1831,21 @@ async def server_rebuild_confirm(call: CallbackQuery):
 # ---------------------------------------------------------------------------
 @router.callback_query(F.data.startswith("sv_ipchange_"))
 async def server_ipchange_start(call: CallbackQuery):
-    server_db_id = int(call.data.replace("sv_ipchange_", ""))
+    # Acknowledge immediately; Telegram otherwise keeps the inline button loading.
+    await call.answer()
+    try:
+        server_db_id = int(call.data.replace("sv_ipchange_", ""))
+    except (TypeError, ValueError):
+        await call.message.answer("❌ شناسه سرور نامعتبر است. لطفاً منوی سرورها را دوباره باز کنید.")
+        return
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT user_id, hetzner_id, name, ip_change_count, provider_type FROM servers WHERE id=?", (server_db_id,))
         row = await cur.fetchone()
     if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
-        await call.answer("دسترسی غیرمجاز", show_alert=True)
+        await call.message.answer("❌ دسترسی غیرمجاز")
         return
     if (row[4] or "hetzner") != "hetzner":
-        await call.answer("این قابلیت فقط برای سرورهای Hetzner در دسترس است.", show_alert=True)
+        await call.message.answer("❌ این قابلیت فقط برای سرورهای Hetzner در دسترس است.")
         return
     count = row[3] or 0
     cost = 0 if count < IP_CHANGE_FREE_COUNT else IP_CHANGE_PRICE
@@ -1857,20 +1863,25 @@ async def server_ipchange_start(call: CallbackQuery):
         "⚠️ توجه: تغییر IP چند دقیقه طول می‌کشد و IP قبلی برای همیشه از بین می‌رود.",
         reply_markup=kb,
     )
-    await call.answer()
 
 
 @router.callback_query(F.data.startswith("ipcf_"))
 async def server_ipchange_confirm(call: CallbackQuery):
-    server_db_id = int(call.data.replace("ipcf_", ""))
+    # Answer Telegram's callback before any API/network work begins.
+    await call.answer("در حال پردازش درخواست تغییر IP…")
+    try:
+        server_db_id = int(call.data.replace("ipcf_", ""))
+    except (TypeError, ValueError):
+        await call.message.answer("❌ شناسه سرور نامعتبر است. لطفاً منوی سرورها را دوباره باز کنید.")
+        return
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT user_id, hetzner_id, name, ip_change_count, provider_type FROM servers WHERE id=?", (server_db_id,))
         row = await cur.fetchone()
         if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
-            await call.answer("دسترسی غیرمجاز", show_alert=True)
+            await call.message.edit_text("❌ دسترسی غیرمجاز")
             return
         if (row[4] or "hetzner") != "hetzner":
-            await call.answer("این قابلیت فقط برای سرورهای Hetzner در دسترس است.", show_alert=True)
+            await call.message.edit_text("❌ این قابلیت فقط برای سرورهای Hetzner در دسترس است.")
             return
         owner_id, hetzner_id, name, count, _ = row
         count = count or 0
@@ -1882,15 +1893,14 @@ async def server_ipchange_confirm(call: CallbackQuery):
                 await call.message.edit_text(
                     f"❌ موجودی کافی نیست. موجودی فعلی: {fmt_price(bal_row[0] if bal_row else 0)}\nلطفاً ابتدا کیف پول خود را شارژ کنید."
                 )
-                await call.answer()
                 return
         token = await get_active_token(db)
     if not token:
         await call.message.edit_text("❌ هیچ API فعالی برای هتزنر تنظیم نشده.")
-        await call.answer()
         return
     api = HetznerAPI(token)
     try:
+        await call.message.edit_text("⏳ درخواست تغییر IP ارسال شد؛ در حال انجام عملیات با هتزنر هستم. لطفاً چند دقیقه صبر کنید…")
         new_ip = await change_server_ip(api, hetzner_id)
     except Exception as e:
         logger.exception("IP change failed for local server id=%s, Hetzner id=%s", server_db_id, hetzner_id)
