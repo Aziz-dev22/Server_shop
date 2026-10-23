@@ -6,8 +6,14 @@ Hetzner Shop - پنل مدیریت تحت وب
 """
 import html
 import os
+from pathlib import Path
 import secrets
 import urllib.parse
+import io
+import zipfile
+import sqlite3
+from fastapi import UploadFile, File
+from fastapi.responses import StreamingResponse
 from datetime import datetime, timedelta
 
 import aiosqlite
@@ -35,6 +41,7 @@ NAV_ITEMS = [
     ("/", "📊 داشبورد"),
     ("/users", "👥 کاربران"),
     ("/servers", "🖥 سرورها"),
+    ("/backup", "💾 بکاپ و بازیابی"),
     ("/plans", "🧩 پلن‌ها"),
     ("/locations", "📍 لوکیشن‌ها"),
     ("/providers", "🔑 API های Hetzner"),
@@ -440,6 +447,64 @@ async def user_ban_toggle(request: Request, tid: int):
 
 
 # ---------------------------------------------------------------------------
+# بکاپ کامل دیتابیس و بازیابی
+# ---------------------------------------------------------------------------
+@app.get("/backup", response_class=HTMLResponse)
+async def backup_page(request: Request):
+    if not get_session(request):
+        return RedirectResponse("/login")
+    body = """
+    <h1>💾 بکاپ و بازیابی</h1>
+    <div class="card"><h3>دریافت نسخه پشتیبان</h3><p>یک فایل ZIP شامل دیتابیس فعلی دریافت می‌کنید.</p><a class="btn" href="/backup/download">⬇️ دانلود بکاپ</a></div>
+    <div class="card"><h3>بازیابی بکاپ</h3><p>فایل ZIP بکاپ ساخته‌شده از همین پروژه را انتخاب کنید. دیتابیس فعلی قبل از بازیابی به‌صورت خودکار کپی می‌شود.</p>
+    <form method="post" action="/backup/restore" enctype="multipart/form-data"><input type="file" name="backup" accept=".zip" required><button class="btn red" type="submit" onclick="return confirm('هشدار: دیتابیس فعلی با نسخه داخل بکاپ جایگزین می‌شود. ادامه می‌دهید؟')">♻️ بازیابی بکاپ</button></form></div>
+    """
+    return page("بکاپ و بازیابی", body, "/backup")
+
+@app.get("/backup/download")
+async def backup_download(request: Request):
+    if not get_session(request):
+        return RedirectResponse("/login")
+    dbfile = Path(DB_PATH).resolve()
+    if not dbfile.exists():
+        return HTMLResponse("فایل دیتابیس پیدا نشد.", status_code=404)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(dbfile, arcname="shop.db")
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="application/zip", headers={"Content-Disposition": "attachment; filename=hetzner-shop-backup.zip"})
+
+@app.post("/backup/restore")
+async def backup_restore(request: Request, backup: UploadFile = File(...)):
+    if not get_session(request):
+        return RedirectResponse("/login")
+    raw = await backup.read()
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            names = zf.namelist()
+            if "shop.db" not in names:
+                raise ValueError("فایل shop.db در بکاپ نیست")
+            db_bytes = zf.read("shop.db")
+        # Validate SQLite integrity before replacing the live DB.
+        temp = io.BytesIO(db_bytes)
+        tmp_path = str(Path(DB_PATH).resolve()) + ".restore-check"
+        Path(tmp_path).write_bytes(temp.getvalue())
+        con = sqlite3.connect(tmp_path)
+        integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
+        con.close()
+        if integrity != "ok":
+            raise ValueError("دیتابیس بکاپ سالم نیست")
+        live = Path(DB_PATH).resolve()
+        if live.exists():
+            import shutil
+            shutil.copy2(live, str(live) + ".before-restore.bak")
+        live.write_bytes(db_bytes)
+        Path(tmp_path).unlink(missing_ok=True)
+    except Exception as exc:
+        return HTMLResponse(f"بازیابی انجام نشد: {esc(exc)} <a href='/backup'>بازگشت</a>", status_code=400)
+    return RedirectResponse("/backup?restored=1", status_code=303)
+
+# ---------------------------------------------------------------------------
 # سرورها
 # ---------------------------------------------------------------------------
 def server_action_buttons(server_id: int) -> str:
@@ -466,9 +531,17 @@ async def servers_list(request: Request):
         if token and request.query_params.get("sync") == "1":
             added = await core.sync_hetzner_servers(db, core.HetznerAPI(token))
         cur = await db.execute(
-            "SELECT id, name, ip, user_id, location, status, root_password FROM servers ORDER BY id DESC LIMIT 200"
+            "SELECT id, hetzner_id, provider_type, name, ip, user_id, location, status, root_password FROM servers ORDER BY CASE WHEN user_id IS NOT NULL THEN 0 ELSE 1 END, id DESC LIMIT 1000"
         )
-        servers = await cur.fetchall()
+        raw_servers = await cur.fetchall()
+        # Deduplicate imported/unowned rows against customer-owned rows by provider + provider server ID.
+        servers, seen = [], set()
+        for r in raw_servers:
+            key = (str(r[2] or 'hetzner'), str(r[1])) if r[1] is not None else ('db', str(r[0]))
+            if key in seen:
+                continue
+            seen.add(key)
+            servers.append((r[0], r[3], r[4], r[5], r[6], r[7], r[8]))
     note = f'<div class="msg ok">{added} سرور جدید از پنل هتزنر همگام‌سازی شد.</div>' if added else ""
     rows = "".join(
         f"<tr><td>{esc(s[1])}</td><td>{esc(s[2])}</td><td>{s[3] or 'بدون مالک'}</td><td>{esc(s[4])}</td>"

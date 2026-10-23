@@ -424,33 +424,47 @@ class HetznerAPI:
     async def delete_primary_ip(self, primary_ip_id):
         return await self._delete(f"/primary_ips/{primary_ip_id}")
 
-    async def create_primary_ip(self, name, ip_type, datacenter, assignee_id):
-        payload = {
-            "type": ip_type, "name": name, "datacenter": datacenter,
-            "assignee_type": "server", "assignee_id": assignee_id,
-        }
+    async def create_primary_ip(self, name, ip_type, datacenter, assignee_id=None):
+        payload = {"type": ip_type, "name": name, "datacenter": datacenter}
+        # Create unassigned first; a server can have only one assigned primary IPv4.
         data = await self._post("/primary_ips", json=payload)
         return data["primary_ip"]
 
+    async def assign_primary_ip(self, primary_ip_id, server_id):
+        return await self._post(f"/primary_ips/{primary_ip_id}/actions/assign", json={"assignee_type": "server", "assignee_id": server_id})
+
 
 async def change_server_ip(api: "HetznerAPI", hetzner_id: int) -> str:
-    """IP اصلی سرور را عوض می‌کند: IP قدیم آزاد و حذف می‌شود و یک IP جدید ساخته و متصل می‌شود."""
+    """Replace primary IPv4 using the Hetzner Primary IP assign/unassign workflow."""
     server = await api.get_server(hetzner_id)
-    old_ip_info = server.get("public_net", {}).get("ipv4")
-    datacenter = server.get("datacenter", {}).get("name")
-    if not old_ip_info or not datacenter:
-        raise RuntimeError("این سرور IPv4 اصلی قابل تغییر ندارد.")
-    old_primary_id = old_ip_info["id"]
-    # Allocate replacement first; if allocation fails, the old IP remains untouched.
-    new_name = f"ip-{hetzner_id}-{secrets.token_hex(3)}"
-    new_ip = await api.create_primary_ip(new_name, "ipv4", datacenter, hetzner_id)
-    if not new_ip.get("ip"):
-        raise RuntimeError("هتزنر IP جدیدی برنگرداند؛ IP قبلی دست‌نخورده باقی مانده است.")
+    old = server.get("public_net", {}).get("ipv4")
+    dc = server.get("datacenter", {}).get("name")
+    if not old or not old.get("id") or not dc:
+        raise RuntimeError("این سرور IPv4 اصلی قابل تعویض ندارد.")
+    new_ip = await api.create_primary_ip(f"replace-{hetzner_id}-{secrets.token_hex(3)}", "ipv4", dc)
+    new_id = new_ip.get("id")
+    if not new_id or not new_ip.get("ip"):
+        raise RuntimeError("هتزنر IP جدید معتبری برنگرداند.")
+    # Preserve the old IP until the new IP can be assigned. If assignment fails,
+    # attempt to restore the old assignment and clean up the unused new IP.
+    await api.unassign_primary_ip(old["id"])
     try:
-        await api.unassign_primary_ip(old_primary_id)
-        await api.delete_primary_ip(old_primary_id)
+        await api.assign_primary_ip(new_id, hetzner_id)
     except Exception as exc:
-        raise RuntimeError(f"IP جدید ({new_ip['ip']}) ساخته شد اما آزادسازی IP قبلی ناموفق بود؛ وضعیت را در پنل Hetzner بررسی کنید: {exc}") from exc
+        try:
+            await api.assign_primary_ip(old["id"], hetzner_id)
+        except Exception:
+            pass
+        try:
+            await api.delete_primary_ip(new_id)
+        except Exception:
+            pass
+        raise RuntimeError(f"اتصال IP جدید به سرور ناموفق بود؛ وضعیت IPها را در پنل هتزنر بررسی کنید: {exc}") from exc
+    try:
+        await api.delete_primary_ip(old["id"])
+    except Exception:
+        # New IP is already assigned; do not report total failure just because old cleanup failed.
+        pass
     return new_ip["ip"]
 
 
