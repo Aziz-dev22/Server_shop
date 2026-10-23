@@ -41,7 +41,7 @@ NAV_ITEMS = [
     ("/", "📊 داشبورد"),
     ("/users", "👥 کاربران"),
     ("/servers", "🖥 سرورها"),
-    ("/backup", "💾 بکاپ و بازیابی"),
+    ("/backup", "🗄 بکاپ خودکار و عضویت اجباری"),
     ("/plans", "🧩 پلن‌ها"),
     ("/locations", "📍 لوکیشن‌ها"),
     ("/providers", "🔑 API های Hetzner"),
@@ -194,6 +194,7 @@ BASE_CSS = """
   input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent); box-shadow: 0 0 0 3px rgba(47,155,240,.18); }
   label { font-size:12.5px; color:var(--txt-dim); display:block; margin-bottom:5px; font-weight:600; }
   .stat-grid { display:flex; gap:18px; flex-wrap:wrap; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:18px; align-items:start; }
   .stat-box {
     background:linear-gradient(165deg, rgba(18,41,74,.88), rgba(15,37,68,.92)); backdrop-filter: blur(10px);
     border:1px solid var(--border); border-radius:18px;
@@ -453,13 +454,110 @@ async def user_ban_toggle(request: Request, tid: int):
 async def backup_page(request: Request):
     if not get_session(request):
         return RedirectResponse("/login")
-    body = """
-    <h1>💾 بکاپ و بازیابی</h1>
-    <div class="card"><h3>دریافت نسخه پشتیبان</h3><p>یک فایل ZIP شامل دیتابیس فعلی دریافت می‌کنید.</p><a class="btn" href="/backup/download">⬇️ دانلود بکاپ</a></div>
-    <div class="card"><h3>بازیابی بکاپ</h3><p>فایل ZIP بکاپ ساخته‌شده از همین پروژه را انتخاب کنید. دیتابیس فعلی قبل از بازیابی به‌صورت خودکار کپی می‌شود.</p>
-    <form method="post" action="/backup/restore" enctype="multipart/form-data"><input type="file" name="backup" accept=".zip" required><button class="btn red" type="submit" onclick="return confirm('هشدار: دیتابیس فعلی با نسخه داخل بکاپ جایگزین می‌شود. ادامه می‌دهید؟')">♻️ بازیابی بکاپ</button></form></div>
+    async with aiosqlite.connect(DB_PATH) as db:
+        backup_channel = await core.get_setting(db, "backup_channel", "") or ""
+        interval = int(await core.get_setting(db, "backup_interval_minutes", "60") or "60")
+        backup_enabled = (await core.get_setting(db, "backup_enabled", "0")) == "1"
+        last_epoch = float(await core.get_setting(db, "backup_last_epoch", "0") or "0")
+        join_channel = await core.get_setting(db, "mandatory_channel", "") or ""
+        join_link = await core.get_setting(db, "mandatory_channel_link", "") or ""
+        join_enabled = (await core.get_setting(db, "mandatory_enabled", "1" if join_channel else "0")) == "1"
+        last_test = await core.get_setting(db, "backup_last_result", "") or ""
+    def fmt_minutes(value):
+        return f"{value // 60} ساعت و {value % 60} دقیقه" if value >= 60 and value % 60 else (f"{value // 60} ساعت" if value >= 60 else f"{value} دقیقه")
+    next_text = "در انتظار اولین بکاپ" if not last_epoch else datetime.fromtimestamp(last_epoch + interval*60).strftime("%Y-%m-%d %H:%M:%S")
+    last_text = datetime.fromtimestamp(last_epoch).strftime("%Y-%m-%d %H:%M:%S") if last_epoch else "هنوز بکاپی ارسال نشده"
+    flash = ""
+    result = request.query_params.get("result", "")
+    if result == "ok": flash = '<div class="msg ok">✅ بکاپ آزمایشی با موفقیت به کانال ارسال شد.</div>'
+    elif result == "error": flash = '<div class="msg err">❌ ارسال بکاپ ناموفق بود؛ جزئیات خطا در پیام زیر آمده است.</div>'
+    err = request.query_params.get("detail", "")
+    if err: flash += f'<div class="msg err">{esc(err)}</div>'
+    body = f"""
+    <h1>💾 بکاپ و عضویت اجباری</h1>{flash}
+    <div class="grid">
+      <div class="card"><h3>🗄 بکاپ خودکار</h3><p>وضعیت: <b style="color:{'#2ee6a8' if backup_enabled else '#ff5c72'}">{'فعال' if backup_enabled else 'غیرفعال'}</b></p><p>کانال مقصد: <b>{esc(backup_channel or 'تنظیم نشده')}</b></p><p>فاصله زمانی: <b>{esc(fmt_minutes(interval))}</b></p><p>آخرین بکاپ: <b>{esc(last_text)}</b></p><p>بکاپ بعدی: <b>{esc(next_text)}</b></p><p>آخرین نتیجه: {esc(last_test or 'هنوز اجرا نشده')}</p>
+      <form method="post" action="/backup/settings"><label>شناسه کانال بکاپ (@channel یا -100...)</label><input name="backup_channel" value="{esc(backup_channel)}" placeholder="@my_channel"><label>فاصله بکاپ (مثلاً 30m یا 2h)</label><input name="backup_interval" value="{esc(str(interval) + 'm')}" required><button class="btn" type="submit">💾 ذخیره تنظیمات</button></form>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px"><form method="post" action="/backup/toggle"><input type="hidden" name="enabled" value="{'0' if backup_enabled else '1'}"><button class="btn {'red' if backup_enabled else 'green'}" type="submit">{'⏸ غیرفعال‌کردن بکاپ' if backup_enabled else '▶️ فعال‌کردن بکاپ'}</button></form><form method="post" action="/backup/test"><button class="btn" type="submit">🧪 ارسال بکاپ آزمایشی</button></form></div></div>
+      <div class="card"><h3>📢 عضویت اجباری</h3><p>وضعیت: <b style="color:{'#2ee6a8' if join_enabled and join_channel else '#ff5c72'}">{'فعال' if join_enabled and join_channel else 'غیرفعال'}</b></p><p>کانال: <b>{esc(join_channel or 'تنظیم نشده')}</b></p><p>لینک عضویت: <b>{esc(join_link or 'تنظیم نشده')}</b></p>
+      <form method="post" action="/backup/join-settings"><label>شناسه کانال عضویت اجباری</label><input name="join_channel" value="{esc(join_channel)}" placeholder="@my_channel"><label>لینک عضویت</label><input name="join_link" value="{esc(join_link)}" placeholder="https://t.me/my_channel"><button class="btn" type="submit">💾 ذخیره کانال</button></form>
+      <form method="post" action="/backup/join-toggle" style="margin-top:12px"><input type="hidden" name="enabled" value="{'0' if join_enabled else '1'}"><button class="btn {'red' if join_enabled else 'green'}" type="submit">{'⏸ غیرفعال‌کردن عضویت اجباری' if join_enabled else '▶️ فعال‌کردن عضویت اجباری'}</button></form><p>برای بررسی عضویت، ربات باید به کانال دسترسی داشته باشد و برای کانال خصوصی لینک دعوت معتبر وارد شود.</p></div>
+    </div>
+    <div class="card"><h3>⬇️ بکاپ دیتابیس / بازیابی</h3><p>این بخش برای دانلود یا بازیابی دیتابیس است؛ بکاپ آزمایشی بالا، فایل ZIP کامل پروژه را به کانال می‌فرستد.</p><a class="btn" href="/backup/download">⬇️ دانلود بکاپ دیتابیس</a><hr><form method="post" action="/backup/restore" enctype="multipart/form-data"><input type="file" name="backup" accept=".zip" required><button class="btn red" type="submit" onclick="return confirm('هشدار: دیتابیس فعلی با نسخه داخل بکاپ جایگزین می‌شود. ادامه می‌دهید؟')">♻️ بازیابی بکاپ دیتابیس</button></form></div>
     """
-    return page("بکاپ و بازیابی", body, "/backup")
+    return page("بکاپ و عضویت اجباری", body, "/backup")
+
+@app.post("/backup/settings")
+async def backup_settings_save(request: Request):
+    if not get_session(request): return RedirectResponse("/login")
+    form = await request.form()
+    channel = str(form.get("backup_channel", "")).strip()
+    raw = str(form.get("backup_interval", "60m")).strip().lower().replace(" ", "")
+    try:
+        if raw.endswith("m"): minutes = int(raw[:-1])
+        elif raw.endswith("h"): minutes = int(raw[:-1]) * 60
+        else: minutes = int(raw)
+        if not 5 <= minutes <= 43200: raise ValueError()
+    except Exception:
+        return RedirectResponse("/backup?result=error&detail=" + urllib.parse.quote("فاصله نامعتبر است؛ مثل 30m یا 2h وارد کن (حداقل ۵ دقیقه)."), status_code=303)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await core.set_setting(db, "backup_channel", channel)
+        await core.set_setting(db, "backup_interval_minutes", str(minutes))
+        if not channel: await core.set_setting(db, "backup_enabled", "0")
+    return RedirectResponse("/backup", status_code=303)
+
+@app.post("/backup/toggle")
+async def backup_toggle(request: Request):
+    if not get_session(request): return RedirectResponse("/login")
+    form = await request.form(); enabled = str(form.get("enabled", "0")) == "1"
+    async with aiosqlite.connect(DB_PATH) as db:
+        channel = await core.get_setting(db, "backup_channel", "")
+        if enabled and not channel:
+            return RedirectResponse("/backup?result=error&detail=" + urllib.parse.quote("ابتدا کانال بکاپ را ذخیره کن."), status_code=303)
+        await core.set_setting(db, "backup_enabled", "1" if enabled else "0")
+    return RedirectResponse("/backup", status_code=303)
+
+@app.post("/backup/join-settings")
+async def join_settings_save(request: Request):
+    if not get_session(request): return RedirectResponse("/login")
+    form = await request.form(); channel = str(form.get("join_channel", "")).strip(); link = str(form.get("join_link", "")).strip()
+    if link and not link.startswith("https://t.me/"):
+        return RedirectResponse("/backup?result=error&detail=" + urllib.parse.quote("لینک عضویت باید با https://t.me/ شروع شود."), status_code=303)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await core.set_setting(db, "mandatory_channel", channel)
+        await core.set_setting(db, "mandatory_channel_link", link)
+        if not channel: await core.set_setting(db, "mandatory_enabled", "0")
+    return RedirectResponse("/backup", status_code=303)
+
+@app.post("/backup/join-toggle")
+async def join_toggle(request: Request):
+    if not get_session(request): return RedirectResponse("/login")
+    form = await request.form(); enabled = str(form.get("enabled", "0")) == "1"
+    async with aiosqlite.connect(DB_PATH) as db:
+        channel = await core.get_setting(db, "mandatory_channel", "")
+        if enabled and not channel:
+            return RedirectResponse("/backup?result=error&detail=" + urllib.parse.quote("ابتدا کانال عضویت اجباری را ذخیره کن."), status_code=303)
+        await core.set_setting(db, "mandatory_enabled", "1" if enabled else "0")
+    return RedirectResponse("/backup", status_code=303)
+
+@app.post("/backup/test")
+async def backup_test(request: Request):
+    if not get_session(request): return RedirectResponse("/login")
+    if not core.BOT_TOKEN: return RedirectResponse("/backup?result=error&detail=" + urllib.parse.quote("BOT_TOKEN در تنظیمات سرور تنظیم نشده است."), status_code=303)
+    async with aiosqlite.connect(DB_PATH) as db: channel = await core.get_setting(db, "backup_channel", "")
+    if not channel: return RedirectResponse("/backup?result=error&detail=" + urllib.parse.quote("ابتدا کانال بکاپ را تنظیم کن."), status_code=303)
+    bot = Bot(token=core.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    try:
+        await core.send_project_backup(bot, channel)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await core.set_setting(db, "backup_last_epoch", str(datetime.now().timestamp()))
+            await core.set_setting(db, "backup_last_result", "ارسال آزمایشی موفق در " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        return RedirectResponse("/backup?result=ok", status_code=303)
+    except Exception as exc:
+        async with aiosqlite.connect(DB_PATH) as db: await core.set_setting(db, "backup_last_result", "خطا: " + str(exc)[:300])
+        return RedirectResponse("/backup?result=error&detail=" + urllib.parse.quote(str(exc)[:250]), status_code=303)
+    finally:
+        await bot.session.close()
 
 @app.get("/backup/download")
 async def backup_download(request: Request):

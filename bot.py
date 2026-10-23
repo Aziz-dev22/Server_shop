@@ -1089,7 +1089,8 @@ class MembershipMiddleware(BaseMiddleware):
         async with aiosqlite.connect(DB_PATH) as db:
             channel = await get_setting(db, "mandatory_channel", "")
             invite = await get_setting(db, "mandatory_channel_link", "")
-        if not channel:
+            enabled = await get_setting(db, "mandatory_enabled", "1" if channel else "0")
+        if not channel or enabled != "1":
             return await handler(event, data)
         try:
             member = await bot.get_chat_member(chat_id=channel, user_id=user.id)
@@ -1130,12 +1131,14 @@ async def admin_backup_join(call: CallbackQuery):
         enabled = await get_setting(db, "backup_enabled", "0")
         join_channel = await get_setting(db, "mandatory_channel", "غیرفعال")
         join_link = await get_setting(db, "mandatory_channel_link", "تنظیم نشده")
+        join_enabled = await get_setting(db, "mandatory_enabled", "1" if join_channel and join_channel != "غیرفعال" else "0")
     status = "فعال" if enabled == "1" else "متوقف"
     await call.message.edit_text(
         "🗄 <b>بکاپ خودکار و عضویت اجباری</b>\n\n"
         f"کانال بکاپ: <code>{html.escape(backup_channel)}</code>\n"
         f"فاصله بکاپ: {html.escape(str(interval))} دقیقه\nوضعیت بکاپ: {status}\n\n"
         f"کانال عضویت اجباری: <code>{html.escape(join_channel)}</code>\n"
+        f"وضعیت عضویت اجباری: {'فعال' if join_enabled == '1' else 'غیرفعال'}\n"
         f"لینک عضویت: {html.escape(join_link)}\n\n"
         "برای ارسال بکاپ، ربات باید در کانال مقصد اجازه ارسال فایل داشته باشد. برای بررسی عضویت نیز ربات باید به کانال دسترسی داشته باشد.",
         reply_markup=backup_join_kb())
@@ -1190,6 +1193,27 @@ async def toggle_auto_backup(call: CallbackQuery):
         return await call.answer("اول کانال بکاپ را تنظیم کن.", show_alert=True)
     await call.answer("بکاپ خودکار فعال شد." if enabled=="1" else "بکاپ خودکار متوقف شد.", show_alert=True)
 
+@router.callback_query(F.data == "send_backup_now")
+async def send_backup_now(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("دسترسی ندارید", show_alert=True)
+    await call.answer("در حال ساخت و ارسال بکاپ...", show_alert=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        channel = await get_setting(db, "backup_channel", "")
+    if not channel:
+        return await call.message.answer("❌ ابتدا کانال بکاپ را تنظیم کن.")
+    try:
+        await send_project_backup(call.bot, channel)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await set_setting(db, "backup_last_epoch", str(time.time()))
+            await set_setting(db, "backup_last_result", "ارسال آزمایشی موفق در " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        await call.message.answer("✅ بکاپ آزمایشی با موفقیت به کانال ارسال شد.")
+    except Exception as exc:
+        logger.exception("manual backup send failed")
+        async with aiosqlite.connect(DB_PATH) as db:
+            await set_setting(db, "backup_last_result", "خطا: " + str(exc)[:300])
+        await call.message.answer("❌ ارسال بکاپ ناموفق بود: " + html.escape(str(exc)[:500]))
+
 @router.callback_query(F.data == "set_join_channel")
 async def set_join_channel_start(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id): return await call.answer("دسترسی ندارید", show_alert=True)
@@ -1225,7 +1249,8 @@ async def set_join_link_save(message: Message, state: FSMContext):
 async def check_mandatory_membership(call: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         channel=await get_setting(db,"mandatory_channel","")
-    if not channel:
+        enabled=await get_setting(db,"mandatory_enabled", "1" if channel else "0")
+    if not channel or enabled != "1":
         return await call.answer("عضویت اجباری فعال نیست.", show_alert=True)
     try:
         member=await call.bot.get_chat_member(chat_id=channel,user_id=call.from_user.id)
