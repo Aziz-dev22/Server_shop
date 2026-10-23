@@ -12,6 +12,7 @@ Hetzner Shop Bot v2 - ربات فروش و مدیریت سرور مجازی (VPS
 """
 
 import asyncio
+import time
 import html
 import logging
 import os
@@ -418,54 +419,96 @@ class HetznerAPI:
         data = await self._get(f"/servers/{hetzner_id}")
         return data["server"]
 
+    async def _wait_action(self, result, timeout=120):
+        """Wait until a Hetzner async action is finished and surface API errors."""
+        action = (result or {}).get("action")
+        if not action or not action.get("id"):
+            return
+        action_id = action["id"]
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            current = await self._get(f"/actions/{action_id}")
+            action = current.get("action", {})
+            status = action.get("status")
+            if status == "success":
+                return
+            if status == "error":
+                err = action.get("error") or {}
+                raise RuntimeError(f"Hetzner action failed: {err.get('code', 'unknown')} — {err.get('message', 'no details')}")
+            await asyncio.sleep(1)
+        raise TimeoutError(f"Hetzner action {action_id} did not finish within {timeout}s")
+
     async def unassign_primary_ip(self, primary_ip_id):
-        return await self._post(f"/primary_ips/{primary_ip_id}/actions/unassign")
+        result = await self._post(f"/primary_ips/{primary_ip_id}/actions/unassign")
+        await self._wait_action(result)
+        return result
 
     async def delete_primary_ip(self, primary_ip_id):
         return await self._delete(f"/primary_ips/{primary_ip_id}")
 
     async def create_primary_ip(self, name, ip_type, datacenter, assignee_id=None):
+        # Hetzner expects a location slug (e.g. nbg1), not the datacenter name.
         payload = {"type": ip_type, "name": name, "datacenter": datacenter}
-        # Create unassigned first; a server can have only one assigned primary IPv4.
         data = await self._post("/primary_ips", json=payload)
         return data["primary_ip"]
 
     async def assign_primary_ip(self, primary_ip_id, server_id):
-        return await self._post(f"/primary_ips/{primary_ip_id}/actions/assign", json={"assignee_type": "server", "assignee_id": server_id})
+        result = await self._post(f"/primary_ips/{primary_ip_id}/actions/assign", json={"assignee_type": "server", "assignee_id": server_id})
+        await self._wait_action(result)
+        return result
 
 
 async def change_server_ip(api: "HetznerAPI", hetzner_id: int) -> str:
-    """Replace primary IPv4 using the Hetzner Primary IP assign/unassign workflow."""
+    """Replace the primary IPv4. Hetzner requires the server to be powered off."""
     server = await api.get_server(hetzner_id)
-    old = server.get("public_net", {}).get("ipv4")
-    dc = server.get("datacenter", {}).get("name")
-    if not old or not old.get("id") or not dc:
-        raise RuntimeError("این سرور IPv4 اصلی قابل تعویض ندارد.")
-    new_ip = await api.create_primary_ip(f"replace-{hetzner_id}-{secrets.token_hex(3)}", "ipv4", dc)
-    new_id = new_ip.get("id")
-    if not new_id or not new_ip.get("ip"):
+    if server.get("status") != "off":
+        raise RuntimeError("برای تغییر Primary IP، ابتدا سرور را خاموش کنید و وضعیت آن باید در هتزنر «off» باشد. پس از خاموش شدن دوباره تلاش کنید.")
+    public_net = server.get("public_net", {})
+    old = public_net.get("ipv4") or {}
+    dc = (server.get("datacenter") or {}).get("name")
+    if not old.get("id") or not dc:
+        raise RuntimeError("این سرور IPv4 اصلی قابل تعویض ندارد یا اطلاعات دیتاسنتر ناقص است.")
+
+    # Use the actual location slug; the datacenter field is not a location slug.
+    location = (server.get("datacenter") or {}).get("location") or {}
+    location_name = location.get("name")
+    if not location_name:
+        # Fetch location list and resolve by datacenter name if API response omits it.
+        locations = await api.locations()
+        dc_info = next((d for d in await api.datacenters() if d.get("name") == dc), None)
+        location_id = (dc_info or {}).get("location", {}).get("id")
+        loc = next((x for x in locations if x.get("id") == location_id), None)
+        location_name = (loc or {}).get("name")
+    if not location_name:
+        raise RuntimeError("مکان هتزنر سرور شناسایی نشد؛ برای جلوگیری از ساخت IP در مکان اشتباه عملیات متوقف شد.")
+
+    new_ip = await api.create_primary_ip(f"replace-{hetzner_id}-{secrets.token_hex(3)}", "ipv4", location_name)
+    new_id, new_address = new_ip.get("id"), new_ip.get("ip")
+    if not new_id or not new_address:
         raise RuntimeError("هتزنر IP جدید معتبری برنگرداند.")
-    # Preserve the old IP until the new IP can be assigned. If assignment fails,
-    # attempt to restore the old assignment and clean up the unused new IP.
+
+    # Unassign old first, then assign new. Each action is awaited to completion.
     await api.unassign_primary_ip(old["id"])
     try:
         await api.assign_primary_ip(new_id, hetzner_id)
     except Exception as exc:
+        # Keep the old IP resource and attempt to restore it if assigning the new IP fails.
         try:
             await api.assign_primary_ip(old["id"], hetzner_id)
-        except Exception:
-            pass
+        except Exception as restore_exc:
+            raise RuntimeError(f"اتصال IP جدید ناموفق بود ({exc}) و اتصال مجدد IP قبلی هم ناموفق شد ({restore_exc}). وضعیت IPها را در کنسول هتزنر بررسی کنید.") from exc
         try:
             await api.delete_primary_ip(new_id)
         except Exception:
             pass
-        raise RuntimeError(f"اتصال IP جدید به سرور ناموفق بود؛ وضعیت IPها را در پنل هتزنر بررسی کنید: {exc}") from exc
+        raise RuntimeError(f"اتصال IP جدید ناموفق بود؛ IP قبلی دوباره متصل شد. علت API: {exc}") from exc
+
     try:
         await api.delete_primary_ip(old["id"])
-    except Exception:
-        # New IP is already assigned; do not report total failure just because old cleanup failed.
-        pass
-    return new_ip["ip"]
+    except Exception as cleanup_exc:
+        # New IP is active; report success with a cleanup warning in logs.
+        logger.warning("New IP assigned but old primary IP %s could not be deleted: %s", old.get("id"), cleanup_exc)
+    return new_address
 
 
 # =============================================================================
