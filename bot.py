@@ -1575,25 +1575,18 @@ async def buy_confirm(call: CallbackQuery, state: FSMContext):
 # ---------------------------------------------------------------------------
 # سرورهای من (کاربر) - و پایه مشترک برای پنل ادمین
 # ---------------------------------------------------------------------------
-def server_actions_kb(server_id: int):
+def server_actions_kb(server_id: int, back_callback: str = "my_servers_list"):
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text="▶️ روشن", callback_data=f"sv_on_{server_id}"),
-                InlineKeyboardButton(text="⏹ خاموش", callback_data=f"sv_off_{server_id}"),
-                InlineKeyboardButton(text="🔄 ریبوت", callback_data=f"sv_reboot_{server_id}"),
-            ],
-            [
-                InlineKeyboardButton(text="🔑 تغییر پسورد", callback_data=f"sv_pass_{server_id}"),
-                InlineKeyboardButton(text="🛠 نصب مجدد (Rebuild)", callback_data=f"sv_rebuild_{server_id}"),
-            ],
-            [
-                InlineKeyboardButton(text="🌐 تغییر IP", callback_data=f"sv_ipchange_{server_id}"),
-                InlineKeyboardButton(text="⏳ تمدید سرویس", callback_data=f"sv_renew_{server_id}"),
-            ],
-            [
-                InlineKeyboardButton(text="🗑 حذف", callback_data=f"sv_del_{server_id}"),
-            ],
+            [InlineKeyboardButton(text="▶️ روشن", callback_data=f"sv_on_{server_id}"),
+             InlineKeyboardButton(text="⏹ خاموش", callback_data=f"sv_off_{server_id}"),
+             InlineKeyboardButton(text="🔄 ریبوت", callback_data=f"sv_reboot_{server_id}")],
+            [InlineKeyboardButton(text="🔑 تغییر پسورد", callback_data=f"sv_pass_{server_id}"),
+             InlineKeyboardButton(text="🛠 نصب مجدد", callback_data=f"sv_rebuild_{server_id}")],
+            [InlineKeyboardButton(text="🌐 تغییر IP", callback_data=f"sv_ipchange_{server_id}"),
+             InlineKeyboardButton(text="⏳ تمدید", callback_data=f"sv_renew_{server_id}")],
+            [InlineKeyboardButton(text="🗑 حذف", callback_data=f"sv_del_{server_id}")],
+            [InlineKeyboardButton(text="🔙 بازگشت به فهرست", callback_data=back_callback)],
         ]
     )
 
@@ -1606,16 +1599,41 @@ async def my_servers(message: Message):
             (message.from_user.id,),
         )
         servers = await cur.fetchall()
-    back_kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🔙 بازگشت به منوی اصلی", callback_data="back_main")]]
-    )
     if not servers:
-        await message.answer("شما هنوز سروری خریداری نکرده‌اید.", reply_markup=back_kb)
+        await message.answer("شما هنوز سروری خریداری نکرده‌اید.", reply_markup=back_inline("back_main"))
         return
-    for s in servers:
-        text = f"🖥 {s[1]}\nآی‌پی: {s[2]}\nدیتاسنتر: {s[3]}\nپلن: {s[4]}\nوضعیت: {s[5]}"
-        await message.answer(text, reply_markup=server_actions_kb(s[0]))
-    await message.answer("برای بازگشت:", reply_markup=back_kb)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🖥 {str(r[1] or 'سرور')} · {str(r[2] or '-')} · #{r[0]}", callback_data=f"svshow_{r[0]}")]
+        for r in servers
+    ] + [[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="back_main")]])
+    await message.answer("🖥 سرورهای شما\nبرای مدیریت، یک سرور را انتخاب کنید:", reply_markup=kb)
+
+
+@router.callback_query(F.data == "my_servers_list")
+async def my_servers_list_callback(call: CallbackQuery):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id, name, ip FROM servers WHERE user_id=? ORDER BY id DESC", (call.from_user.id,))
+        servers = await cur.fetchall()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🖥 {str(r[1] or 'سرور')} · {str(r[2] or '-')} · #{r[0]}", callback_data=f"svshow_{r[0]}")]
+        for r in servers
+    ] + [[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="back_main")]])
+    await call.message.edit_text("🖥 سرورهای شما\nیک سرور را برای مدیریت انتخاب کنید:", reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("svshow_"))
+async def show_server_details(call: CallbackQuery):
+    sid = int(call.data.rsplit("_", 1)[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id, name, ip, location, plan_title, status FROM servers WHERE id=?", (sid,))
+        row = await cur.fetchone()
+    if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
+        await call.answer("سرور پیدا نشد یا دسترسی ندارید.", show_alert=True)
+        return
+    text = f"🖥 {row[1]}\nآی‌پی: {row[2]}\nدیتاسنتر: {row[3]}\nپلن: {row[4]}\nوضعیت: {row[5]}"
+    await call.message.edit_text(text, reply_markup=server_actions_kb(sid))
+    await call.answer()
 
 
 @router.callback_query(F.data.startswith("sv_"))
@@ -2148,23 +2166,43 @@ async def adm_servers(call: CallbackQuery):
         pids = [pid for pid, _ in providers]
         if pids:
             marks = ",".join("?" for _ in pids)
-            cur = await db.execute(f"SELECT id, name, ip, user_id, location, status FROM servers WHERE user_id IS NOT NULL OR (provider_id IN ({marks}) AND user_id IS NULL) ORDER BY id DESC LIMIT 80", pids)
+            cur = await db.execute(f"SELECT id, hetzner_id, name, ip, user_id, location, status FROM servers WHERE user_id IS NOT NULL OR (provider_id IN ({marks}) AND user_id IS NULL) ORDER BY CASE WHEN user_id IS NOT NULL THEN 0 ELSE 1 END, id DESC", pids)
         else:
-            cur = await db.execute("SELECT id, name, ip, user_id, location, status FROM servers WHERE user_id IS NOT NULL ORDER BY id DESC LIMIT 80")
-        servers = await cur.fetchall()
+            cur = await db.execute("SELECT id, hetzner_id, name, ip, user_id, location, status FROM servers WHERE user_id IS NOT NULL ORDER BY id DESC")
+        raw_servers = await cur.fetchall()
+        # One visible record per Hetzner server; prefer customer-owned row over imported ownerless row.
+        seen = set(); servers = []
+        for row in raw_servers:
+            key = row[1] if row[1] is not None else ("db", row[0])
+            if key in seen:
+                continue
+            seen.add(key); servers.append((row[0], row[2], row[3], row[4], row[5], row[6]))
+        servers = servers[:80]
     if not servers:
         await call.message.edit_text("سروری ثبت نشده است.", reply_markup=back_inline())
         await call.answer()
         return
     note = f"\n(🔄 {added} سرور جدید از پنل هتزنر همگام‌سازی شد)" if added else ""
-    await call.message.edit_text(
-        f"🖥 {len(servers)} سرور (شامل سرورهای ساخته‌شده خارج از ربات) - با دکمه‌های مدیریت کامل:{note}",
-        reply_markup=back_inline(),
-    )
-    for s in servers:
-        owner = s[3] if s[3] else "بدون مالک (خارج از ربات)"
-        text = f"🖥 {s[1]}\nآی‌پی: {s[2]}\nمالک: {owner}\nدیتاسنتر: {s[4]}\nوضعیت: {s[5]}"
-        await call.message.answer(text, reply_markup=server_actions_kb(s[0]))
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🖥 {str(s[1] or 'سرور')} · {str(s[2] or '-')} · {'👤'+str(s[3]) if s[3] else 'بدون مالک'} · #{s[0]}", callback_data=f"admsvshow_{s[0]}")]
+        for s in servers
+    ] + [[InlineKeyboardButton(text="🔙 بازگشت", callback_data="adm_back")]])
+    await call.message.edit_text(f"🖥 {len(servers)} سرور — برای مدیریت انتخاب کنید:{note}", reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admsvshow_"))
+async def admin_show_server_details(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("دسترسی غیرمجاز", show_alert=True); return
+    sid = int(call.data.rsplit("_", 1)[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT name, ip, user_id, location, status FROM servers WHERE id=?", (sid,))
+        row = await cur.fetchone()
+    if not row:
+        await call.answer("سرور پیدا نشد.", show_alert=True); return
+    owner = row[2] if row[2] is not None else "بدون مالک (خارج از ربات)"
+    await call.message.edit_text(f"🖥 {row[0]}\nIP: {row[1]}\nمالک: {owner}\nموقعیت: {row[3]}\nوضعیت: {row[4]}", reply_markup=server_actions_kb(sid, "adm_servers"))
     await call.answer()
 
 
