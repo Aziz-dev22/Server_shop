@@ -1279,14 +1279,44 @@ async def create_project_backup() -> Path:
     return archive
 
 async def send_project_backup(bot: Bot, channel: str):
-    archive=await create_project_backup()
+    """Send a new project backup, then best-effort delete the previous managed backup.
+
+    The previous backup is never deleted until Telegram confirms the new document was sent.
+    We only delete the exact message ID saved by this function, never other channel messages.
+    """
+    archive = await create_project_backup()
     try:
-        await bot.send_document(chat_id=channel, document=FSInputFile(archive), caption=f"🗄 بکاپ خودکار پروژه\nزمان: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nفایل تنظیمات محرمانه .env عمداً داخل بکاپ نیست.")
+        sent = await bot.send_document(
+            chat_id=channel,
+            document=FSInputFile(archive),
+            caption=(
+                f"🗄 بکاپ پروژه\nزمان: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "فایل تنظیمات محرمانه .env عمداً داخل بکاپ نیست."
+            ),
+        )
+        # A successful Telegram response is required before touching the previous backup.
+        async with aiosqlite.connect(DB_PATH) as db:
+            old_channel = await get_setting(db, "backup_last_message_channel", "")
+            old_message_id = await get_setting(db, "backup_last_message_id", "")
+            # Persist the new message first, so the newest known-good backup is always tracked.
+            await set_setting(db, "backup_last_message_channel", str(channel))
+            await set_setting(db, "backup_last_message_id", str(sent.message_id))
+        if old_channel and old_message_id:
+            try:
+                await bot.delete_message(chat_id=old_channel, message_id=int(old_message_id))
+            except Exception as exc:
+                # Do not report the successful new backup as failed just because the old
+                # message cannot be deleted (missing admin rights, old message, etc.).
+                logger.warning("New backup sent, but previous backup message could not be deleted: %s", exc)
     finally:
-        try: archive.unlink()
-        except OSError: pass
-        try: archive.parent.rmdir()
-        except OSError: pass
+        try:
+            archive.unlink()
+        except OSError:
+            pass
+        try:
+            archive.parent.rmdir()
+        except OSError:
+            pass
 
 async def automatic_backup_poller(bot: Bot):
     # Settings are read repeatedly so changes in admin panel take effect without restart.

@@ -42,6 +42,7 @@ NAV_ITEMS = [
     ("/users", "👥 کاربران"),
     ("/servers", "🖥 سرورها"),
     ("/backup", "🗄 بکاپ خودکار و عضویت اجباری"),
+    ("/server-transfer", "🔁 انتقال سرورها بین APIها"),
     ("/plans", "🧩 پلن‌ها"),
     ("/locations", "📍 لوکیشن‌ها"),
     ("/providers", "🔑 API های Hetzner"),
@@ -601,6 +602,92 @@ async def backup_restore(request: Request, backup: UploadFile = File(...)):
     except Exception as exc:
         return HTMLResponse(f"بازیابی انجام نشد: {esc(exc)} <a href='/backup'>بازگشت</a>", status_code=400)
     return RedirectResponse("/backup?restored=1", status_code=303)
+
+# ---------------------------------------------------------------------------
+# انتقال ارتباط سرور به API مقصد پس از انتقال واقعی در کنسول Hetzner
+# ---------------------------------------------------------------------------
+@app.get("/server-transfer", response_class=HTMLResponse)
+async def server_transfer_page(request: Request):
+    sess = get_session(request)
+    if not sess:
+        return RedirectResponse("/login")
+    error = request.query_params.get("err", "")
+    success = request.query_params.get("ok", "")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id, label, type, active FROM provider ORDER BY id DESC")
+        providers = await cur.fetchall()
+        cur = await db.execute("""SELECT s.id, s.hetzner_id, s.name, s.ip, s.user_id, s.provider_id,
+            p.label FROM servers s LEFT JOIN provider p ON p.id=s.provider_id
+            WHERE s.hetzner_id IS NOT NULL AND COALESCE(s.provider_type,'hetzner')='hetzner'
+            ORDER BY s.id DESC LIMIT 1000""")
+        servers = await cur.fetchall()
+    provider_options = "".join(
+        f'<option value="{int(p[0])}">{esc(p[1] or "بدون‌نام")} (API #{int(p[0])})</option>'
+        for p in providers if (p[2] or "hetzner") == "hetzner"
+    )
+    seen = set()
+    server_options = []
+    for row in servers:
+        sid, hzid, name, ip, uid, pid, label = row
+        key = str(hzid)
+        if key in seen: continue
+        seen.add(key)
+        owner = f"مالک {uid}" if uid is not None else "بدون مالک"
+        server_options.append(
+            f'<option value="{int(sid)}">{esc(name or "سرور")} | {esc(ip or "بدون IP")} | Hetzner ID: {int(hzid)} | {esc(owner)} | API فعلی: {esc(label or "نامشخص")}</option>'
+        )
+    flash = (f'<div class="msg err">{esc(error)}</div>' if error else "") + (f'<div class="msg ok">{esc(success)}</div>' if success else "")
+    body = f"""
+    <h1><span class="page-icon icon-blue">🔁</span> انتقال سرورها بین APIها</h1>
+    {flash}
+    <div class="card">
+      <h3>انتقال پس از انجام مراحل در Hetzner</h3>
+      <p>این ابزار سرور را در خود Hetzner جابه‌جا نمی‌کند. ابتدا اکانت مقصد را در کنسول Hetzner به پروژه دعوت کن، دعوت را بپذیر و سرور را از پروژه مبدأ به پروژه مقصد منتقل کن.</p>
+      <p><b>فقط پس از انتقال واقعی:</b> سرور و API مقصد را انتخاب کن. پنل بررسی می‌کند که توکن API مقصد بتواند همان سرور را بخواند؛ سپس ارتباط دیتابیس را به API مقصد تغییر می‌دهد.</p>
+      <p class="msg err">تا پیش از موفقیت بررسی دسترسی مقصد، اطلاعات دیتابیس تغییر نمی‌کند. توکن مبدأ را حذف نکن مگر پس از اطمینان از مدیریت کامل سرورها با API مقصد.</p>
+      <form method="post" action="/server-transfer">
+        <label>سرور منتقل‌شده</label>
+        <select name="server_row_id" required>{''.join(server_options) or '<option value="">سروری موجود نیست</option>'}</select>
+        <label>API مقصد (Hetzner)</label>
+        <select name="provider_id" required>{provider_options or '<option value="">ابتدا API مقصد را اضافه کنید</option>'}</select>
+        <button class="btn" type="submit">🔎 بررسی دسترسی و ثبت API مقصد</button>
+      </form>
+    </div>
+    """
+    return page("انتقال سرورها بین APIها", body, "/server-transfer")
+
+
+@app.post("/server-transfer")
+async def server_transfer_submit(request: Request):
+    sess = get_session(request)
+    if not sess:
+        return RedirectResponse("/login")
+    form = await request.form()
+    try:
+        server_row_id = int(form.get("server_row_id", "0"))
+        provider_id = int(form.get("provider_id", "0"))
+    except (TypeError, ValueError):
+        return RedirectResponse("/server-transfer?err=" + urllib.parse.quote("سرور یا API مقصد نامعتبر است."), status_code=303)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT hetzner_id, provider_type FROM servers WHERE id=?", (server_row_id,))
+        server = await cur.fetchone()
+        cur = await db.execute("SELECT api_token, type, label FROM provider WHERE id=?", (provider_id,))
+        provider = await cur.fetchone()
+    if not server or not server[0]:
+        return RedirectResponse("/server-transfer?err=" + urllib.parse.quote("سرور انتخاب‌شده پیدا نشد."), status_code=303)
+    if not provider or (provider[1] or "hetzner") != "hetzner":
+        return RedirectResponse("/server-transfer?err=" + urllib.parse.quote("API مقصد باید یک اتصال Hetzner معتبر باشد."), status_code=303)
+    try:
+        api = core.HetznerAPI(provider[0])
+        await api.get_server(int(server[0]))
+    except Exception as exc:
+        return RedirectResponse("/server-transfer?err=" + urllib.parse.quote("API مقصد هنوز به این سرور دسترسی ندارد؛ انتقال در دیتابیس انجام نشد. جزئیات: " + str(exc)[:180]), status_code=303)
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Update all duplicate DB rows for this Hetzner server, preserving owner/order/expiry.
+        await db.execute("UPDATE servers SET provider_id=?, provider_type='hetzner' WHERE hetzner_id=? AND COALESCE(provider_type,'hetzner')='hetzner'", (provider_id, int(server[0])))
+        await db.commit()
+    return RedirectResponse("/server-transfer?ok=" + urllib.parse.quote(f"دسترسی API مقصد ({provider[2] or provider_id}) تأیید شد و ارتباط سرور در دیتابیس به‌روزرسانی شد."), status_code=303)
+
 
 # ---------------------------------------------------------------------------
 # سرورها
