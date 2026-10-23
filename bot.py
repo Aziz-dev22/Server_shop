@@ -435,7 +435,8 @@ class HetznerAPI:
             if status == "error":
                 err = action.get("error") or {}
                 raise RuntimeError(f"Hetzner action failed: {err.get('code', 'unknown')} — {err.get('message', 'no details')}")
-            await asyncio.sleep(1)
+            # Hetzner recommends avoiding overly frequent action polling.
+            await asyncio.sleep(3)
         raise TimeoutError(f"Hetzner action {action_id} did not finish within {timeout}s")
 
     async def unassign_primary_ip(self, primary_ip_id):
@@ -446,9 +447,13 @@ class HetznerAPI:
     async def delete_primary_ip(self, primary_ip_id):
         return await self._delete(f"/primary_ips/{primary_ip_id}")
 
-    async def create_primary_ip(self, name, ip_type, datacenter, assignee_id=None):
-        # Hetzner expects a location slug (e.g. nbg1), not the datacenter name.
-        payload = {"type": ip_type, "name": name, "datacenter": datacenter}
+    async def create_primary_ip(self, name, ip_type, location, assignee_id=None):
+        # Hetzner removed the deprecated `datacenter` request field in July 2026.
+        # Primary IPs must now be created with the location slug (e.g. nbg1).
+        payload = {"type": ip_type, "name": name, "location": location}
+        if assignee_id is not None:
+            payload["assignee_type"] = "server"
+            payload["assignee_id"] = assignee_id
         data = await self._post("/primary_ips", json=payload)
         return data["primary_ip"]
 
@@ -463,24 +468,17 @@ async def change_server_ip(api: "HetznerAPI", hetzner_id: int) -> str:
     server = await api.get_server(hetzner_id)
     if server.get("status") != "off":
         raise RuntimeError("برای تغییر Primary IP، ابتدا سرور را خاموش کنید و وضعیت آن باید در هتزنر «off» باشد. پس از خاموش شدن دوباره تلاش کنید.")
-    public_net = server.get("public_net", {})
+    public_net = server.get("public_net") or {}
     old = public_net.get("ipv4") or {}
-    dc = (server.get("datacenter") or {}).get("name")
-    if not old.get("id") or not dc:
-        raise RuntimeError("این سرور IPv4 اصلی قابل تعویض ندارد یا اطلاعات دیتاسنتر ناقص است.")
-
-    # Use the actual location slug; the datacenter field is not a location slug.
-    location = (server.get("datacenter") or {}).get("location") or {}
+    # The Hetzner Cloud API removed the `datacenter` response field on 1 Oct 2026.
+    # Current server responses expose the location directly.
+    location = server.get("location") or {}
     location_name = location.get("name")
     if not location_name:
-        # Fetch location list and resolve by datacenter name if API response omits it.
-        locations = await api.locations()
-        dc_info = next((d for d in await api.datacenters() if d.get("name") == dc), None)
-        location_id = (dc_info or {}).get("location", {}).get("id")
-        loc = next((x for x in locations if x.get("id") == location_id), None)
-        location_name = (loc or {}).get("name")
-    if not location_name:
-        raise RuntimeError("مکان هتزنر سرور شناسایی نشد؛ برای جلوگیری از ساخت IP در مکان اشتباه عملیات متوقف شد.")
+        # Compatibility with older API responses that still include datacenter.location.
+        location_name = ((server.get("datacenter") or {}).get("location") or {}).get("name")
+    if not old.get("id") or not location_name:
+        raise RuntimeError("این سرور IPv4 اصلی قابل تعویض ندارد یا API هتزنر اطلاعات مکان سرور را برنگرداند.")
 
     new_ip = await api.create_primary_ip(f"replace-{hetzner_id}-{secrets.token_hex(3)}", "ipv4", location_name)
     new_id, new_address = new_ip.get("id"), new_ip.get("ip")
