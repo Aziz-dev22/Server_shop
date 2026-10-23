@@ -1726,7 +1726,14 @@ async def show_server_details(call: CallbackQuery):
     await call.answer()
 
 
-@router.callback_query(F.data.startswith("sv_"))
+@router.callback_query(
+    F.data.startswith("sv_on_")
+    | F.data.startswith("sv_off_")
+    | F.data.startswith("sv_reboot_")
+    | F.data.startswith("sv_pass_")
+    | F.data.startswith("sv_rebuild_")
+    | F.data.startswith("sv_del_")
+)
 async def server_action(call: CallbackQuery):
     _, action, server_db_id = call.data.split("_")
     server_db_id = int(server_db_id)
