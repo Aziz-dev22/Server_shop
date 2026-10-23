@@ -17,6 +17,9 @@ import html
 import logging
 import os
 import secrets
+import zipfile
+import tempfile
+from pathlib import Path
 from datetime import datetime, timedelta
 
 import aiosqlite
@@ -35,7 +38,9 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    FSInputFile,
 )
+from aiogram import BaseMiddleware
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -983,6 +988,7 @@ def admin_menu_kb():
         [InlineKeyboardButton(text="🏦 آدرس واریز دستی", callback_data="adm_manual_addr")],
         [InlineKeyboardButton(text="💳 درخواست‌های شارژ در انتظار", callback_data="adm_wallet_reqs")],
         [InlineKeyboardButton(text="📢 پیام همگانی", callback_data="adm_broadcast")],
+        [InlineKeyboardButton(text="🗄 بکاپ خودکار و عضویت اجباری", callback_data="adm_backup_join")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1047,12 +1053,232 @@ class SupportTicket(StatesGroup):
     waiting = State()
 
 
+class AdminBackupChannel(StatesGroup):
+    waiting = State()
+
+class AdminBackupInterval(StatesGroup):
+    waiting = State()
+
+class AdminJoinChannel(StatesGroup):
+    waiting = State()
+
+class AdminJoinLink(StatesGroup):
+    waiting = State()
+
 class AdminDirect(StatesGroup):
     location = State()
     type = State()
     image = State()
     confirm = State()
 
+
+# ---------------------------------------------------------------------------
+# بکاپ خودکار پروژه و عضویت اجباری کانال
+# ---------------------------------------------------------------------------
+PROJECT_DIR = Path(__file__).resolve().parent
+BACKUP_EXCLUDE_DIRS = {"__pycache__", ".git", ".venv", "venv", "node_modules", "backups"}
+
+class MembershipMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if isinstance(event, CallbackQuery) and event.data == "check_mandatory_membership":
+            return await handler(event, data)
+        if not user or is_admin(user.id):
+            return await handler(event, data)
+        bot = data.get("bot")
+        async with aiosqlite.connect(DB_PATH) as db:
+            channel = await get_setting(db, "mandatory_channel", "")
+            invite = await get_setting(db, "mandatory_channel_link", "")
+        if not channel:
+            return await handler(event, data)
+        try:
+            member = await bot.get_chat_member(chat_id=channel, user_id=user.id)
+            if member.status in ("creator", "administrator", "member") or (member.status == "restricted" and getattr(member, "is_member", False)):
+                return await handler(event, data)
+        except Exception as exc:
+            logger.warning("membership check failed for %s in %s: %s", user.id, channel, exc)
+            # Fail closed: configured channel must be accessible and the bot should be admin/member.
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📢 عضویت در کانال", url=invite)] if invite else [InlineKeyboardButton(text="📢 باز کردن کانال", url=f"https://t.me/{str(channel).lstrip('@')}")],
+            [InlineKeyboardButton(text="✅ بررسی عضویت", callback_data="check_mandatory_membership")],
+        ])
+        if isinstance(event, Message):
+            await event.answer("برای استفاده از ربات ابتدا در کانال زیر عضو شو و سپس «بررسی عضویت» را بزن.", reply_markup=kb)
+        elif isinstance(event, CallbackQuery):
+            await event.answer("ابتدا باید عضو کانال شوی.", show_alert=True)
+        return None
+
+
+def backup_join_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 تنظیم کانال بکاپ", callback_data="set_backup_channel")],
+        [InlineKeyboardButton(text="⏱ تنظیم فاصله بکاپ", callback_data="set_backup_interval")],
+        [InlineKeyboardButton(text="▶️ فعال‌کردن بکاپ", callback_data="enable_auto_backup"), InlineKeyboardButton(text="⏸ توقف بکاپ", callback_data="disable_auto_backup")],
+        [InlineKeyboardButton(text="📢 تنظیم کانال عضویت اجباری", callback_data="set_join_channel")],
+        [InlineKeyboardButton(text="🔗 تنظیم لینک عضویت", callback_data="set_join_link")],
+        [InlineKeyboardButton(text="🧪 ارسال بکاپ آزمایشی", callback_data="send_backup_now")],
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="adm_back")],
+    ])
+
+@router.callback_query(F.data == "adm_backup_join")
+async def admin_backup_join(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("دسترسی ندارید", show_alert=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        backup_channel = await get_setting(db, "backup_channel", "تنظیم نشده")
+        interval = await get_setting(db, "backup_interval_minutes", "60")
+        enabled = await get_setting(db, "backup_enabled", "0")
+        join_channel = await get_setting(db, "mandatory_channel", "غیرفعال")
+        join_link = await get_setting(db, "mandatory_channel_link", "تنظیم نشده")
+    status = "فعال" if enabled == "1" else "متوقف"
+    await call.message.edit_text(
+        "🗄 <b>بکاپ خودکار و عضویت اجباری</b>\n\n"
+        f"کانال بکاپ: <code>{html.escape(backup_channel)}</code>\n"
+        f"فاصله بکاپ: {html.escape(str(interval))} دقیقه\nوضعیت بکاپ: {status}\n\n"
+        f"کانال عضویت اجباری: <code>{html.escape(join_channel)}</code>\n"
+        f"لینک عضویت: {html.escape(join_link)}\n\n"
+        "برای ارسال بکاپ، ربات باید در کانال مقصد اجازه ارسال فایل داشته باشد. برای بررسی عضویت نیز ربات باید به کانال دسترسی داشته باشد.",
+        reply_markup=backup_join_kb())
+    await call.answer()
+
+@router.callback_query(F.data == "set_backup_channel")
+async def set_backup_channel_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return await call.answer("دسترسی ندارید", show_alert=True)
+    await state.set_state(AdminBackupChannel.waiting)
+    await call.message.answer("شناسه کانال بکاپ را بفرست (مثلاً <code>-1001234567890</code> یا <code>@channelname</code>). ربات باید اجازه ارسال فایل داشته باشد.")
+    await call.answer()
+
+@router.message(AdminBackupChannel.waiting)
+async def set_backup_channel_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    value=(message.text or "").strip()
+    if not value or len(value)>100:
+        return await message.answer("شناسه کانال معتبر نیست؛ دوباره بفرست.")
+    async with aiosqlite.connect(DB_PATH) as db: await set_setting(db,"backup_channel",value)
+    await state.clear(); await message.answer("✅ کانال بکاپ ذخیره شد. از /admin و بخش بکاپ و عضویت ادامه بده.")
+
+@router.callback_query(F.data == "set_backup_interval")
+async def set_backup_interval_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return await call.answer("دسترسی ندارید", show_alert=True)
+    await state.set_state(AdminBackupInterval.waiting)
+    await call.message.answer("فاصله بکاپ را بفرست؛ مثال: <code>30m</code> برای ۳۰ دقیقه یا <code>2h</code> برای ۲ ساعت. حداقل ۵ دقیقه.")
+    await call.answer()
+
+@router.message(AdminBackupInterval.waiting)
+async def set_backup_interval_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    raw=(message.text or "").strip().lower().replace(" ", "")
+    try:
+        if raw.endswith("m"): minutes=int(raw[:-1])
+        elif raw.endswith("h"): minutes=int(raw[:-1])*60
+        else: minutes=int(raw)
+        if minutes < 5 or minutes > 43200: raise ValueError
+    except ValueError:
+        return await message.answer("فرمت نامعتبر است. مثل 15m، 2h یا 60 بفرست. حداقل ۵ دقیقه و حداکثر ۳۰ روز.")
+    async with aiosqlite.connect(DB_PATH) as db: await set_setting(db,"backup_interval_minutes",str(minutes))
+    await state.clear(); await message.answer(f"✅ فاصله بکاپ روی {minutes} دقیقه تنظیم شد.")
+
+@router.callback_query(F.data.in_({"enable_auto_backup", "disable_auto_backup"}))
+async def toggle_auto_backup(call: CallbackQuery):
+    if not is_admin(call.from_user.id): return await call.answer("دسترسی ندارید", show_alert=True)
+    enabled = "1" if call.data == "enable_auto_backup" else "0"
+    async with aiosqlite.connect(DB_PATH) as db:
+        channel=await get_setting(db,"backup_channel","")
+        await set_setting(db,"backup_enabled",enabled)
+    if enabled == "1" and not channel:
+        async with aiosqlite.connect(DB_PATH) as db: await set_setting(db,"backup_enabled","0")
+        return await call.answer("اول کانال بکاپ را تنظیم کن.", show_alert=True)
+    await call.answer("بکاپ خودکار فعال شد." if enabled=="1" else "بکاپ خودکار متوقف شد.", show_alert=True)
+
+@router.callback_query(F.data == "set_join_channel")
+async def set_join_channel_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return await call.answer("دسترسی ندارید", show_alert=True)
+    await state.set_state(AdminJoinChannel.waiting)
+    await call.message.answer("شناسه کانال عضویت اجباری را بفرست (مثلاً <code>@channelname</code> یا شناسه عددی <code>-100...</code>). برای کانال خصوصی، شناسه عددی را وارد کن.")
+    await call.answer()
+
+@router.message(AdminJoinChannel.waiting)
+async def set_join_channel_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    value=(message.text or "").strip()
+    if not value or len(value)>100: return await message.answer("شناسه کانال معتبر نیست؛ دوباره بفرست.")
+    async with aiosqlite.connect(DB_PATH) as db: await set_setting(db,"mandatory_channel",value)
+    await state.clear(); await message.answer("✅ کانال عضویت اجباری ذخیره شد. مطمئن شو ربات به کانال دسترسی دارد.")
+
+@router.callback_query(F.data == "set_join_link")
+async def set_join_link_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return await call.answer("دسترسی ندارید", show_alert=True)
+    await state.set_state(AdminJoinLink.waiting)
+    await call.message.answer("لینک عضویت کانال را بفرست (مثلاً <code>https://t.me/channelname</code> یا لینک دعوت خصوصی). برای حذف لینک، کلمه <code>none</code> را بفرست.")
+    await call.answer()
+
+@router.message(AdminJoinLink.waiting)
+async def set_join_link_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    value=(message.text or "").strip()
+    if value.lower()=="none": value=""
+    elif not value.startswith("https://t.me/"): return await message.answer("لینک باید با https://t.me/ شروع شود یا none بفرستی.")
+    async with aiosqlite.connect(DB_PATH) as db: await set_setting(db,"mandatory_channel_link",value)
+    await state.clear(); await message.answer("✅ لینک عضویت ذخیره شد.")
+
+@router.callback_query(F.data == "check_mandatory_membership")
+async def check_mandatory_membership(call: CallbackQuery):
+    async with aiosqlite.connect(DB_PATH) as db:
+        channel=await get_setting(db,"mandatory_channel","")
+    if not channel:
+        return await call.answer("عضویت اجباری فعال نیست.", show_alert=True)
+    try:
+        member=await call.bot.get_chat_member(chat_id=channel,user_id=call.from_user.id)
+        ok=member.status in ("creator","administrator","member") or (member.status=="restricted" and getattr(member,"is_member",False))
+    except Exception:
+        ok=False
+    if ok:
+        await call.answer("عضویت تأیید شد؛ حالا /start را بزن.", show_alert=True)
+        try: await call.message.delete()
+        except Exception: pass
+    else:
+        await call.answer("هنوز عضویتت تأیید نشده است.", show_alert=True)
+
+async def create_project_backup() -> Path:
+    temp_dir = Path(tempfile.mkdtemp(prefix="hetzner_backup_"))
+    archive = temp_dir / f"hetzner-shop-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for path in PROJECT_DIR.rglob("*"):
+            if not path.is_file(): continue
+            rel=path.relative_to(PROJECT_DIR)
+            if any(part in BACKUP_EXCLUDE_DIRS for part in rel.parts): continue
+            if path.name == ".env" or path.suffix in {".pyc", ".zip"}: continue
+            # Avoid archiving the backup itself or temporary artifacts.
+            if path.resolve() == archive.resolve(): continue
+            zf.write(path, rel.as_posix())
+    return archive
+
+async def send_project_backup(bot: Bot, channel: str):
+    archive=await create_project_backup()
+    try:
+        await bot.send_document(chat_id=channel, document=FSInputFile(archive), caption=f"🗄 بکاپ خودکار پروژه\nزمان: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nفایل تنظیمات محرمانه .env عمداً داخل بکاپ نیست.")
+    finally:
+        try: archive.unlink()
+        except OSError: pass
+        try: archive.parent.rmdir()
+        except OSError: pass
+
+async def automatic_backup_poller(bot: Bot):
+    # Settings are read repeatedly so changes in admin panel take effect without restart.
+    while True:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                enabled=await get_setting(db,"backup_enabled","0")
+                channel=await get_setting(db,"backup_channel","")
+                interval=int(await get_setting(db,"backup_interval_minutes","60"))
+                last=float(await get_setting(db,"backup_last_epoch","0"))
+            now=time.time()
+            if enabled=="1" and channel and now-last >= interval*60:
+                await send_project_backup(bot,channel)
+                async with aiosqlite.connect(DB_PATH) as db: await set_setting(db,"backup_last_epoch",str(time.time()))
+        except Exception as exc:
+            logger.exception("automatic backup failed: %s",exc)
+        await asyncio.sleep(30)
 
 # ---------------------------------------------------------------------------
 # شروع / منوی اصلی
@@ -3262,6 +3488,9 @@ async def main():
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    router.message.middleware(MembershipMiddleware())
+    router.callback_query.middleware(MembershipMiddleware())
+    asyncio.create_task(automatic_backup_poller(bot))
     asyncio.create_task(oxapay_poller(bot))
     asyncio.create_task(maintenance_poller(bot))
     logger.info("Bot started.")
