@@ -1019,6 +1019,10 @@ class AdminUserBalance(StatesGroup):
     amount = State()
 
 
+class AdminServerOwner(StatesGroup):
+    waiting_for_user_id = State()
+
+
 class AdminOxapay(StatesGroup):
     waiting = State()
 
@@ -1655,6 +1659,7 @@ def server_actions_kb(server_id: int, back_callback: str = "my_servers_list"):
             [InlineKeyboardButton(text="🌐 تغییر IP", callback_data=f"sv_ipchange_{server_id}"),
              InlineKeyboardButton(text="⏳ تمدید", callback_data=f"sv_renew_{server_id}")],
             [InlineKeyboardButton(text="🗑 حذف", callback_data=f"sv_del_{server_id}")],
+            *([[InlineKeyboardButton(text="👤 تعیین / انتقال مالکیت", callback_data=f"admsvowner_{server_id}")]] if back_callback == "adm_servers" else []),
             [InlineKeyboardButton(text="🔙 بازگشت به فهرست", callback_data=back_callback)],
         ]
     )
@@ -2296,6 +2301,77 @@ async def adm_servers(call: CallbackQuery):
     ] + [[InlineKeyboardButton(text="🔙 بازگشت", callback_data="adm_back")]])
     await call.message.edit_text(f"🖥 {len(servers)} سرور — برای مدیریت انتخاب کنید:{note}", reply_markup=kb)
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("admsvowner_"))
+async def admin_server_owner_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("دسترسی غیرمجاز", show_alert=True)
+        return
+    sid = int(call.data.rsplit("_", 1)[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id, name, user_id FROM servers WHERE id=?", (sid,))
+        server = await cur.fetchone()
+    if not server:
+        await call.answer("سرور پیدا نشد.", show_alert=True)
+        return
+    await state.set_state(AdminServerOwner.waiting_for_user_id)
+    await state.update_data(owner_server_id=sid)
+    await call.message.answer(
+        f"👤 تعیین مالک برای سرور «{server[1] or sid}»\n"
+        f"مالک فعلی: {server[2] if server[2] is not None else 'بدون مالک'}\n\n"
+        "شناسه عددی تلگرام (Telegram ID) مالک جدید را ارسال کنید. "
+        "کاربر باید حداقل یک‌بار ربات را Start کرده باشد.\n"
+        "برای لغو، /cancel را بفرستید."
+    )
+    await call.answer()
+
+
+@router.message(AdminServerOwner.waiting_for_user_id)
+async def admin_server_owner_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    if (message.text or "").strip().lower() == "/cancel":
+        await state.clear()
+        await message.answer("عملیات تعیین مالک لغو شد.", reply_markup=main_menu_kb(True))
+        return
+    raw_id = (message.text or "").strip()
+    if not raw_id.isdigit():
+        await message.answer("شناسه تلگرام باید فقط عدد باشد. دوباره ارسال کنید یا /cancel بزنید.")
+        return
+    target_id = int(raw_id)
+    data = await state.get_data()
+    sid = data.get("owner_server_id")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id, name, user_id FROM servers WHERE id=?", (sid,))
+        server = await cur.fetchone()
+        user = await get_user(db, target_id)
+        if not server:
+            await state.clear()
+            await message.answer("سرور پیدا نشد؛ فهرست سرورها را دوباره باز کنید.")
+            return
+        if not user:
+            await message.answer("این کاربر در ربات ثبت نشده است. از او بخواهید ابتدا ربات را Start کند، سپس شناسه را دوباره بفرستید.")
+            return
+        old_owner = server[2]
+        await db.execute("UPDATE servers SET user_id=? WHERE id=?", (target_id, sid))
+        await db.commit()
+    await state.clear()
+    await message.answer(
+        f"✅ مالکیت سرور با موفقیت ثبت شد.\nسرور: {server[1] or sid}\n"
+        f"مالک قبلی: {old_owner if old_owner is not None else 'بدون مالک'}\nمالک جدید: {target_id}",
+        reply_markup=main_menu_kb(True),
+    )
+    try:
+        await message.bot.send_message(target_id, f"👤 یک سرور به حساب شما اختصاص داده شد: {server[1] or sid} (شناسه سرور: #{sid})")
+    except Exception:
+        pass
+    if old_owner and old_owner != target_id:
+        try:
+            await message.bot.send_message(old_owner, f"ℹ️ مالکیت سرور «{server[1] or sid}» به کاربر دیگری منتقل شد.")
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data.startswith("admsvshow_"))
