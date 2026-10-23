@@ -1372,6 +1372,20 @@ def compute_price_generic(types_list, server_type_id, markup_percent):
     return None
 
 
+def deduplicate_images(images):
+    """Remove duplicate OS choices by display name, keeping the newest/first API entry."""
+    result = []
+    seen = set()
+    for img in images or []:
+        name = str(img.get("name") or img.get("description") or img.get("id") or "").strip()
+        key = " ".join(name.casefold().split())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(img)
+    return result
+
+
 def extract_server_ip(provider_type: str, server: dict) -> str:
     if provider_type == "hetzner":
         return server.get("public_net", {}).get("ipv4", {}).get("ip", "در حال تخصیص")
@@ -1468,7 +1482,7 @@ async def buy_plan(call: CallbackQuery, state: FSMContext):
     await state.update_data(plan_id=plan[0], server_type=plan[1], plan_title=plan[2], markup=plan[3])
     api = make_provider_api(provider_type, token)
     try:
-        images = await api.images()
+        images = deduplicate_images(await api.images())
     except Exception as e:
         await call.message.answer(f"خطا در دریافت سیستم‌عامل‌ها: {e}")
         await call.answer()
@@ -1645,7 +1659,28 @@ async def show_server_details(call: CallbackQuery):
     if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
         await call.answer("سرور پیدا نشد یا دسترسی ندارید.", show_alert=True)
         return
-    text = f"🖥 {row[1]}\nآی‌پی: {row[2]}\nدیتاسنتر: {row[3]}\nپلن: {row[4]}\nوضعیت: {row[5]}"
+    status = row[5] or "نامشخص"
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT hetzner_id, provider_type FROM servers WHERE id=?", (sid,))
+        live_row = await cur.fetchone()
+        if live_row:
+            provider_type = live_row[1] or "hetzner"
+            token = await get_active_token_for(db, provider_type)
+        else:
+            provider_type, token = "hetzner", None
+    if live_row and token:
+        try:
+            api = make_provider_api(provider_type, token)
+            live_server = await api.get_server(live_row[0])
+            raw_status = str(live_server.get("status") or "unknown").lower()
+            status_map = {"running": "🟢 روشن", "off": "🔴 خاموش", "initializing": "🟡 در حال راه‌اندازی", "starting": "🟡 در حال روشن شدن", "stopping": "🟠 در حال خاموش شدن", "rebooting": "🟡 در حال راه‌اندازی مجدد", "unknown": "⚪ نامشخص"}
+            status = status_map.get(raw_status, raw_status)
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE servers SET status=? WHERE id=?", (raw_status, sid))
+                await db.commit()
+        except Exception:
+            status = ("🟢 روشن" if str(status).lower() == "running" else "🔴 خاموش" if str(status).lower() == "off" else f"⚪ {status}")
+    text = f"🖥 {row[1]}\nآی‌پی: {row[2]}\nدیتاسنتر: {row[3]}\nپلن: {row[4]}\nوضعیت: {status}"
     await call.message.edit_text(text, reply_markup=server_actions_kb(sid))
     await call.answer()
 
@@ -1688,7 +1723,7 @@ async def server_action(call: CallbackQuery):
             )
             await call.answer()
         elif action == "rebuild":
-            images = await api.images()
+            images = deduplicate_images(await api.images())
             kb_rows = [
                 [InlineKeyboardButton(text=img.get("name"), callback_data=f"svrbc_{server_db_id}_{img['id']}")]
                 for img in images[:100]
@@ -2275,7 +2310,7 @@ async def adm_direct_type(call: CallbackQuery, state: FSMContext):
     async with aiosqlite.connect(DB_PATH) as db:
         token = await get_active_token(db)
     api = HetznerAPI(token)
-    images = await api.images()
+    images = deduplicate_images(await api.images())
     kb_rows = [[InlineKeyboardButton(text=img.get("name"), callback_data=f"adimg_{img['id']}")] for img in images[:100]]
     kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="adm_back")])
     await state.set_state(AdminDirect.image)
