@@ -271,6 +271,15 @@ async def get_setting(db, key, default=None):
     return row[0] if row else default
 
 
+async def get_ip_change_pricing(db):
+    """قیمت‌گذاری تغییر IP قابل تنظیم از پنل تنظیمات/دیتابیس."""
+    try: free_count = max(0, int(await get_setting(db, "ip_change_free_count", str(IP_CHANGE_FREE_COUNT))))
+    except (TypeError, ValueError): free_count = IP_CHANGE_FREE_COUNT
+    try: price = max(0.0, float(await get_setting(db, "ip_change_price_usd", str(IP_CHANGE_PRICE))))
+    except (TypeError, ValueError): price = IP_CHANGE_PRICE
+    return free_count, price
+
+
 async def set_setting(db, key, value):
     await db.execute(
         "INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -948,6 +957,9 @@ class AdminAddPlan(StatesGroup):
 class AdminUserBalance(StatesGroup):
     amount = State()
 
+class AdminServerTransfer(StatesGroup):
+    waiting_user_id = State()
+
 
 class AdminOxapay(StatesGroup):
     waiting = State()
@@ -1529,11 +1541,11 @@ async def buy_confirm(call: CallbackQuery, state: FSMContext):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=?", (price, user_id))
         await db.execute(
-            "INSERT INTO servers (user_id, hetzner_id, name, ip, location, plan_title, os_image, root_password, status, created_at, expires_at, monthly_price, provider_type) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO servers (user_id, hetzner_id, name, ip, location, plan_title, os_image, root_password, status, created_at, expires_at, monthly_price, provider_type, provider_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,(SELECT id FROM provider WHERE active=1 AND type=? ORDER BY id LIMIT 1))",
             (
                 user_id, server["id"], server_name, ip, data["location"], data["plan_title"],
-                data["image"], root_password, "running", datetime.utcnow().isoformat(), expires_at, price, provider_type,
+                data["image"], root_password, "running", datetime.utcnow().isoformat(), expires_at, price, provider_type, provider_type,
             ),
         )
         cur = await db.execute("SELECT last_insert_rowid()")
@@ -1717,7 +1729,9 @@ async def server_ipchange_start(call: CallbackQuery):
         await call.answer("این قابلیت فقط برای سرورهای Hetzner در دسترس است.", show_alert=True)
         return
     count = row[3] or 0
-    cost = 0 if count < IP_CHANGE_FREE_COUNT else IP_CHANGE_PRICE
+    async with aiosqlite.connect(DB_PATH) as db:
+        free_count, ip_price = await get_ip_change_pricing(db)
+    cost = 0 if count < free_count else ip_price
     cost_txt = "رایگان" if cost == 0 else fmt_price(cost)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1727,7 +1741,7 @@ async def server_ipchange_start(call: CallbackQuery):
     )
     await call.message.answer(
         f"سرور «{html.escape(row[2])}» را تاکنون {count} بار IP تغییر داده‌اید.\n"
-        f"دفعات رایگان: {IP_CHANGE_FREE_COUNT} بار — بعد از آن هر بار {fmt_price(IP_CHANGE_PRICE)}.\n"
+        f"دفعات رایگان: {free_count} بار — بعد از آن هر بار {fmt_price(ip_price)}.\n"
         f"هزینه این تغییر: {cost_txt}\n\n"
         "⚠️ توجه: تغییر IP چند دقیقه طول می‌کشد و IP قبلی برای همیشه از بین می‌رود.",
         reply_markup=kb,
@@ -1749,7 +1763,8 @@ async def server_ipchange_confirm(call: CallbackQuery):
             return
         owner_id, hetzner_id, name, count, _ = row
         count = count or 0
-        cost = 0 if count < IP_CHANGE_FREE_COUNT else IP_CHANGE_PRICE
+        free_count, ip_price = await get_ip_change_pricing(db)
+        cost = 0 if count < free_count else ip_price
         if cost > 0 and owner_id:
             cur2 = await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,))
             bal_row = await cur2.fetchone()
@@ -2054,15 +2069,33 @@ async def adm_user_balance_apply(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "adm_orders")
 async def adm_orders(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return
+    if not is_admin(call.from_user.id): return
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT plan_title, user_id, price, status FROM orders ORDER BY id DESC LIMIT 30")
+        cur = await db.execute("SELECT id, plan_title, user_id, price, status FROM orders ORDER BY id DESC LIMIT 40")
         orders = await cur.fetchall()
-    lines = ["📦 آخرین سفارش‌ها:\n"]
-    for o in orders:
-        lines.append(f"• {o[0]} | کاربر: {o[1]} | {fmt_price(o[2])} | {o[3]}")
-    await call.message.edit_text("\n".join(lines) if orders else "سفارشی ثبت نشده است.", reply_markup=back_inline())
+    rows = []
+    for oid, title, uid, price, status in orders:
+        rows.append([InlineKeyboardButton(text=f"#{oid} | {title or 'سفارش'} | {uid or '-'} | {fmt_price(price)} | {status}"[:60], callback_data=f"adm_order_{oid}")])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت به منوی مدیریت", callback_data="adm_back")])
+    await call.message.edit_text("📦 برای مدیریت سفارش، آن را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm_order_"))
+async def adm_order_detail(call: CallbackQuery):
+    if not is_admin(call.from_user.id): return
+    oid = int(call.data.rsplit("_", 1)[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id, user_id, server_id, plan_title, location, price, status, created_at FROM orders WHERE id=?", (oid,))
+        o = await cur.fetchone()
+    if not o: await call.answer("سفارش پیدا نشد", show_alert=True); return
+    _, uid, sid, title, loc, price, status, created = o
+    rows = []
+    if sid:
+        rows.extend(server_actions_kb(sid).inline_keyboard)
+        rows.append([InlineKeyboardButton(text="👤 انتقال سرور به مشتری دیگر", callback_data=f"sv_transfer_{sid}")])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت به سفارش‌ها", callback_data="adm_orders")])
+    await call.message.edit_text(f"📦 سفارش #{oid}\nمشتری: {uid or '-'}\nسرور: {sid or '-'}\nپلن: {title or '-'}\nلوکیشن: {loc or '-'}\nمبلغ: {fmt_price(price)}\nوضعیت: {status}\nزمان: {created or '-'}", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await call.answer()
 
 
@@ -2120,34 +2153,68 @@ async def sync_hetzner_servers(db, api: "HetznerAPI"):
 
 @router.callback_query(F.data == "adm_servers")
 async def adm_servers(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return
+    if not is_admin(call.from_user.id): return
     async with aiosqlite.connect(DB_PATH) as db:
         token = await get_active_token(db)
-        added = 0
-        if token:
-            added = await sync_hetzner_servers(db, HetznerAPI(token))
-        cur = await db.execute(
-            "SELECT id, name, ip, user_id, location, status FROM servers ORDER BY id DESC LIMIT 40"
-        )
+        added = await sync_hetzner_servers(db, HetznerAPI(token)) if token else 0
+        cur = await db.execute("SELECT id, name, ip, user_id, status FROM servers ORDER BY id DESC LIMIT 80")
         servers = await cur.fetchall()
-    if not servers:
-        await call.message.edit_text("سروری ثبت نشده است.", reply_markup=back_inline())
-        await call.answer()
-        return
-    note = f"\n(🔄 {added} سرور جدید از پنل هتزنر همگام‌سازی شد)" if added else ""
-    await call.message.edit_text(
-        f"🖥 {len(servers)} سرور (شامل سرورهای ساخته‌شده خارج از ربات) - با دکمه‌های مدیریت کامل:{note}",
-        reply_markup=back_inline(),
-    )
-    for s in servers:
-        owner = s[3] if s[3] else "بدون مالک (خارج از ربات)"
-        text = f"🖥 {s[1]}\nآی‌پی: {s[2]}\nمالک: {owner}\nدیتاسنتر: {s[4]}\nوضعیت: {s[5]}"
-        await call.message.answer(text, reply_markup=server_actions_kb(s[0]))
+    rows = []
+    for sid, name, ip, owner, status in servers:
+        label = f"{name or 'بدون‌نام'} | {ip or 'بدون IP'}"
+        rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"adm_server_{sid}")])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت به منوی مدیریت", callback_data="adm_back")])
+    note = f"\n{added} سرور جدید همگام شد." if added else ""
+    await call.message.edit_text(f"🖥 سرورها را برای مدیریت انتخاب کنید (نام و IP).{note}", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm_server_"))
+async def adm_server_detail(call: CallbackQuery):
+    if not is_admin(call.from_user.id): return
+    sid = int(call.data.rsplit("_", 1)[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT name, ip, user_id, location, status, plan_title FROM servers WHERE id=?", (sid,))
+        row = await cur.fetchone()
+    if not row:
+        await call.answer("سرور پیدا نشد", show_alert=True); return
+    name, ip, owner, loc, status, plan = row
+    text = f"🖥 {name or 'بدون‌نام'}\nIP: {ip or '-'}\nمالک: {owner or 'بدون مالک'}\nلوکیشن: {loc or '-'}\nپلن: {plan or '-'}\nوضعیت: {status or '-'}"
+    kb = server_actions_kb(sid).inline_keyboard
+    kb.append([InlineKeyboardButton(text="👤 انتقال به مشتری دیگر", callback_data=f"sv_transfer_{sid}")])
+    kb.append([InlineKeyboardButton(text="🔙 بازگشت به فهرست سرورها", callback_data="adm_servers")])
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await call.answer()
 
 
 # ---------------------------------------------------------------------------
+@router.callback_query(F.data.startswith("sv_transfer_"))
+async def adm_server_transfer_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return
+    sid = int(call.data.rsplit("_", 1)[1])
+    await state.update_data(transfer_server_id=sid)
+    await state.set_state(AdminServerTransfer.waiting_user_id)
+    await call.message.answer("شناسه عددی تلگرام مشتری جدید را ارسال کنید. برای لغو /cancel بفرستید.")
+    await call.answer()
+
+
+@router.message(AdminServerTransfer.waiting_user_id)
+async def adm_server_transfer_finish(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    if not (message.text or "").strip().isdigit():
+        await message.answer("شناسه باید عددی باشد؛ دوباره بفرستید یا /cancel برای لغو."); return
+    data = await state.get_data(); sid = int(data["transfer_server_id"]); new_owner = int(message.text.strip())
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT telegram_id FROM users WHERE telegram_id=?", (new_owner,))
+        if not await cur.fetchone():
+            await message.answer("این مشتری در دیتابیس ثبت نشده است. ابتدا باید ربات را /start کند."); return
+        await db.execute("UPDATE servers SET user_id=? WHERE id=?", (new_owner, sid))
+        await db.execute("UPDATE orders SET user_id=? WHERE server_id=? AND status='completed'", (new_owner, sid))
+        await db.commit()
+    await state.clear()
+    await message.answer(f"✅ مالکیت سرور #{sid} به مشتری {new_owner} منتقل شد.", reply_markup=main_menu_kb(True))
+
+
 # پنل ادمین: ساخت سرور رایگان مستقیم برای ادمین (بدون کسر کیف پول)
 # ---------------------------------------------------------------------------
 @router.callback_query(F.data == "adm_direct")
@@ -2322,9 +2389,17 @@ async def adm_token_delete(call: CallbackQuery):
         return
     pid = int(call.data.replace("prov_del_", ""))
     async with aiosqlite.connect(DB_PATH) as db:
+        # اطلاعات سرورها و مشتریان عمداً حفظ می‌شود؛ فقط اتصال به API حذف‌شده پاک می‌شود.
+        await db.execute("UPDATE servers SET provider_id=NULL WHERE provider_id=?", (pid,))
         await db.execute("DELETE FROM provider WHERE id=?", (pid,))
+        cur = await db.execute("SELECT type FROM provider WHERE active=1 LIMIT 1")
+        active = await cur.fetchone()
+        if not active:
+            cur = await db.execute("SELECT id FROM provider ORDER BY id DESC LIMIT 1")
+            replacement = await cur.fetchone()
+            if replacement: await db.execute("UPDATE provider SET active=1 WHERE id=?", (replacement[0],))
         await db.commit()
-    await call.answer("🗑 حذف شد")
+    await call.answer("🗑 API حذف شد؛ اطلاعات سرورها حفظ شد.")
     await adm_token_list(call)
 
 
@@ -2598,44 +2673,55 @@ async def adm_manual_addr_save(message: Message, state: FSMContext):
 # ---------------------------------------------------------------------------
 @router.callback_query(F.data == "adm_plans")
 async def adm_plans(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return
+    if not is_admin(call.from_user.id): return
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT id, title, server_type, markup_percent, active, location, provider_type FROM plans ORDER BY id")
         plans = await cur.fetchall()
-        token = await get_active_token(db)  # هتزنر - برای فیلتر موجودی
-        enabled_locations = None
-        stock_map = None
-        if token:
-            api = HetznerAPI(token)
-            disabled = await get_disabled_locations(db)
-            try:
-                all_locs = await api.locations()
-                enabled_locations = {l["name"] for l in all_locs if l["name"] not in disabled}
-            except Exception:
-                enabled_locations = set()
-            stock_map = await build_stock_map(api)
-    visible, hidden_count = [], 0
+    rows = []
     for p in plans:
-        ptype = p[6] or "hetzner"
-        if ptype != "hetzner" or plan_has_stock(stock_map, p[5], p[2], enabled_locations or set()):
-            visible.append(p)
-        else:
-            hidden_count += 1
-    lines = ["🧩 پلن‌های فعلی (قیمت‌ها همیشه زنده از سرویس‌دهنده + درصد سود محاسبه می‌شود):\n"]
-    for p in visible:
-        loc_txt = p[5] if p[5] else "همه لوکیشن‌ها"
-        ptype_label = PROVIDER_LABELS.get(p[6] or "hetzner", p[6])
-        lines.append(f"• #{p[0]} [{ptype_label}] {p[1]} ({p[2]}) | سود: %{p[3]:g} | {loc_txt} | {'✅' if p[4] else '❌'}")
-    if hidden_count:
-        lines.append(f"\n⚠️ {hidden_count} پلن هتزنری دیگر به‌دلیل نبود موجودی فعلی در این لیست نمایش داده نشد.")
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ افزودن پلن جدید", callback_data="adm_plan_add")],
-            [InlineKeyboardButton(text="🔙 بازگشت", callback_data="adm_back")],
-        ]
-    )
-    await call.message.edit_text("\n".join(lines) if visible else "پلنی با موجودی فعلی وجود ندارد.", reply_markup=kb)
+        status = "✅" if p[4] else "⏸"
+        rows.append([InlineKeyboardButton(text=f"{status} #{p[0]} {p[1]} ({p[2]})", callback_data=f"adm_plan_{p[0]}")])
+    rows += [[InlineKeyboardButton(text="➕ افزودن پلن جدید", callback_data="adm_plan_add")], [InlineKeyboardButton(text="🔙 بازگشت", callback_data="adm_back")]]
+    await call.message.edit_text("🧩 برای ویرایش یا فعال/غیرفعال کردن، یک پلن را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@router.callback_query(F.data.regexp(r"^adm_plan_\d+$"))
+async def adm_plan_detail(call: CallbackQuery):
+    if not is_admin(call.from_user.id): return
+    raw = call.data.replace("adm_plan_", "")
+    if not raw.isdigit(): return
+    pid = int(raw)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT title, server_type, markup_percent, active, location, provider_type FROM plans WHERE id=?", (pid,))
+        p = await cur.fetchone()
+    if not p: await call.answer("پلن پیدا نشد", show_alert=True); return
+    title, stype, markup, active, loc, ptype = p
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏸ غیرفعال کردن" if active else "✅ فعال کردن", callback_data=f"adm_plan_toggle_{pid}")],
+        [InlineKeyboardButton(text="✏️ ویرایش عنوان/درصد سود", callback_data=f"adm_plan_edit_{pid}")],
+        [InlineKeyboardButton(text="🔙 بازگشت به پلن‌ها", callback_data="adm_plans")],
+    ])
+    await call.message.edit_text(f"🧩 پلن #{pid}\nعنوان: {title}\nنوع: {stype}\nسود: %{markup:g}\nلوکیشن: {loc or 'همه'}\nوضعیت: {'فعال' if active else 'غیرفعال'}", reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm_plan_toggle_"))
+async def adm_plan_toggle(call: CallbackQuery):
+    if not is_admin(call.from_user.id): return
+    pid = int(call.data.rsplit("_", 1)[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE plans SET active=CASE WHEN active=1 THEN 0 ELSE 1 END WHERE id=?", (pid,)); await db.commit()
+    call.data = f"adm_plan_{pid}"
+    await adm_plan_detail(call)
+
+
+@router.callback_query(F.data.startswith("adm_plan_edit_"))
+async def adm_plan_edit_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return
+    pid = int(call.data.rsplit("_", 1)[1]); await state.update_data(edit_plan_id=pid)
+    await state.set_state(AdminAddPlan.title)
+    await call.message.answer("عنوان جدید پلن را بفرستید:")
     await call.answer()
 
 
@@ -2702,6 +2788,12 @@ async def adm_plan_choose_type(call: CallbackQuery, state: FSMContext):
 
 @router.message(AdminAddPlan.title)
 async def adm_plan_title(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if data.get("edit_plan_id"):
+        await state.update_data(edit_title=message.text.strip())
+        await state.set_state(AdminAddPlan.markup)
+        await message.answer("درصد سود جدید را وارد کنید:")
+        return
     await state.update_data(title=message.text.strip())
     await state.set_state(AdminAddPlan.markup)
     await message.answer("درصد سود روی قیمت پایه را وارد کنید (مثلاً 20 برای ۲۰٪):")
@@ -2713,6 +2805,14 @@ async def adm_plan_markup(message: Message, state: FSMContext):
         markup = float(message.text.strip().replace(",", "."))
     except ValueError:
         await message.answer("لطفاً یک عدد معتبر وارد کنید (مثلاً 20).")
+        return
+    data = await state.get_data()
+    if data.get("edit_plan_id"):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE plans SET title=?, markup_percent=? WHERE id=?", (data.get("edit_title", ""), markup, data["edit_plan_id"]))
+            await db.commit()
+        await state.clear()
+        await message.answer("✅ پلن ویرایش شد.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 بازگشت به پلن‌ها", callback_data="adm_plans")]]))
         return
     await state.update_data(markup=markup)
     data = await state.get_data()

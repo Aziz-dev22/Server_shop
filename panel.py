@@ -695,12 +695,12 @@ async def plans_list(request: Request):
         except Exception:
             pass
         stock_map = await core.build_stock_map(api)
-    plans = [p for p in all_plans if core.plan_has_stock(stock_map, p[8], p[2], enabled_locations)]
-    hidden_count = len(all_plans) - len(plans)
+    plans = all_plans
+    hidden_count = sum(1 for p in all_plans if not core.plan_has_stock(stock_map, p[8], p[2], enabled_locations)) if stock_map is not None else 0
     rows = "".join(
         f"<tr><td>{esc(p[1])}</td><td>{esc(p[2])}</td><td>{esc(p[3])}/{esc(p[4])}/{esc(p[5])}</td><td>%{p[6]:g}</td>"
         f"<td>{esc(p[8]) if p[8] else 'همه'}</td><td>{'✅' if p[7] else '❌'}</td>"
-        f"<td><form class='inline' method='post' action='/plans/{p[0]}/toggle'><button class='btn small gray' type='submit'>{'غیرفعال' if p[7] else 'فعال'}</button></form>"
+        f"<td><a class='btn small' href='/plans/{p[0]}/edit'>ویرایش</a><form class='inline' method='post' action='/plans/{p[0]}/toggle'><button class='btn small gray' type='submit'>{'غیرفعال' if p[7] else 'فعال'}</button></form>"
         f"<form class='inline' method='post' action='/plans/{p[0]}/delete' onsubmit=\"return confirm('حذف این پلن؟')\"><button class='btn small red' type='submit'>حذف</button></form></td></tr>"
         for p in plans
     )
@@ -753,6 +753,45 @@ async def plans_add(request: Request):
             "INSERT INTO plans (server_type, title, cpu, ram, disk, markup_percent, active, location) VALUES (?,?,?,?,?,?,1,?)",
             (server_type, title, f"{cores} core", f"{memory} GB", f"{disk} GB", markup, loc_value),
         )
+        await db.commit()
+    return RedirectResponse("/plans", status_code=303)
+
+
+@app.get("/plans/{plan_id}/edit", response_class=HTMLResponse)
+async def plans_edit_page(request: Request, plan_id: int):
+    if not get_session(request): return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id,title,server_type,cpu,ram,disk,markup_percent,location,active FROM plans WHERE id=?", (plan_id,))
+        p = await cur.fetchone()
+    if not p: return RedirectResponse("/plans", status_code=303)
+    body = f"""
+    <h1>✏️ ویرایش پلن #{p[0]}</h1>
+    <div class="card"><form method="post" action="/plans/{plan_id}/edit">
+      <label>عنوان پلن</label><input name="title" value="{esc(p[1])}" required>
+      <label>نوع سرور (شناسه API)</label><input value="{esc(p[2])}" disabled>
+      <label>CPU</label><input value="{esc(p[3])}" disabled>
+      <label>RAM</label><input value="{esc(p[4])}" disabled>
+      <label>Disk</label><input value="{esc(p[5])}" disabled>
+      <label>درصد سود</label><input name="markup" type="number" step="0.1" min="0" value="{p[6]}" required>
+      <label>لوکیشن (ALL برای همه)</label><input name="location" value="{esc(p[7] or 'ALL')}" required>
+      <label>وضعیت</label><select name="active"><option value="1" {'selected' if p[8] else ''}>فعال</option><option value="0" {'selected' if not p[8] else ''}>غیرفعال</option></select>
+      <button class="btn" type="submit">ذخیره تغییرات</button> <a class="btn gray" href="/plans">بازگشت به پلن‌ها</a>
+    </form></div>"""
+    return page("ویرایش پلن", body, "/plans")
+
+
+@app.post("/plans/{plan_id}/edit")
+async def plans_edit_save(request: Request, plan_id: int):
+    if not get_session(request): return RedirectResponse("/login")
+    form = await request.form()
+    title = str(form.get("title", "")).strip()
+    try: markup = max(0.0, float(form.get("markup", 0)))
+    except (TypeError, ValueError): markup = 0.0
+    loc = str(form.get("location", "ALL")).strip()
+    loc = None if not loc or loc.upper() == "ALL" else loc
+    active = 1 if str(form.get("active", "1")) == "1" else 0
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE plans SET title=?,markup_percent=?,location=?,active=? WHERE id=?", (title, markup, loc, active, plan_id))
         await db.commit()
     return RedirectResponse("/plans", status_code=303)
 
@@ -1031,6 +1070,8 @@ async def settings_page(request: Request):
         now_key = await core.get_setting(db, "nowpayments_api_key")
         now_currency = await core.get_setting(db, "nowpayments_pay_currency", core.NOWPAYMENTS_PAY_CURRENCY)
         addr = await core.get_setting(db, "manual_address", "")
+        ip_free = await core.get_setting(db, "ip_change_free_count", str(core.IP_CHANGE_FREE_COUNT))
+        ip_price = await core.get_setting(db, "ip_change_price_usd", str(core.IP_CHANGE_PRICE))
     ok = request.query_params.get("ok")
     active_currencies = request.query_params.get("currencies")
     msg = '<div class="msg ok">ذخیره شد.</div>' if ok else ""
@@ -1068,6 +1109,14 @@ async def settings_page(request: Request):
       <p style="color:var(--txt-dim);font-size:12px;margin-top:10px;">⚠️ اگر خطای «400 Bad Request» می‌گیرید یعنی ارز انتخابی روی حساب NOWPayments شما فعال نیست — روی دکمه بالا بزنید تا لیست درست را ببینید.</p>
     </div>
     <div class="card">
+      <h3>🌐 قیمت‌گذاری تغییر IP</h3>
+      <form method="post" action="/settings/ip-change">
+        <label>تعداد دفعات رایگان برای هر سرور</label><input name="free_count" type="number" min="0" step="1" value="{esc(ip_free)}" required>
+        <label>قیمت هر تغییر IP پس از دفعات رایگان (دلار؛ صفر = رایگان)</label><input name="price_usd" type="number" min="0" step="0.01" value="{esc(ip_price)}" required>
+        <button class="btn" type="submit">ذخیره قیمت تغییر IP</button>
+      </form>
+    </div>
+    <div class="card">
       <h3><span class="mini-icon icon-yellow">🏦</span> آدرس واریز دستی (کارت/ولت)</h3>
       <form method="post" action="/settings/manual-address">
         <label>متن آدرس/شماره کارت</label>
@@ -1093,6 +1142,20 @@ async def settings_nowpayments_currencies(request: Request):
     except Exception as e:
         return RedirectResponse(f"/settings?cur_err={urllib.parse.quote(str(e))}", status_code=303)
     return RedirectResponse(f"/settings?currencies={urllib.parse.quote(', '.join(c.upper() for c in currencies))}", status_code=303)
+
+
+@app.post("/settings/ip-change")
+async def settings_ip_change(request: Request):
+    if not get_session(request): return RedirectResponse("/login")
+    form = await request.form()
+    try: free_count = max(0, int(form.get("free_count", core.IP_CHANGE_FREE_COUNT)))
+    except (TypeError, ValueError): free_count = core.IP_CHANGE_FREE_COUNT
+    try: price = max(0.0, float(form.get("price_usd", core.IP_CHANGE_PRICE)))
+    except (TypeError, ValueError): price = core.IP_CHANGE_PRICE
+    async with aiosqlite.connect(DB_PATH) as db:
+        await core.set_setting(db, "ip_change_free_count", str(free_count))
+        await core.set_setting(db, "ip_change_price_usd", str(price))
+    return RedirectResponse("/settings?ok=1", status_code=303)
 
 
 @app.post("/settings/oxapay")
