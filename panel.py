@@ -939,17 +939,34 @@ async def server_action_do(request: Request, server_id: int, action: str):
                 await db.commit()
         elif action == "ipchange":
             owner_id, count = row[2], (row[3] or 0)
-            cost = 0 if count < core.IP_CHANGE_FREE_COUNT else core.IP_CHANGE_PRICE
+            async with aiosqlite.connect(DB_PATH) as db:
+                free_count, ip_price = await core.get_ip_change_settings(db)
+                await db.execute("UPDATE servers SET ip_change_pending=1 WHERE id=? AND COALESCE(ip_change_pending,0)=0", (server_id,))
+                if db.total_changes == 0:
+                    await db.rollback()
+                    sep = "&" if "?" in referer else "?"
+                    return RedirectResponse(f"{referer}{sep}err={urllib.parse.quote('تغییر IP این سرور در حال انجام است')}", status_code=303)
+                await db.commit()
+            cost = 0 if count < free_count else ip_price
             if cost > 0 and owner_id:
                 async with aiosqlite.connect(DB_PATH) as db:
                     cur2 = await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,))
                     bal_row = await cur2.fetchone()
                 if not bal_row or bal_row[0] < cost:
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute("UPDATE servers SET ip_change_pending=0 WHERE id=?", (server_id,))
+                        await db.commit()
                     sep = "&" if "?" in referer else "?"
                     return RedirectResponse(f"{referer}{sep}err={urllib.parse.quote('موجودی کیف پول کاربر کافی نیست')}", status_code=303)
-            new_ip = await core.change_server_ip(api, row[0])
+            try:
+                new_ip = await core.change_server_ip(api, row[0])
+            except Exception:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("UPDATE servers SET ip_change_pending=0 WHERE id=?", (server_id,))
+                    await db.commit()
+                raise
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE servers SET ip=?, ip_change_count=ip_change_count+1 WHERE id=?", (new_ip, server_id))
+                await db.execute("UPDATE servers SET ip=?, ip_change_count=ip_change_count+1, ip_change_pending=0 WHERE id=?", (new_ip, server_id))
                 if cost > 0 and owner_id:
                     await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=?", (cost, owner_id))
                 await db.commit()
@@ -1258,17 +1275,41 @@ async def providers_list(request: Request):
     if not sess:
         return RedirectResponse("/login")
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id, label, api_token, active FROM provider ORDER BY id DESC")
+        cur = await db.execute("SELECT id, label, api_token, active, COALESCE(type,'hetzner') FROM provider ORDER BY id DESC")
         rows_db = await cur.fetchall()
     err = request.query_params.get("err")
     msg = f'<div class="msg err">اتصال ناموفق بود: {esc(err)}</div>' if err else ""
-    rows = "".join(
-        f"<tr><td>{esc(r[1] or 'بدون‌نام')}</td><td>...{esc(r[2][-4:]) if r[2] else '-'}</td>"
-        f"<td>{'✅ فعال' if r[3] else '⚪️ غیرفعال'}</td>"
-        f"<td><form class='inline' method='post' action='/providers/{r[0]}/activate'><button class='btn small green' type='submit'>فعال‌سازی</button></form>"
-        f"<form class='inline' method='post' action='/providers/{r[0]}/delete' onsubmit=\"return confirm('حذف این اتصال؟')\"><button class='btn small red' type='submit'>حذف</button></form></td></tr>"
-        for r in rows_db
-    )
+    rows = []
+    for r in rows_db:
+        pid, label, token, active, ptype = r
+        usage = "—"
+        if (ptype or "hetzner") == "hetzner" and token:
+            try:
+                api = core.HetznerAPI(token)
+                servers, pricing = await api.all_servers(), await api.pricing()
+                currency = pricing.get("currency", "EUR")
+                estimated = 0.0
+                priced_count = 0
+                for server in servers:
+                    st = (server.get("server_type") or {}).get("name")
+                    loc = (server.get("datacenter") or {}).get("location", {}).get("name")
+                    # Hetzner removed datacenter from some API responses; fallback to server location.
+                    loc = loc or (server.get("location") or {}).get("name")
+                    price_obj = core.find_type_price(pricing, st, loc) if st and loc else None
+                    if price_obj and price_obj.get("price_monthly", {}).get("gross") is not None:
+                        estimated += float(price_obj["price_monthly"]["gross"])
+                        priced_count += 1
+                cost_label = f"{estimated:.2f} {esc(currency)}/ماه برآورد" if priced_count else "هزینه ماهانه قابل برآورد نیست"
+                usage = f"{len(servers)} سرور؛ {cost_label}"
+            except Exception as exc:
+                usage = f"خطا در خواندن API: {esc(str(exc)[:100])}"
+        rows.append(
+            f"<tr><td>{esc(label or 'بدون‌نام')}</td><td>...{esc(token[-4:]) if token else '-'}</td>"
+            f"<td>{'✅ فعال' if active else '⚪️ غیرفعال'}</td><td>{usage}</td>"
+            f"<td><form class='inline' method='post' action='/providers/{int(pid)}/activate'><button class='btn small green' type='submit'>فعال‌سازی</button></form> "
+            f"<form class='inline' method='post' action='/providers/{int(pid)}/delete' onsubmit=&#34;return confirm(&#39;حذف این اتصال؟&#39;)&#34;><button class='btn small red' type='submit'>حذف</button></form></td></tr>"
+        )
+    rows = "".join(rows)
     body = f"""
     <h1><span class="page-icon icon-yellow">🔑</span> API های Hetzner</h1>
     {msg}
@@ -1282,10 +1323,15 @@ async def providers_list(request: Request):
         <button class="btn" type="submit">افزودن و فعال‌سازی</button>
       </form>
     </div>
-    <div class="card"><table>
-      <tr><th>نام</th><th>توکن</th><th>وضعیت</th><th>عملیات</th></tr>
-      {rows or "<tr><td colspan=4>هنوز اتصالی اضافه نشده.</td></tr>"}
-    </table></div>
+    <div class="card">
+      <h3>مصرف منابع هر API</h3>
+      <p>تعداد سرورها و برآورد هزینه ماهانه از قیمت‌های فعلی Hetzner نمایش داده می‌شود. این عدد صورتحساب قطعی نیست و ممکن است هزینه‌های ترافیک، حجم‌ها، IPها، بکاپ و مالیات را شامل نشود.</p>
+      <p class="msg">مانده بدهی/صورتحساب واقعی از طریق Cloud API Token عمومی Hetzner قابل دریافت نیست؛ برای بدهی قطعی باید بخش Billing/Invoices در کنسول Hetzner بررسی شود.</p>
+      <table>
+      <tr><th>نام</th><th>توکن</th><th>وضعیت</th><th>مصرف تخمینی</th><th>عملیات</th></tr>
+      {rows or "<tr><td colspan=5>هنوز اتصالی اضافه نشده.</td></tr>"}
+      </table>
+    </div>
     """
     return page("API های Hetzner", body, "/providers")
 
@@ -1464,6 +1510,7 @@ async def settings_page(request: Request):
         now_key = await core.get_setting(db, "nowpayments_api_key")
         now_currency = await core.get_setting(db, "nowpayments_pay_currency", core.NOWPAYMENTS_PAY_CURRENCY)
         addr = await core.get_setting(db, "manual_address", "")
+        ip_free_count, ip_change_price = await core.get_ip_change_settings(db)
     ok = request.query_params.get("ok")
     active_currencies = request.query_params.get("currencies")
     msg = '<div class="msg ok">ذخیره شد.</div>' if ok else ""
@@ -1475,8 +1522,19 @@ async def settings_page(request: Request):
     elif request.query_params.get("cur_err"):
         currencies_msg = f'<div class="msg err">خطا در دریافت لیست ارزها: {esc(request.query_params.get("cur_err"))}</div>'
     body = f"""
-    <h1><span class="page-icon icon-purple">⚙️</span> تنظیمات درگاه پرداخت</h1>
+    <h1><span class="page-icon icon-purple">⚙️</span> تنظیمات</h1>
     {msg}
+    <div class="card">
+      <h3>🌐 تنظیمات تغییر IP</h3>
+      <p style="color:var(--txt-dim);font-size:13px;">این تنظیمات به‌صورت مشترک برای ربات و پنل ذخیره می‌شود. سهمیه رایگان برای هر سرور محاسبه می‌شود.</p>
+      <form method="post" action="/settings/ip-change">
+        <label>تعداد دفعات رایگان تغییر IP برای هر سرور</label>
+        <input type="number" name="free_count" min="0" step="1" value="{ip_free_count}" required>
+        <label>قیمت هر تغییر IP پس از اتمام سهمیه (دلار)</label>
+        <input type="number" name="price" min="0" step="0.01" value="{ip_change_price:.2f}" required>
+        <button class="btn" type="submit">💾 ذخیره تنظیمات تغییر IP</button>
+      </form>
+    </div>
     <div class="card">
       <h3><span class="mini-icon icon-blue">💠</span> درگاه ارز دیجیتال (OxaPay)</h3>
       <p style="color:var(--txt-dim);font-size:13px;">وضعیت فعلی: {"<span class='badge ok'>فعال (..." + esc(oxa_key[-4:]) + ")</span>" if oxa_key else "<span class='badge off'>غیرفعال</span>"}</p>
@@ -1510,6 +1568,25 @@ async def settings_page(request: Request):
     </div>
     """
     return page("تنظیمات", body, "/settings")
+
+
+@app.post("/settings/ip-change")
+async def settings_ip_change_save(request: Request):
+    sess = get_session(request)
+    if not sess:
+        return RedirectResponse("/login")
+    form = await request.form()
+    try:
+        free_count = int(str(form.get("free_count", "")))
+        price = float(str(form.get("price", "")))
+        if free_count < 0 or price < 0 or price != price or price == float("inf"):
+            raise ValueError
+    except (TypeError, ValueError):
+        return RedirectResponse("/settings?ip_err=1", status_code=303)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await core.set_setting(db, "ip_change_free_count", str(free_count))
+        await core.set_setting(db, "ip_change_price", str(price))
+    return RedirectResponse("/settings?ok=1", status_code=303)
 
 
 @app.get("/settings/nowpayments/currencies")
