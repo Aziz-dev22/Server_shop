@@ -186,6 +186,9 @@ async def init_db():
         await db.execute("UPDATE plans SET provider_type='hetzner' WHERE provider_type IS NULL")
         await db.execute("UPDATE servers SET provider_type='hetzner' WHERE provider_type IS NULL")
         await _safe_add_column(db, "users", "is_banned INTEGER DEFAULT 0")
+        # Persist configurable IP-change price/quota while preserving current defaults.
+        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('ip_change_free_count', ?)", (str(IP_CHANGE_FREE_COUNT),))
+        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('ip_change_price', ?)", (str(IP_CHANGE_PRICE),))
         await db.commit()
         # اگر از نسخه قبلی آپدیت شده و هیچ توکنی فعال نیست، آخرین توکن را فعال کن
         cur = await db.execute("SELECT COUNT(*) FROM provider WHERE active=1")
@@ -283,6 +286,19 @@ async def set_setting(db, key, value):
         (key, value),
     )
     await db.commit()
+
+
+async def get_ip_change_config(db):
+    """Return persisted IP-change quota and price, falling back to legacy defaults."""
+    try:
+        free_count = max(0, int(float(await get_setting(db, "ip_change_free_count", str(IP_CHANGE_FREE_COUNT)))))
+    except (TypeError, ValueError):
+        free_count = IP_CHANGE_FREE_COUNT
+    try:
+        price = max(0.0, float(await get_setting(db, "ip_change_price", str(IP_CHANGE_PRICE))))
+    except (TypeError, ValueError):
+        price = IP_CHANGE_PRICE
+    return free_count, price
 
 
 def is_admin(tid: int) -> bool:
@@ -989,6 +1005,7 @@ def admin_menu_kb():
         [InlineKeyboardButton(text="💳 درخواست‌های شارژ در انتظار", callback_data="adm_wallet_reqs")],
         [InlineKeyboardButton(text="📢 پیام همگانی", callback_data="adm_broadcast")],
         [InlineKeyboardButton(text="🗄 بکاپ خودکار و عضویت اجباری", callback_data="adm_backup_join")],
+        [InlineKeyboardButton(text="🌐 قیمت و دفعات رایگان تغییر IP", callback_data="adm_ip_pricing")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1053,6 +1070,12 @@ class SupportTicket(StatesGroup):
     waiting = State()
 
 
+class AdminIPFreeCount(StatesGroup):
+    waiting = State()
+
+class AdminIPPrice(StatesGroup):
+    waiting = State()
+
 class AdminBackupChannel(StatesGroup):
     waiting = State()
 
@@ -1071,6 +1094,70 @@ class AdminDirect(StatesGroup):
     image = State()
     confirm = State()
 
+
+# ---------------------------------------------------------------------------
+# تنظیمات قیمت و سهمیه رایگان تغییر IP
+# ---------------------------------------------------------------------------
+def ip_pricing_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 تغییر تعداد دفعات رایگان", callback_data="adm_ip_free_count")],
+        [InlineKeyboardButton(text="💰 تغییر قیمت هر بار", callback_data="adm_ip_price")],
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="adm_back")],
+    ])
+
+@router.callback_query(F.data == "adm_ip_pricing")
+async def admin_ip_pricing(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("دسترسی ندارید", show_alert=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        free_count, price = await get_ip_change_config(db)
+    await call.message.edit_text(
+        "🌐 <b>تنظیم قیمت و سهمیه تغییر IP</b>\n\n"
+        f"🎁 دفعات رایگان برای هر سرور: <b>{free_count}</b> بار\n"
+        f"💰 قیمت هر تغییر پس از سهمیه: <b>{fmt_price(price)}</b>\n\n"
+        "تغییرات در دیتابیس ذخیره می‌شوند و پس از راه‌اندازی مجدد هم باقی می‌مانند.",
+        reply_markup=ip_pricing_kb(), parse_mode=ParseMode.HTML)
+    await call.answer()
+
+@router.callback_query(F.data == "adm_ip_free_count")
+async def admin_ip_free_count_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return await call.answer("دسترسی ندارید", show_alert=True)
+    await state.set_state(AdminIPFreeCount.waiting)
+    await call.message.answer("🎁 تعداد دفعات رایگان را به‌صورت عدد صحیح بفرست (مثلاً 0، 2 یا 5). عدد صفر یعنی بدون دفعات رایگان.")
+    await call.answer()
+
+@router.message(AdminIPFreeCount.waiting)
+async def admin_ip_free_count_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    try:
+        value = int(message.text.strip())
+        if not 0 <= value <= 100000: raise ValueError()
+    except (AttributeError, ValueError):
+        return await message.answer("❌ مقدار نامعتبر است. یک عدد صحیح بین 0 تا 100000 بفرست.")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await set_setting(db, "ip_change_free_count", str(value))
+    await state.clear()
+    await message.answer(f"✅ سهمیه رایگان تغییر IP روی {value} بار تنظیم شد.", reply_markup=admin_menu_kb())
+
+@router.callback_query(F.data == "adm_ip_price")
+async def admin_ip_price_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return await call.answer("دسترسی ندارید", show_alert=True)
+    await state.set_state(AdminIPPrice.waiting)
+    await call.message.answer("💰 قیمت هر بار تغییر IP را به دلار بفرست (مثلاً 0.50 یا 1). برای رایگان بودن پس از سهمیه، 0 وارد کن.")
+    await call.answer()
+
+@router.message(AdminIPPrice.waiting)
+async def admin_ip_price_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    try:
+        value = float(message.text.strip().replace(",", ".").replace("$", ""))
+        if not 0 <= value <= 1000000: raise ValueError()
+    except (AttributeError, ValueError):
+        return await message.answer("❌ قیمت نامعتبر است. یک عدد صفر یا بیشتر وارد کن؛ مثلاً 0.50.")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await set_setting(db, "ip_change_price", f"{value:.6f}".rstrip("0").rstrip("."))
+    await state.clear()
+    await message.answer(f"✅ قیمت هر تغییر IP روی {fmt_price(value)} تنظیم شد.", reply_markup=admin_menu_kb())
 
 # ---------------------------------------------------------------------------
 # بکاپ خودکار پروژه و عضویت اجباری کانال
@@ -2139,7 +2226,9 @@ async def server_ipchange_start(call: CallbackQuery):
         await call.message.answer("❌ این قابلیت فقط برای سرورهای Hetzner در دسترس است.")
         return
     count = row[3] or 0
-    cost = 0 if count < IP_CHANGE_FREE_COUNT else IP_CHANGE_PRICE
+    async with aiosqlite.connect(DB_PATH) as db:
+        free_count, ip_price = await get_ip_change_config(db)
+    cost = 0 if count < free_count else ip_price
     cost_txt = "رایگان" if cost == 0 else fmt_price(cost)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -2149,7 +2238,7 @@ async def server_ipchange_start(call: CallbackQuery):
     )
     await call.message.answer(
         f"سرور «{html.escape(row[2])}» را تاکنون {count} بار IP تغییر داده‌اید.\n"
-        f"دفعات رایگان: {IP_CHANGE_FREE_COUNT} بار — بعد از آن هر بار {fmt_price(IP_CHANGE_PRICE)}.\n"
+        f"دفعات رایگان: {free_count} بار برای هر سرور — بعد از آن هر بار {fmt_price(ip_price)}.\n"
         f"هزینه این تغییر: {cost_txt}\n\n"
         "⚠️ توجه: تغییر IP چند دقیقه طول می‌کشد و IP قبلی برای همیشه از بین می‌رود.",
         reply_markup=kb,
@@ -2176,7 +2265,8 @@ async def server_ipchange_confirm(call: CallbackQuery):
             return
         owner_id, hetzner_id, name, count, _ = row
         count = count or 0
-        cost = 0 if count < IP_CHANGE_FREE_COUNT else IP_CHANGE_PRICE
+        free_count, ip_price = await get_ip_change_config(db)
+        cost = 0 if count < free_count else ip_price
         if cost > 0 and owner_id:
             cur2 = await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,))
             bal_row = await cur2.fetchone()

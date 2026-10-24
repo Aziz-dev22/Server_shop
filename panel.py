@@ -44,6 +44,7 @@ NAV_ITEMS = [
     ("/users", "👥 کاربران"),
     ("/servers", "🖥 سرورها"),
     ("/backup", "🗄 بکاپ خودکار و عضویت اجباری"),
+    ("/ip-pricing", "🌐 قیمت و دفعات رایگان تغییر IP"),
     ("/server-transfer", "🔁 انتقال سرورها بین APIها"),
     ("/plans", "🧩 پلن‌ها"),
     ("/locations", "📍 لوکیشن‌ها"),
@@ -912,6 +913,49 @@ async def servers_list(request: Request):
     return page("سرورها", body, "/servers")
 
 
+@app.get("/ip-pricing", response_class=HTMLResponse)
+async def ip_pricing_page(request: Request):
+    if not get_session(request): return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        free_count, price = await core.get_ip_change_config(db)
+    flash = ""
+    result = request.query_params.get("result", "")
+    detail = request.query_params.get("detail", "")
+    if result == "ok": flash = '<div class="msg ok">✅ تنظیمات تغییر IP ذخیره شد.</div>'
+    elif result == "error": flash = '<div class="msg err">❌ مقادیر واردشده معتبر نیستند.</div>'
+    if detail: flash += f'<div class="msg err">{esc(detail)}</div>'
+    body = f"""
+    <h1>🌐 قیمت و دفعات رایگان تغییر IP</h1>{flash}
+    <div class="card"><p>این تنظیمات برای ربات تلگرام و پنل وب مشترک است و در دیتابیس ذخیره می‌شود.</p>
+      <form method="post" action="/ip-pricing">
+        <label>دفعات رایگان برای هر سرور</label>
+        <input type="number" name="free_count" min="0" max="100000" step="1" value="{free_count}" required>
+        <small>۰ یعنی هیچ تغییر IP رایگانی وجود ندارد. شمارش فعلی به ازای هر سرور است.</small>
+        <label style="margin-top:14px">قیمت هر تغییر پس از سهمیه (دلار)</label>
+        <input type="number" name="price" min="0" max="1000000" step="0.01" value="{price:.2f}" required>
+        <small>قیمت صفر یعنی حتی پس از اتمام سهمیه نیز هزینه‌ای دریافت نشود.</small>
+        <button class="btn" type="submit" style="margin-top:16px">💾 ذخیره تنظیمات</button>
+      </form>
+    </div>
+    """
+    return page("قیمت و دفعات رایگان تغییر IP", body, "/ip-pricing")
+
+@app.post("/ip-pricing")
+async def ip_pricing_save(request: Request):
+    if not get_session(request): return RedirectResponse("/login")
+    form = await request.form()
+    try:
+        free_count = int(str(form.get("free_count", "")).strip())
+        price = float(str(form.get("price", "")).strip().replace(",", "."))
+        if not 0 <= free_count <= 100000 or not 0 <= price <= 1000000: raise ValueError()
+    except (TypeError, ValueError):
+        return RedirectResponse("/ip-pricing?result=error", status_code=303)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await core.set_setting(db, "ip_change_free_count", str(free_count))
+        await core.set_setting(db, "ip_change_price", f"{price:.6f}".rstrip("0").rstrip("."))
+    return RedirectResponse("/ip-pricing?result=ok", status_code=303)
+
+
 @app.post("/servers/{server_id}/action/{action}")
 async def server_action_do(request: Request, server_id: int, action: str):
     sess = get_session(request)
@@ -939,7 +983,9 @@ async def server_action_do(request: Request, server_id: int, action: str):
                 await db.commit()
         elif action == "ipchange":
             owner_id, count = row[2], (row[3] or 0)
-            cost = 0 if count < core.IP_CHANGE_FREE_COUNT else core.IP_CHANGE_PRICE
+            async with aiosqlite.connect(DB_PATH) as db:
+                free_count, ip_price = await core.get_ip_change_config(db)
+            cost = 0 if count < free_count else ip_price
             if cost > 0 and owner_id:
                 async with aiosqlite.connect(DB_PATH) as db:
                     cur2 = await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,))
