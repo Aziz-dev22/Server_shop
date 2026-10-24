@@ -400,6 +400,21 @@ class HetznerAPI:
         data = await self._get("/pricing")
         return data.get("pricing", {})
 
+    async def limits(self):
+        """Read project limits when this API deployment exposes the endpoint.
+
+        Hetzner does not expose billing/invoice data through the Cloud API, and some
+        API versions do not provide a limits endpoint; in that case return an empty list
+        so server/CPU usage can still be shown from the live server inventory.
+        """
+        try:
+            data = await self._get("/limits")
+            return data.get("limits", [])
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return []
+            raise
+
     async def datacenters(self):
         data = await self._get("/datacenters")
         return data.get("datacenters", [])
@@ -785,36 +800,74 @@ class GcoreAPI:
 
 
 async def available_types_for_location(api: "HetznerAPI", location_name: str):
-    """مجموعه نام سرورتایپ‌هایی که هم‌اکنون در این دیتاسنتر موجودی برای فروش دارند."""
+    """Return server-type names whose current Hetzner availability flag is true."""
     try:
         types = await api.server_types()
-        id_to_name = {t["id"]: t["name"] for t in types}
-        dcs = await api.datacenters()
     except Exception:
-        return None  # نامشخص -> فیلتر انجام نشود
-    available_ids = set()
-    for dc in dcs:
-        if dc.get("location", {}).get("name") == location_name:
-            available_ids.update(dc.get("server_types", {}).get("available", []))
-    return {id_to_name[i] for i in available_ids if i in id_to_name}
+        return None
+    available = set()
+    known = False
+    for server_type in types:
+        name = server_type.get("name")
+        if not name:
+            continue
+        # Current Hetzner API uses server_types[].locations[].available.
+        location_entries = server_type.get("locations")
+        if isinstance(location_entries, list):
+            known = True
+            for item in location_entries:
+                if isinstance(item, dict) and item.get("name") == location_name and item.get("available") is True:
+                    available.add(name)
+                    break
+            continue
+        # Compatibility fallback for responses exposing available_locations.
+        locations = server_type.get("available_locations")
+        if isinstance(locations, list):
+            known = True
+            normalized = {item.get("name") if isinstance(item, dict) else item for item in locations}
+            if location_name in normalized:
+                available.add(name)
+            continue
+        # Legacy fallback: per-location prices show support, but not live stock.
+        # Do not call it available unless API explicitly says available.
+        prices = server_type.get("prices") or []
+        if any(price.get("location") == location_name for price in prices):
+            known = True
+            if server_type.get("available") is True:
+                available.add(name)
+    return available if known else None
 
 
 async def build_stock_map(api: "HetznerAPI"):
-    """یک‌بار همه دیتاسنترها را می‌خواند و map از نام‌لوکیشن -> مجموعه سرورتایپ‌های موجود می‌سازد."""
+    """Build location -> currently available server types from current Hetzner API fields."""
     try:
         types = await api.server_types()
-        id_to_name = {t["id"]: t["name"] for t in types}
-        dcs = await api.datacenters()
     except Exception:
         return None
     stock_map = {}
-    for dc in dcs:
-        loc = dc.get("location", {}).get("name")
-        if not loc:
+    known = False
+    for server_type in types:
+        name = server_type.get("name")
+        if not name:
             continue
-        names = {id_to_name[i] for i in dc.get("server_types", {}).get("available", []) if i in id_to_name}
-        stock_map.setdefault(loc, set()).update(names)
-    return stock_map
+        location_entries = server_type.get("locations")
+        if isinstance(location_entries, list):
+            known = True
+            for item in location_entries:
+                if isinstance(item, dict) and item.get("name") and item.get("available") is True:
+                    stock_map.setdefault(item["name"], set()).add(name)
+            continue
+        locations = server_type.get("available_locations")
+        if isinstance(locations, list):
+            known = True
+            for item in locations:
+                loc = item.get("name") if isinstance(item, dict) else item
+                if loc:
+                    stock_map.setdefault(loc, set()).add(name)
+            continue
+        # Prices alone are not proof of live inventory. Leave the map unknown if
+        # the API response does not include any supported availability field.
+    return stock_map if known else None
 
 
 def plan_has_stock(stock_map, plan_location, server_type, enabled_locations):
@@ -1816,7 +1869,11 @@ def extract_server_ip(provider_type: str, server: dict) -> str:
 
 @router.callback_query(BuyFlow.location, F.data.startswith("loc_"))
 async def buy_location(call: CallbackQuery, state: FSMContext):
-    location = call.data.replace("loc_", "")
+    location = call.data.replace("loc_", "", 1)
+    await _render_location_plans(call, state, location)
+
+
+async def _render_location_plans(call: CallbackQuery, state: FSMContext, location: str):
     data = await state.get_data()
     provider_type = data.get("provider_type", "hetzner")
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1831,52 +1888,84 @@ async def buy_location(call: CallbackQuery, state: FSMContext):
             await call.message.answer("در حال حاضر پلنی برای این دیتاسنتر تعریف نشده است.")
             await call.answer()
             return
-        api = make_provider_api(provider_type, token)
+        api = make_provider_api(provider_type, token) if token else None
         pricing = None
         types_list = None
+        stock = None
         kb_rows = []
         if provider_type == "hetzner":
             try:
                 pricing = await api.pricing()
+                stock = await available_types_for_location(api, location)
             except Exception as e:
-                await call.message.answer(f"خطا در دریافت قیمت‌ها: {e}")
-                await call.answer()
+                await call.answer("استعلام قیمت/موجودی ناموفق بود؛ دوباره تلاش کنید.", show_alert=True)
+                logger.warning("Hetzner plan/stock lookup failed for %s: %s", location, e)
                 return
-            # فقط پلن‌هایی که هم‌اکنون در این دیتاسنتر موجودی سخت‌افزاری دارند نمایش داده شوند
-            stock = await available_types_for_location(api, location)
             for p in plans:
                 plan_id, title, cpu, ram, disk, server_type, markup = p
-                if stock is not None and server_type not in stock:
-                    continue
                 price = await compute_price_usd(db, pricing, server_type, location, markup)
                 if price is None:
                     continue
-                kb_rows.append(
-                    [InlineKeyboardButton(text=f"{title} | {cpu} / {ram} / {disk} - {fmt_price(price)}/ماه", callback_data=f"plan_{plan_id}")]
-                )
+                # Unknown inventory must not be falsely labelled as available; show it distinctly.
+                in_stock = (stock is not None and server_type in stock)
+                if stock is None:
+                    label = "⚠️ موجودی نامشخص"
+                    callback = f"planout_{plan_id}"
+                elif in_stock:
+                    label = "✅ موجود"
+                    callback = f"plan_{plan_id}"
+                else:
+                    label = "❌ ناموجود"
+                    callback = f"planout_{plan_id}"
+                kb_rows.append([InlineKeyboardButton(
+                    text=f"{title} | {cpu} / {ram} / {disk} - {fmt_price(price)}/ماه | {label}",
+                    callback_data=callback,
+                )])
         else:
             try:
                 types_list = await api.server_types()
             except Exception as e:
-                await call.message.answer(f"خطا در دریافت قیمت‌ها: {e}")
-                await call.answer()
+                await call.answer("خطا در دریافت قیمت‌ها؛ دوباره تلاش کنید.", show_alert=True)
                 return
             for p in plans:
                 plan_id, title, cpu, ram, disk, server_type, markup = p
                 price = compute_price_generic(types_list, server_type, markup)
                 if price is None:
                     continue
-                kb_rows.append(
-                    [InlineKeyboardButton(text=f"{title} | {cpu} / {ram} / {disk} - {fmt_price(price)}/ماه", callback_data=f"plan_{plan_id}")]
-                )
-    if not kb_rows:
-        await call.message.answer("پلنی برای این دیتاسنتر در دسترس نیست.")
-        await call.answer()
-        return
+                kb_rows.append([InlineKeyboardButton(
+                    text=f"{title} | {cpu} / {ram} / {disk} - {fmt_price(price)}/ماه",
+                    callback_data=f"plan_{plan_id}",
+                )])
     await state.update_data(location=location, pricing=pricing, types_list=types_list)
-    kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_main")])
+    kb_rows.append([InlineKeyboardButton(text="🔄 همگام‌سازی موجودی", callback_data=f"stock_sync_{location}")])
+    kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت به لوکیشن‌ها", callback_data="back_buy_locations")])
     await state.set_state(BuyFlow.plan)
-    await call.message.edit_text("📦 یک پلن انتخاب کنید (قیمت‌ها ماهانه و زنده هستند):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    text = "📦 پلن موردنظر را انتخاب کنید (قیمت ماهانه زنده است):"
+    if call.message.text:
+        try:
+            await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+        except Exception:
+            await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    else:
+        await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("stock_sync_"))
+async def buy_stock_sync(call: CallbackQuery, state: FSMContext):
+    location = call.data[len("stock_sync_"):]
+    await _render_location_plans(call, state, location)
+
+
+@router.callback_query(F.data.startswith("planout_"))
+async def buy_unavailable_plan(call: CallbackQuery):
+    await call.answer("❌ این پلن در حال حاضر موجود نیست یا موجودی آن قابل تأیید نیست. از دکمه همگام‌سازی موجودی استفاده کنید.", show_alert=True)
+
+
+@router.callback_query(F.data == "back_buy_locations")
+async def back_buy_locations(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await _buy_show_locations(call.message, state, data.get("provider_type", "hetzner"))
     await call.answer()
 
 
@@ -1892,6 +1981,16 @@ async def buy_plan(call: CallbackQuery, state: FSMContext):
     if not plan or not token:
         await call.answer("خطا در دریافت اطلاعات پلن", show_alert=True)
         return
+    if provider_type == "hetzner":
+        data_now = await state.get_data()
+        location_now = data_now.get("location")
+        try:
+            current_stock = await available_types_for_location(HetznerAPI(token), location_now)
+        except Exception:
+            current_stock = None
+        if current_stock is None or plan[1] not in current_stock:
+            await call.answer("❌ موجودی این پلن تأیید نشد یا ناموجود است. لطفاً موجودی را همگام‌سازی کنید.", show_alert=True)
+            return
     await state.update_data(plan_id=plan[0], server_type=plan[1], plan_title=plan[2], markup=plan[3])
     api = make_provider_api(provider_type, token)
     try:

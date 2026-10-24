@@ -49,6 +49,7 @@ NAV_ITEMS = [
     ("/plans", "🧩 پلن‌ها"),
     ("/locations", "📍 لوکیشن‌ها"),
     ("/providers", "🔑 API های Hetzner"),
+    ("/account-status", "📈 لیمیت، CPU و Usage اکانت‌ها"),
     ("/wallet-requests", "💳 درخواست‌های شارژ"),
     ("/orders", "📦 سفارش‌ها"),
     ("/settings", "⚙️ تنظیمات درگاه"),
@@ -1148,6 +1149,8 @@ async def plans_list(request: Request):
         all_plans = await cur.fetchall()
         token = await core.get_active_token(db)
         disabled = await core.get_disabled_locations(db)
+    query_err = request.query_params.get("err")
+    query_ok = request.query_params.get("ok")
     type_options, loc_options = "", "<option value='ALL'>🌍 همه لوکیشن‌ها</option>"
     stock_map, enabled_locations = None, set()
     if token:
@@ -1164,19 +1167,25 @@ async def plans_list(request: Request):
         except Exception:
             pass
         stock_map = await core.build_stock_map(api)
-    plans = [p for p in all_plans if core.plan_has_stock(stock_map, p[8], p[2], enabled_locations)]
-    hidden_count = len(all_plans) - len(plans)
+    plans = all_plans
+    def plan_stock_label(plan_row):
+        if stock_map is None:
+            return "⚠️ نامشخص"
+        return "✅ موجود" if core.plan_has_stock(stock_map, plan_row[8], plan_row[2], enabled_locations) else "❌ ناموجود"
     rows = "".join(
         f"<tr><td>{esc(p[1])}</td><td>{esc(p[2])}</td><td>{esc(p[3])}/{esc(p[4])}/{esc(p[5])}</td><td>%{p[6]:g}</td>"
-        f"<td>{esc(p[8]) if p[8] else 'همه'}</td><td>{'✅' if p[7] else '❌'}</td>"
+        f"<td>{esc(p[8]) if p[8] else 'همه'}</td><td>{plan_stock_label(p)}</td><td>{'✅ فعال' if p[7] else '⚪ غیرفعال'}</td>"
         f"<td><form class='inline' method='post' action='/plans/{p[0]}/toggle'><button class='btn small gray' type='submit'>{'غیرفعال' if p[7] else 'فعال'}</button></form>"
         f"<form class='inline' method='post' action='/plans/{p[0]}/delete' onsubmit=\"return confirm('حذف این پلن؟')\"><button class='btn small red' type='submit'>حذف</button></form></td></tr>"
         for p in plans
     )
-    note = f'<div class="msg ok">⚠️ {hidden_count} پلن دیگر به‌دلیل نبود موجودی فعلی هتزنر نمایش داده نشد.</div>' if hidden_count else ""
+    note = '<div class="msg">وضعیت موجودی از API فعلی Hetzner خوانده می‌شود؛ در صورت خطای API، وضعیت نامشخص است.</div>' if stock_map is None else ""
     body = f"""
     <h1><span class="page-icon icon-teal">🧩</span> پلن‌ها ({len(plans)})</h1>
     {note}
+    {f'<div class="msg err">{esc(query_err)}</div>' if query_err else ''}
+    {f'<div class="msg ok">{esc(query_ok)}</div>' if query_ok else ''}
+    <form method="post" action="/plans/sync"><button class="btn" type="submit">🔄 همگام‌سازی موجودی پلن‌ها از Hetzner</button></form>
     <div class="card">
       <h3>افزودن پلن جدید</h3>
       <form method="post" action="/plans/add">
@@ -1192,11 +1201,29 @@ async def plans_list(request: Request):
       </form>
     </div>
     <div class="card"><table>
-      <tr><th>عنوان</th><th>نوع</th><th>مشخصات</th><th>سود</th><th>لوکیشن</th><th>وضعیت</th><th>عملیات</th></tr>
-      {rows or "<tr><td colspan=7>پلنی با موجودی فعلی وجود ندارد.</td></tr>"}
+      <tr><th>عنوان</th><th>نوع</th><th>مشخصات</th><th>سود</th><th>لوکیشن</th><th>موجودی</th><th>فعال‌بودن</th><th>عملیات</th></tr>
+      {rows or "<tr><td colspan=8>هنوز پلنی تعریف نشده است.</td></tr>"}
     </table></div>
     """
     return page("پلن‌ها", body, "/plans")
+
+
+@app.post("/plans/sync")
+async def plans_sync(request: Request):
+    sess = get_session(request)
+    if not sess:
+        return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        token = await core.get_active_token(db)
+    if not token:
+        return RedirectResponse("/plans?err=" + urllib.parse.quote("هیچ API فعال Hetzner وجود ندارد."), status_code=303)
+    try:
+        stock = await core.build_stock_map(core.HetznerAPI(token))
+        if stock is None:
+            return RedirectResponse("/plans?err=" + urllib.parse.quote("استعلام موجودی از Hetzner ناموفق بود."), status_code=303)
+    except Exception as exc:
+        return RedirectResponse("/plans?err=" + urllib.parse.quote("استعلام موجودی ناموفق بود: " + str(exc)[:150]), status_code=303)
+    return RedirectResponse("/plans?ok=" + urllib.parse.quote("موجودی پلن‌ها از Hetzner دوباره استعلام شد."), status_code=303)
 
 
 @app.post("/plans/add")
@@ -1311,7 +1338,8 @@ async def providers_list(request: Request):
     rows = "".join(
         f"<tr><td>{esc(r[1] or 'بدون‌نام')}</td><td>...{esc(r[2][-4:]) if r[2] else '-'}</td>"
         f"<td>{'✅ فعال' if r[3] else '⚪️ غیرفعال'}</td>"
-        f"<td><form class='inline' method='post' action='/providers/{r[0]}/activate'><button class='btn small green' type='submit'>فعال‌سازی</button></form>"
+        f"<td><a class='btn small' href='/account-status?pid={r[0]}'>📈 لیمیت و Usage</a> "
+        f"<form class='inline' method='post' action='/providers/{r[0]}/activate'><button class='btn small green' type='submit'>فعال‌سازی</button></form>"
         f"<form class='inline' method='post' action='/providers/{r[0]}/delete' onsubmit=\"return confirm('حذف این اتصال؟')\"><button class='btn small red' type='submit'>حذف</button></form></td></tr>"
         for r in rows_db
     )
@@ -1334,6 +1362,126 @@ async def providers_list(request: Request):
     </table></div>
     """
     return page("API های Hetzner", body, "/providers")
+
+
+def _limit_value(limits, names):
+    for item in limits or []:
+        if str(item.get("name", "")).lower() in names:
+            values = item.get("values") or {}
+            return values.get("current"), values.get("max")
+    return None, None
+
+
+@app.get("/account-status", response_class=HTMLResponse)
+async def account_status(request: Request):
+    sess = get_session(request)
+    if not sess:
+        return RedirectResponse("/login")
+    pid = request.query_params.get("pid", "").strip()
+    async with aiosqlite.connect(DB_PATH) as db:
+        if pid.isdigit():
+            cur = await db.execute("SELECT id, label, api_token, active, type FROM provider WHERE id=?", (int(pid),))
+        else:
+            cur = await db.execute("SELECT id, label, api_token, active, type FROM provider ORDER BY id DESC")
+        accounts = await cur.fetchall()
+    if not accounts:
+        return page("وضعیت اکانت‌ها", "<h1>📈 وضعیت اکانت‌ها</h1><div class='card'>هنوز API اضافه نشده است.</div>", "/account-status")
+
+    cards = []
+    for account_id, label, token, active, provider_type in accounts:
+        name = esc(label or f"اکانت #{account_id}")
+        if (provider_type or "hetzner") != "hetzner":
+            cards.append(f"<section class='card'><h2>{name}</h2><p>این صفحه در حال حاضر برای Hetzner Cloud طراحی شده است.</p></section>")
+            continue
+        try:
+            api = core.HetznerAPI(token)
+            limits, servers, pricing = await __import__('asyncio').gather(api.limits(), api.all_servers(), api.pricing())
+            server_types = await api.server_types()
+            type_by_name = {str(t.get("name")): t for t in server_types}
+            used_cores = 0
+            used_ram = 0.0
+            estimated_monthly = 0.0
+            estimate_complete = True
+            currency = pricing.get("currency", "EUR")
+            for server in servers:
+                st = server.get("server_type") or {}
+                used_cores += int(st.get("cores") or 0)
+                used_ram += float(st.get("memory") or 0)
+                type_info = type_by_name.get(str(st.get("name") or ""), {})
+                loc = (server.get("location") or {}).get("name")
+                price_row = next((x for x in (type_info.get("prices") or []) if x.get("location") == loc), None)
+                monthly = (price_row or {}).get("price_monthly", {}).get("gross")
+                if monthly is None:
+                    estimate_complete = False
+                else:
+                    estimated_monthly += float(monthly)
+            server_current, server_max = _limit_value(limits, {"servers", "server"})
+            core_current, core_max = _limit_value(limits, {"cores", "cpu", "vcpus", "vcpus_per_server"})
+            # Some Hetzner Cloud API versions do not expose project limits. Allow admin to
+            # record the values shown in the Hetzner Console, while still showing live usage.
+            async with aiosqlite.connect(DB_PATH) as db:
+                manual_server_limit = await core.get_setting(db, f"provider_{account_id}_server_limit", "")
+                manual_core_limit = await core.get_setting(db, f"provider_{account_id}_core_limit", "")
+            if server_max is None and str(manual_server_limit).isdigit():
+                server_max = int(manual_server_limit)
+            if core_max is None and str(manual_core_limit).isdigit():
+                core_max = int(manual_core_limit)
+            # API limit current value is authoritative where supplied; calculated totals are fallback only.
+            if server_current is None:
+                server_current = len(servers)
+            if core_current is None:
+                core_current = used_cores
+            limits_rows = "".join(
+                f"<tr><td>{esc(str(item.get('description') or item.get('name') or 'منبع'))}</td>"
+                f"<td>{esc(str((item.get('values') or {}).get('current', '—')))}</td>"
+                f"<td>{esc(str((item.get('values') or {}).get('max', '—')))}</td></tr>"
+                for item in limits
+            )
+            estimate_text = f"{estimated_monthly:.2f} {esc(currency)} / ماه" if estimate_complete else f"حداقل {estimated_monthly:.2f} {esc(currency)} / ماه؛ قیمت بعضی سرورها قابل محاسبه نبود"
+            cards.append(f"""
+            <section class='card'>
+              <h2>🔑 {name} {'<span class="dash-pill">فعال</span>' if active else '<span class="dash-pill">غیرفعال</span>'}</h2>
+              <div class='system-list'>
+                <span>سرورهای فعلی</span><strong>{len(servers)} (حد API: {esc(str(server_max if server_max is not None else 'از API برنگشت'))})</strong>
+                <span>CPU هسته‌های مصرف‌شده</span><strong>{used_cores} (حد API: {esc(str(core_max if core_max is not None else 'از API برنگشت'))})</strong>
+                <span>RAM مجموع سرورها</span><strong>{used_ram:.1f} GB</strong>
+                <span>هزینه ماهانه تخمینی سرورها</span><strong>{estimate_text}</strong>
+              </div>
+              <p class='msg'>⚠️ API رسمی Hetzner Cloud مبلغ بدهی/صورتحساب واقعی یا usage مالی جاری را ارائه نمی‌کند. عدد بالا فقط برآورد قیمت ماهانه سرورهای موجود است و شامل همه منابع اضافی/تخفیف‌ها/صورتحساب نهایی نیست.</p>
+              <h3>جزئیات لیمیت‌های گزارش‌شده توسط API</h3>
+              <div class='table-wrap'><table><tr><th>منبع</th><th>مصرف فعلی</th><th>حداکثر</th></tr>{limits_rows or '<tr><td colspan="3">API اطلاعات لیمیت برنگرداند.</td></tr>'}</table></div>
+              <h3>ثبت لیمیت از کنسول Hetzner (در صورت نبود مقدار خودکار)</h3>
+              <form method='post' action='/account-status/{account_id}/limits'>
+                <label>حداکثر تعداد سرور</label><input name='server_limit' type='number' min='0' value='{esc(str(server_max) if server_max is not None else str(manual_server_limit))}'>
+                <label>حداکثر تعداد هسته CPU</label><input name='core_limit' type='number' min='0' value='{esc(str(core_max) if core_max is not None else str(manual_core_limit))}'>
+                <button class='btn' type='submit'>💾 ذخیره لیمیت دستی</button>
+              </form>
+              <p><a target='_blank' rel='noopener' href='https://console.hetzner.cloud/'>باز کردن Hetzner Cloud Console برای بررسی لیمیت و صورتحساب واقعی ↗</a></p>
+            </section>""")
+        except Exception as exc:
+            cards.append(f"<section class='card'><h2>🔑 {name}</h2><div class='msg err'>خواندن اطلاعات این اکانت ناموفق بود: {esc(str(exc)[:300])}</div></section>")
+    body = "<h1>📈 لیمیت، CPU و Usage اکانت‌ها</h1><p class='muted'>اطلاعات هر API به‌صورت جداگانه از Hetzner استعلام می‌شود.</p>" + "".join(cards)
+    return page("وضعیت اکانت‌ها", body, "/account-status")
+
+
+@app.post("/account-status/{pid}/limits")
+async def account_status_save_limits(request: Request, pid: int):
+    sess = get_session(request)
+    if not sess:
+        return RedirectResponse("/login")
+    form = await request.form()
+    server_limit = str(form.get("server_limit", "")).strip()
+    core_limit = str(form.get("core_limit", "")).strip()
+    if (server_limit and not server_limit.isdigit()) or (core_limit and not core_limit.isdigit()):
+        return RedirectResponse(f"/account-status?pid={pid}", status_code=303)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id FROM provider WHERE id=?", (pid,))
+        if not await cur.fetchone():
+            return RedirectResponse("/account-status", status_code=303)
+        await core.set_setting(db, f"provider_{pid}_server_limit", server_limit)
+        await core.set_setting(db, f"provider_{pid}_core_limit", core_limit)
+        await db.commit()
+    return RedirectResponse(f"/account-status?pid={pid}", status_code=303)
 
 
 @app.post("/providers/add")
