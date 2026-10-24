@@ -175,7 +175,6 @@ async def init_db():
         await _safe_add_column(db, "servers", "markup_percent REAL")
         await _safe_add_column(db, "servers", "expires_at TEXT")
         await _safe_add_column(db, "servers", "ip_change_count INTEGER DEFAULT 0")
-        await _safe_add_column(db, "servers", "ip_change_pending INTEGER DEFAULT 0")
         await _safe_add_column(db, "servers", "traffic_powered_off INTEGER DEFAULT 0")
         await _safe_add_column(db, "servers", "expired_powered_off_at TEXT")
         await _safe_add_column(db, "servers", "monthly_price REAL")
@@ -276,21 +275,6 @@ async def get_setting(db, key, default=None):
     cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))
     row = await cur.fetchone()
     return row[0] if row else default
-
-
-async def get_ip_change_settings(db):
-    """Read shared, persistent IP-change settings; legacy constants are fallbacks only."""
-    raw_count = await get_setting(db, "ip_change_free_count", str(IP_CHANGE_FREE_COUNT))
-    raw_price = await get_setting(db, "ip_change_price", str(IP_CHANGE_PRICE))
-    try:
-        free_count = max(0, int(raw_count))
-    except (TypeError, ValueError):
-        free_count = IP_CHANGE_FREE_COUNT
-    try:
-        price = max(0.0, float(raw_price))
-    except (TypeError, ValueError):
-        price = IP_CHANGE_PRICE
-    return free_count, price
 
 
 async def set_setting(db, key, value):
@@ -1771,18 +1755,17 @@ async def buy_location(call: CallbackQuery, state: FSMContext):
                 await call.message.answer(f"خطا در دریافت قیمت‌ها: {e}")
                 await call.answer()
                 return
-            # همه پلن‌ها نمایش داده می‌شوند؛ وضعیت موجودی زنده کنار هر پلن می‌آید.
-            # با کلیک روی پلن و تأیید خرید نیز موجودی دوباره از API خوانده می‌شود.
+            # فقط پلن‌هایی که هم‌اکنون در این دیتاسنتر موجودی سخت‌افزاری دارند نمایش داده شوند
             stock = await available_types_for_location(api, location)
             for p in plans:
                 plan_id, title, cpu, ram, disk, server_type, markup = p
+                if stock is not None and server_type not in stock:
+                    continue
                 price = await compute_price_usd(db, pricing, server_type, location, markup)
                 if price is None:
                     continue
-                unavailable = stock is not None and server_type not in stock
-                stock_label = " | ❌ ناموجود" if unavailable else (" | ✅ موجود" if stock is not None else " | وضعیت نامشخص")
                 kb_rows.append(
-                    [InlineKeyboardButton(text=f"{title}{stock_label} | {cpu}/{ram}/{disk} - {fmt_price(price)}/ماه", callback_data=f"plan_{plan_id}")]
+                    [InlineKeyboardButton(text=f"{title} | {cpu} / {ram} / {disk} - {fmt_price(price)}/ماه", callback_data=f"plan_{plan_id}")]
                 )
         else:
             try:
@@ -1822,21 +1805,8 @@ async def buy_plan(call: CallbackQuery, state: FSMContext):
     if not plan or not token:
         await call.answer("خطا در دریافت اطلاعات پلن", show_alert=True)
         return
-    api = make_provider_api(provider_type, token)
-    if provider_type == "hetzner":
-        stock = await available_types_for_location(api, data.get("location", ""))
-        if stock is None:
-            await call.answer("⚠️ وضعیت موجودی از Hetzner دریافت نشد؛ برای جلوگیری از خطای خرید دوباره تلاش کنید.", show_alert=True)
-            return
-        if plan[1] not in stock:
-            await call.answer("❌ این پلن در حال حاضر ناموجود است. فهرست را دوباره باز کنید و پلن دیگری انتخاب کنید.", show_alert=True)
-            try:
-                await call.message.edit_text("❌ این پلن اکنون ناموجود است. برای مشاهده وضعیت به‌روز، لوکیشن را دوباره انتخاب کنید.")
-            except Exception:
-                pass
-            await state.set_state(BuyFlow.location)
-            return
     await state.update_data(plan_id=plan[0], server_type=plan[1], plan_title=plan[2], markup=plan[3])
+    api = make_provider_api(provider_type, token)
     try:
         images = deduplicate_images(await api.images())
     except Exception as e:
@@ -1890,22 +1860,6 @@ async def buy_confirm(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     provider_type = data.get("provider_type", "hetzner")
     user_id = call.from_user.id
-    # کنترل موجودی درست پیش از ساخت؛ وضعیت ممکن است بعد از انتخاب پلن عوض شده باشد.
-    if provider_type == "hetzner":
-        async with aiosqlite.connect(DB_PATH) as stock_db:
-            stock_token = await get_active_token_for(stock_db, provider_type)
-        if not stock_token:
-            await call.answer("اتصال API فعال نیست.", show_alert=True)
-            return
-        stock = await available_types_for_location(HetznerAPI(stock_token), data.get("location", ""))
-        if stock is None:
-            await call.answer("⚠️ نتوانستیم موجودی را از Hetzner بررسی کنیم؛ خرید انجام نشد. دوباره تلاش کنید.", show_alert=True)
-            return
-        if data.get("server_type") not in stock:
-            await call.message.edit_text("❌ متأسفیم، این پلن تا زمان تأیید خرید ناموجود شده است. هیچ هزینه‌ای کسر نشد. لطفاً پلن دیگری انتخاب کنید.")
-            await state.clear()
-            await call.answer()
-            return
     async with aiosqlite.connect(DB_PATH) as db:
         # محاسبه قیمت نهایی دوباره برای دقت بیشتر لحظه خرید
         if provider_type == "hetzner":
@@ -1930,13 +1884,7 @@ async def buy_confirm(call: CallbackQuery, state: FSMContext):
             name=server_name, server_type=data["server_type"], image=data["image"], location=data["location"]
         )
     except Exception as e:
-        err_text = str(e)
-        lowered = err_text.lower()
-        if any(term in lowered for term in ("unavailable", "not available", "out of stock", "no server type available")):
-            message = "❌ این پلن در زمان خرید ناموجود شد. هیچ هزینه‌ای کسر نشد؛ لطفاً پلن دیگری انتخاب کنید."
-        else:
-            message = f"❌ ساخت سرور ناموفق بود؛ هیچ هزینه‌ای کسر نشد. جزئیات: {err_text[:350]}"
-        await call.message.answer(message)
+        await call.message.answer(f"❌ خطا در ساخت سرور: {e}")
         await state.clear()
         await call.answer()
         return
@@ -2191,9 +2139,7 @@ async def server_ipchange_start(call: CallbackQuery):
         await call.message.answer("❌ این قابلیت فقط برای سرورهای Hetzner در دسترس است.")
         return
     count = row[3] or 0
-    async with aiosqlite.connect(DB_PATH) as db:
-        free_count, ip_price = await get_ip_change_settings(db)
-    cost = 0 if count < free_count else ip_price
+    cost = 0 if count < IP_CHANGE_FREE_COUNT else IP_CHANGE_PRICE
     cost_txt = "رایگان" if cost == 0 else fmt_price(cost)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -2203,7 +2149,7 @@ async def server_ipchange_start(call: CallbackQuery):
     )
     await call.message.answer(
         f"سرور «{html.escape(row[2])}» را تاکنون {count} بار IP تغییر داده‌اید.\n"
-        f"دفعات رایگان: {free_count} بار برای هر سرور — بعد از آن هر بار {fmt_price(ip_price)}.\n"
+        f"دفعات رایگان: {IP_CHANGE_FREE_COUNT} بار — بعد از آن هر بار {fmt_price(IP_CHANGE_PRICE)}.\n"
         f"هزینه این تغییر: {cost_txt}\n\n"
         "⚠️ توجه: تغییر IP چند دقیقه طول می‌کشد و IP قبلی برای همیشه از بین می‌رود.",
         reply_markup=kb,
@@ -2230,30 +2176,17 @@ async def server_ipchange_confirm(call: CallbackQuery):
             return
         owner_id, hetzner_id, name, count, _ = row
         count = count or 0
-        free_count, ip_price = await get_ip_change_settings(db)
-        cost = 0 if count < free_count else ip_price
-        # Claim this server before calling the provider; repeated callbacks cannot run concurrently.
-        await db.execute("UPDATE servers SET ip_change_pending=1 WHERE id=? AND COALESCE(ip_change_pending,0)=0", (server_db_id,))
-        if db.total_changes == 0:
-            await db.rollback()
-            await call.message.edit_text("⏳ تغییر IP این سرور در حال انجام است؛ لطفاً دوباره کلیک نکنید.")
-            return
-        await db.commit()
+        cost = 0 if count < IP_CHANGE_FREE_COUNT else IP_CHANGE_PRICE
         if cost > 0 and owner_id:
             cur2 = await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,))
             bal_row = await cur2.fetchone()
             if not bal_row or bal_row[0] < cost:
-                await db.execute("UPDATE servers SET ip_change_pending=0 WHERE id=?", (server_db_id,))
-                await db.commit()
                 await call.message.edit_text(
                     f"❌ موجودی کافی نیست. موجودی فعلی: {fmt_price(bal_row[0] if bal_row else 0)}\nلطفاً ابتدا کیف پول خود را شارژ کنید."
                 )
                 return
         token = await get_active_token(db)
     if not token:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE servers SET ip_change_pending=0 WHERE id=?", (server_db_id,))
-            await db.commit()
         await call.message.edit_text("❌ هیچ API فعالی برای هتزنر تنظیم نشده.")
         return
     api = HetznerAPI(token)
@@ -2262,16 +2195,13 @@ async def server_ipchange_confirm(call: CallbackQuery):
         new_ip = await change_server_ip(api, hetzner_id)
     except Exception as e:
         logger.exception("IP change failed for local server id=%s, Hetzner id=%s", server_db_id, hetzner_id)
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE servers SET ip_change_pending=0 WHERE id=?", (server_db_id,))
-            await db.commit()
         try:
             await call.message.edit_text(f"❌ تغییر IP ناموفق بود. جزئیات API: {html.escape(str(e))}")
         finally:
             await call.answer("تغییر IP ناموفق بود", show_alert=True)
         return
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE servers SET ip=?, ip_change_count=ip_change_count+1, ip_change_pending=0 WHERE id=?", (new_ip, server_db_id))
+        await db.execute("UPDATE servers SET ip=?, ip_change_count=ip_change_count+1 WHERE id=?", (new_ip, server_db_id))
         if cost > 0 and owner_id:
             await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=?", (cost, owner_id))
         await db.commit()
