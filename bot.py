@@ -71,6 +71,11 @@ logger = logging.getLogger("hetzner_shop_bot")
 router = Router()
 
 
+class AdminSupportSettings(StatesGroup):
+    waiting_id = State()
+    waiting_message = State()
+
+
 # ---------------------------------------------------------------------------
 # دیتابیس
 # ---------------------------------------------------------------------------
@@ -1893,11 +1898,6 @@ async def support_set_message_save(message: Message, state: FSMContext):
 
 class AdminTicketReply(StatesGroup):
     waiting = State()
-
-
-class AdminSupportSettings(StatesGroup):
-    waiting_id = State()
-    waiting_message = State()
 
 
 @router.callback_query(F.data.startswith("ticket_reply_"))
