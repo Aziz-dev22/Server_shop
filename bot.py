@@ -169,6 +169,9 @@ async def init_db():
         await _safe_add_column(db, "plans", "markup_percent REAL DEFAULT 20")
         await _safe_add_column(db, "wallet_requests", "method TEXT DEFAULT 'manual'")
         await _safe_add_column(db, "wallet_requests", "track_id TEXT")
+        await _safe_add_column(db, "tickets", "status TEXT DEFAULT 'open'")
+        await _safe_add_column(db, "tickets", "reply TEXT")
+        await _safe_add_column(db, "tickets", "replied_at TEXT")
         await _safe_add_column(db, "plans", "location TEXT")
         await _safe_add_column(db, "servers", "provider_id INTEGER")
         await _safe_add_column(db, "servers", "server_type TEXT")
@@ -218,22 +221,54 @@ async def ensure_user(db, tid, username, full_name):
     return user
 
 
-async def get_active_token(db):
-    cur = await db.execute("SELECT api_token FROM provider WHERE active=1 AND type='hetzner' LIMIT 1")
-    row = await cur.fetchone()
-    return row[0] if row else None
-
-
-async def get_active_provider(db):
-    cur = await db.execute("SELECT id, api_token FROM provider WHERE active=1 AND type='hetzner' LIMIT 1")
+async def get_active_provider_for(db, provider_type: str):
+    """Return the preferred active provider for sales, without disabling other accounts."""
+    preferred = await get_setting(db, f"priority_provider_{provider_type}")
+    if preferred and str(preferred).isdigit():
+        cur = await db.execute("SELECT id, api_token FROM provider WHERE id=? AND active=1 AND type=?", (int(preferred), provider_type))
+        row = await cur.fetchone()
+        if row:
+            return row[0], row[1]
+    cur = await db.execute("SELECT id, api_token FROM provider WHERE active=1 AND type=? ORDER BY id DESC LIMIT 1", (provider_type,))
     row = await cur.fetchone()
     return (row[0], row[1]) if row else (None, None)
 
 
+async def get_active_token(db):
+    return (await get_active_provider_for(db, "hetzner"))[1]
+
+
+async def get_active_provider(db):
+    return await get_active_provider_for(db, "hetzner")
+
+
 async def get_active_token_for(db, provider_type: str):
-    cur = await db.execute("SELECT api_token FROM provider WHERE active=1 AND type=? LIMIT 1", (provider_type,))
+    return (await get_active_provider_for(db, provider_type))[1]
+
+
+async def get_token_for_server(db, server_db_id: int, provider_type: str):
+    """Resolve the owning account regardless of whether it is enabled for new sales."""
+    cur = await db.execute("SELECT provider_id, hetzner_id FROM servers WHERE id=?", (server_db_id,))
     row = await cur.fetchone()
-    return row[0] if row else None
+    if row and row[0] is not None:
+        cur = await db.execute("SELECT api_token FROM provider WHERE id=? AND type=?", (row[0], provider_type))
+        provider = await cur.fetchone()
+        if provider:
+            return provider[0]
+    # Backfill legacy rows that predate provider_id by finding which account owns this remote server.
+    if row and row[1] is not None:
+        cur = await db.execute("SELECT id, api_token FROM provider WHERE type=? ORDER BY id", (provider_type,))
+        providers = await cur.fetchall()
+        for pid, candidate_token in providers:
+            try:
+                remote_servers = await make_provider_api(provider_type, candidate_token).all_servers()
+                if any(int(remote.get("id", -1)) == int(row[1]) for remote in remote_servers):
+                    await db.execute("UPDATE servers SET provider_id=? WHERE id=?", (pid, server_db_id))
+                    await db.commit()
+                    return candidate_token
+            except Exception:
+                continue
+    return await get_active_token_for(db, provider_type)
 
 
 async def get_enabled_provider_types(db):
@@ -1057,6 +1092,7 @@ def admin_menu_kb():
         [InlineKeyboardButton(text="🏦 آدرس واریز دستی", callback_data="adm_manual_addr")],
         [InlineKeyboardButton(text="💳 درخواست‌های شارژ در انتظار", callback_data="adm_wallet_reqs")],
         [InlineKeyboardButton(text="📢 پیام همگانی", callback_data="adm_broadcast")],
+        [InlineKeyboardButton(text="🎫 تیکت‌ها و تنظیمات پشتیبانی", callback_data="adm_tickets")],
         [InlineKeyboardButton(text="🗄 بکاپ خودکار و عضویت اجباری", callback_data="adm_backup_join")],
         [InlineKeyboardButton(text="🌐 قیمت و دفعات رایگان تغییر IP", callback_data="adm_ip_pricing")],
     ]
@@ -1743,28 +1779,156 @@ async def wallet_request_decision(call: CallbackQuery):
 # ---------------------------------------------------------------------------
 @router.message(F.text == "🆘 پشتیبانی")
 async def support_start(message: Message, state: FSMContext):
+    async with aiosqlite.connect(DB_PATH) as db:
+        enabled = await get_setting(db, "tickets_enabled", "1")
+        support_id = await get_setting(db, "support_id", "")
+        support_message = await get_setting(db, "support_message", "برای ارتباط با پشتیبانی از اطلاعات زیر استفاده کنید.")
+    if enabled != "1":
+        lines = ["🆘 پشتیبانی", support_message]
+        if support_id:
+            lines.append(f"شناسه پشتیبانی: {support_id}")
+        await message.answer("\n\n".join(lines))
+        return
     await state.set_state(SupportTicket.waiting)
-    await message.answer("پیام خود را برای تیم پشتیبانی بنویسید:")
+    lines = ["پیام خود را برای تیم پشتیبانی بنویسید:"]
+    if support_message:
+        lines.append(support_message)
+    if support_id:
+        lines.append(f"ارتباط مستقیم: {support_id}")
+    await message.answer("\n\n".join(lines))
 
 
 @router.message(SupportTicket.waiting)
 async def support_receive(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("لطفاً متن پیام را ارسال کنید.")
+        return
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO tickets (user_id, message, created_at) VALUES (?,?,?)",
+        if await get_setting(db, "tickets_enabled", "1") != "1":
+            await state.clear()
+            await message.answer("سیستم تیکت در حال حاضر غیرفعال است.")
+            return
+        cur = await db.execute(
+            "INSERT INTO tickets (user_id, message, created_at, status) VALUES (?,?,?,'open')",
             (message.from_user.id, message.text, datetime.utcnow().isoformat()),
         )
+        ticket_id = cur.lastrowid
         await db.commit()
     await state.clear()
-    await message.answer("✅ پیام شما ثبت شد. به زودی پاسخ داده می‌شود.")
+    await message.answer(f"✅ تیکت شماره #{ticket_id} ثبت شد. پاسخ از همین طریق برای شما ارسال می‌شود.")
     for admin_id in ADMIN_IDS:
         try:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"✍️ پاسخ به تیکت #{ticket_id}", callback_data=f"ticket_reply_{ticket_id}")]])
             await message.bot.send_message(
                 admin_id,
-                f"🆘 تیکت پشتیبانی جدید\nکاربر: {message.from_user.id} (@{message.from_user.username})\n\n{message.text}",
+                f"🆘 تیکت جدید #{ticket_id}\nکاربر: {message.from_user.id} (@{message.from_user.username or 'ندارد'})\n\n{message.text}",
+                reply_markup=kb,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("cannot notify ticket to admin %s: %s", admin_id, exc)
+
+
+@router.callback_query(F.data == "adm_tickets")
+async def admin_tickets_menu(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("دسترسی ندارید", show_alert=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        enabled = await get_setting(db, "tickets_enabled", "1")
+        support_id = await get_setting(db, "support_id", "")
+        support_message = await get_setting(db, "support_message", "")
+        cur = await db.execute("SELECT id, user_id, message, created_at, COALESCE(status,'open') FROM tickets ORDER BY id DESC LIMIT 15")
+        rows = await cur.fetchall()
+    kb_rows = [[InlineKeyboardButton(text=("⏸ غیرفعال‌کردن تیکت" if enabled == "1" else "▶️ فعال‌کردن تیکت"), callback_data="ticket_toggle")],
+               [InlineKeyboardButton(text="🆔 تنظیم آیدی پشتیبانی", callback_data="support_set_id"), InlineKeyboardButton(text="💬 تنظیم پیام پشتیبانی", callback_data="support_set_message")]]
+    lines = [f"🎫 مدیریت تیکت‌ها | وضعیت: {'فعال' if enabled == '1' else 'غیرفعال'}", f"آیدی پشتیبانی: {support_id or 'تنظیم نشده'}", f"پیام: {support_message or 'تنظیم نشده'}", "", "آخرین تیکت‌ها:"]
+    for tid, uid, msg, created, status in rows:
+        lines.append(f"#{tid} | کاربر {uid} | {'باز' if status == 'open' else 'پاسخ‌داده‌شده'}\n{(msg or '')[:180]}")
+        if status == 'open':
+            kb_rows.append([InlineKeyboardButton(text=f"✍️ پاسخ #{tid}", callback_data=f"ticket_reply_{tid}")])
+    kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="adm_back")])
+    await call.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    await call.answer()
+
+
+@router.callback_query(F.data == "ticket_toggle")
+async def admin_ticket_toggle(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("دسترسی ندارید", show_alert=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        old = await get_setting(db, "tickets_enabled", "1")
+        await set_setting(db, "tickets_enabled", "0" if old == "1" else "1")
+    await admin_tickets_menu(call)
+
+
+@router.callback_query(F.data == "support_set_id")
+async def support_set_id_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return await call.answer("دسترسی ندارید", show_alert=True)
+    await state.set_state(AdminSupportSettings.waiting_id)
+    await call.message.answer("آیدی پشتیبانی را ارسال کنید (مثلاً @support یا لینک https://t.me/support). برای پاک کردن، - بفرستید.")
+    await call.answer()
+
+
+@router.callback_query(F.data == "support_set_message")
+async def support_set_message_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return await call.answer("دسترسی ندارید", show_alert=True)
+    await state.set_state(AdminSupportSettings.waiting_message)
+    await call.message.answer("متن دلخواهی که هنگام زدن دکمه پشتیبانی به کاربر نمایش داده شود را ارسال کنید.")
+    await call.answer()
+
+
+@router.message(AdminSupportSettings.waiting_id)
+async def support_set_id_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    value = "" if (message.text or "").strip() == "-" else (message.text or "").strip()
+    async with aiosqlite.connect(DB_PATH) as db: await set_setting(db, "support_id", value)
+    await state.clear(); await message.answer("✅ آیدی پشتیبانی ذخیره شد.")
+
+
+@router.message(AdminSupportSettings.waiting_message)
+async def support_set_message_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    async with aiosqlite.connect(DB_PATH) as db: await set_setting(db, "support_message", message.text or "")
+    await state.clear(); await message.answer("✅ متن پشتیبانی ذخیره شد.")
+
+
+class AdminTicketReply(StatesGroup):
+    waiting = State()
+
+
+class AdminSupportSettings(StatesGroup):
+    waiting_id = State()
+    waiting_message = State()
+
+
+@router.callback_query(F.data.startswith("ticket_reply_"))
+async def admin_ticket_reply_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id): return await call.answer("دسترسی ندارید", show_alert=True)
+    ticket_id = int(call.data.rsplit("_", 1)[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id, message FROM tickets WHERE id=?", (ticket_id,))
+        ticket = await cur.fetchone()
+    if not ticket: return await call.answer("تیکت پیدا نشد", show_alert=True)
+    await state.update_data(ticket_id=ticket_id, ticket_user_id=ticket[0])
+    await state.set_state(AdminTicketReply.waiting)
+    await call.message.answer(f"پاسخ خود را برای تیکت #{ticket_id} بنویسید.\nپیام کاربر: {(ticket[1] or '')[:500]}")
+    await call.answer()
+
+
+@router.message(AdminTicketReply.waiting)
+async def admin_ticket_reply_send(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    data = await state.get_data(); ticket_id = data.get("ticket_id"); user_id = data.get("ticket_user_id")
+    if not message.text:
+        await message.answer("لطفاً پاسخ را به صورت متن ارسال کنید."); return
+    try:
+        await message.bot.send_message(user_id, f"📩 پاسخ پشتیبانی | تیکت #{ticket_id}\n\n{message.text}")
+    except Exception as exc:
+        await message.answer(f"❌ ارسال پاسخ به کاربر ناموفق بود: {exc}"); return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE tickets SET status='answered', reply=?, replied_at=? WHERE id=?", (message.text, datetime.utcnow().isoformat(), ticket_id))
+        await db.commit()
+    await state.clear()
+    await message.answer(f"✅ پاسخ تیکت #{ticket_id} برای کاربر ارسال شد.")
 
 
 # ---------------------------------------------------------------------------
@@ -1801,23 +1965,39 @@ async def _buy_show_locations(message: Message, state: FSMContext, provider_type
     async with aiosqlite.connect(DB_PATH) as db:
         token = await get_active_token_for(db, provider_type)
     if not token:
-        await message.answer("اتصال این سرویس‌دهنده در حال حاضر فعال نیست.")
+        text = "اتصال این سرویس‌دهنده در حال حاضر فعال نیست."
+        if edit:
+            await message.edit_text(text)
+        else:
+            await message.answer(text)
         return
     api = make_provider_api(provider_type, token)
     try:
         locations = await api.locations()
     except Exception as e:
-        await message.answer(f"خطا در دریافت لیست دیتاسنترها: {e}")
+        text = f"خطا در دریافت لیست دیتاسنترها: {e}"
+        if edit:
+            await message.edit_text(text)
+        else:
+            await message.answer(text)
         return
     if not locations:
-        await message.answer("در حال حاضر دیتاسنتری در دسترس نیست.")
+        text = "در حال حاضر دیتاسنتری در دسترس نیست."
+        if edit:
+            await message.edit_text(text)
+        else:
+            await message.answer(text)
         return
     if provider_type == "hetzner":
         async with aiosqlite.connect(DB_PATH) as db:
             disabled = await get_disabled_locations(db)
         locations = [loc for loc in locations if loc["name"] not in disabled]
     if not locations:
-        await message.answer("در حال حاضر هیچ دیتاسنتری برای فروش فعال نیست.")
+        text = "در حال حاضر هیچ دیتاسنتری برای فروش فعال نیست."
+        if edit:
+            await message.edit_text(text)
+        else:
+            await message.answer(text)
         return
     kb_rows = [
         [InlineKeyboardButton(text=f"{loc['city']} ({loc['country']})" if loc["country"] else loc["city"], callback_data=f"loc_{loc['name']}")]
@@ -1825,7 +2005,16 @@ async def _buy_show_locations(message: Message, state: FSMContext, provider_type
     ]
     kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_main")])
     await state.set_state(BuyFlow.location)
-    await message.answer("📍 یک دیتاسنتر انتخاب کنید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    text = "📍 یک دیتاسنتر انتخاب کنید:"
+    if edit:
+        try:
+            await message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+        except Exception as e:
+            # Avoid creating duplicate menus; unchanged message is already correct.
+            if "message is not modified" not in str(e).lower():
+                logger.warning("Could not edit location menu: %s", e)
+    else:
+        await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 
 def compute_price_generic(types_list, server_type_id, markup_percent):
@@ -1944,11 +2133,16 @@ async def _render_location_plans(call: CallbackQuery, state: FSMContext, locatio
     if call.message.text:
         try:
             await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
-        except Exception:
-            await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+        except Exception as e:
+            # Telegram reports an error when the refreshed text/keyboard is identical.
+            # Do not send another message: the existing menu is already up to date.
+            if "message is not modified" not in str(e).lower():
+                logger.warning("Could not refresh plan menu for %s: %s", location, e)
+                await call.answer("به‌روزرسانی پیام انجام نشد؛ دوباره تلاش کنید.", show_alert=True)
+                return
     else:
         await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
-    await call.answer()
+    await call.answer("موجودی به‌روزرسانی شد" if call.data.startswith("stock_sync_") else None)
 
 
 @router.callback_query(F.data.startswith("stock_sync_"))
@@ -1965,7 +2159,7 @@ async def buy_unavailable_plan(call: CallbackQuery):
 @router.callback_query(F.data == "back_buy_locations")
 async def back_buy_locations(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    await _buy_show_locations(call.message, state, data.get("provider_type", "hetzner"))
+    await _buy_show_locations(call.message, state, data.get("provider_type", "hetzner"), edit=True)
     await call.answer()
 
 
@@ -2060,7 +2254,7 @@ async def buy_confirm(call: CallbackQuery, state: FSMContext):
             await state.clear()
             await call.answer()
             return
-        token = await get_active_token_for(db, provider_type)
+        provider_id, token = await get_active_provider_for(db, provider_type)
 
     await call.message.edit_text("⏳ در حال ساخت سرور شما... لطفاً چند لحظه صبر کنید.")
     api = make_provider_api(provider_type, token)
@@ -2084,11 +2278,11 @@ async def buy_confirm(call: CallbackQuery, state: FSMContext):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=?", (price, user_id))
         await db.execute(
-            "INSERT INTO servers (user_id, hetzner_id, name, ip, location, plan_title, os_image, root_password, status, created_at, expires_at, monthly_price, provider_type) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO servers (user_id, hetzner_id, name, ip, location, plan_title, os_image, root_password, status, created_at, expires_at, monthly_price, provider_type, provider_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 user_id, server["id"], server_name, ip, data["location"], data["plan_title"],
-                data["image"], root_password, "running", datetime.utcnow().isoformat(), expires_at, price, provider_type,
+                data["image"], root_password, "running", datetime.utcnow().isoformat(), expires_at, price, provider_type, provider_id,
             ),
         )
         cur = await db.execute("SELECT last_insert_rowid()")
@@ -2210,13 +2404,13 @@ async def server_action(call: CallbackQuery):
     _, action, server_db_id = call.data.split("_")
     server_db_id = int(server_db_id)
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id, hetzner_id, name, provider_type FROM servers WHERE id=?", (server_db_id,))
+        cur = await db.execute("SELECT user_id, hetzner_id, name, provider_type, provider_id FROM servers WHERE id=?", (server_db_id,))
         row = await cur.fetchone()
         if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
             await call.answer("دسترسی غیرمجاز", show_alert=True)
             return
         provider_type = row[3] or "hetzner"
-        token = await get_active_token_for(db, provider_type)
+        token = await get_token_for_server(db, server_db_id, provider_type)
     if not token:
         await call.answer("اتصال این سرویس‌دهنده در حال حاضر فعال نیست.", show_alert=True)
         return
@@ -2272,13 +2466,13 @@ async def server_rebuild_confirm(call: CallbackQuery):
     _, server_db_id, image_id = call.data.split("_")
     server_db_id = int(server_db_id)
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id, hetzner_id, name, provider_type FROM servers WHERE id=?", (server_db_id,))
+        cur = await db.execute("SELECT user_id, hetzner_id, name, provider_type, provider_id FROM servers WHERE id=?", (server_db_id,))
         row = await cur.fetchone()
         if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
             await call.answer("دسترسی غیرمجاز", show_alert=True)
             return
         provider_type = row[3] or "hetzner"
-        token = await get_active_token_for(db, provider_type)
+        token = await get_token_for_server(db, server_db_id, provider_type)
     if not token:
         await call.answer("اتصال این سرویس‌دهنده در حال حاضر فعال نیست.", show_alert=True)
         return
@@ -2316,7 +2510,7 @@ async def server_ipchange_start(call: CallbackQuery):
         await call.message.answer("❌ شناسه سرور نامعتبر است. لطفاً منوی سرورها را دوباره باز کنید.")
         return
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id, hetzner_id, name, ip_change_count, provider_type FROM servers WHERE id=?", (server_db_id,))
+        cur = await db.execute("SELECT user_id, hetzner_id, name, ip_change_count, provider_type, provider_id FROM servers WHERE id=?", (server_db_id,))
         row = await cur.fetchone()
     if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
         await call.message.answer("❌ دسترسی غیرمجاز")
@@ -2354,7 +2548,7 @@ async def server_ipchange_confirm(call: CallbackQuery):
         await call.message.answer("❌ شناسه سرور نامعتبر است. لطفاً منوی سرورها را دوباره باز کنید.")
         return
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id, hetzner_id, name, ip_change_count, provider_type FROM servers WHERE id=?", (server_db_id,))
+        cur = await db.execute("SELECT user_id, hetzner_id, name, ip_change_count, provider_type, provider_id FROM servers WHERE id=?", (server_db_id,))
         row = await cur.fetchone()
         if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
             await call.message.edit_text("❌ دسترسی غیرمجاز")
@@ -2362,7 +2556,7 @@ async def server_ipchange_confirm(call: CallbackQuery):
         if (row[4] or "hetzner") != "hetzner":
             await call.message.edit_text("❌ این قابلیت فقط برای سرورهای Hetzner در دسترس است.")
             return
-        owner_id, hetzner_id, name, count, _ = row
+        owner_id, hetzner_id, name, count, _, _ = row
         count = count or 0
         free_count, ip_price = await get_ip_change_config(db)
         cost = 0 if count < free_count else ip_price
@@ -2374,9 +2568,9 @@ async def server_ipchange_confirm(call: CallbackQuery):
                     f"❌ موجودی کافی نیست. موجودی فعلی: {fmt_price(bal_row[0] if bal_row else 0)}\nلطفاً ابتدا کیف پول خود را شارژ کنید."
                 )
                 return
-        token = await get_active_token(db)
+        token = await get_token_for_server(db, server_db_id, "hetzner")
     if not token:
-        await call.message.edit_text("❌ هیچ API فعالی برای هتزنر تنظیم نشده.")
+        await call.message.edit_text("❌ API مالک این سرور پیدا نشد؛ اگر API حذف شده باشد باید دوباره اضافه شود.")
         return
     api = HetznerAPI(token)
     try:
@@ -2435,14 +2629,14 @@ async def server_renew_confirm(call: CallbackQuery):
     server_db_id = int(call.data.replace("rncf_", ""))
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT user_id, hetzner_id, name, expires_at, monthly_price, expired_powered_off_at, provider_type FROM servers WHERE id=?",
+            "SELECT user_id, hetzner_id, name, expires_at, monthly_price, expired_powered_off_at, provider_type, provider_id FROM servers WHERE id=?",
             (server_db_id,),
         )
         row = await cur.fetchone()
         if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
             await call.answer("دسترسی غیرمجاز", show_alert=True)
             return
-        owner_id, hetzner_id, name, expires_at, monthly_price, expired_off_at, provider_type = row
+        owner_id, hetzner_id, name, expires_at, monthly_price, expired_off_at, provider_type, provider_id = row
         provider_type = provider_type or "hetzner"
         if not expires_at or not monthly_price:
             await call.answer("این سرویس تحت سیستم تمدید خودکار نیست.", show_alert=True)
@@ -2455,7 +2649,7 @@ async def server_renew_confirm(call: CallbackQuery):
             )
             await call.answer()
             return
-        token = await get_active_token_for(db, provider_type)
+        token = await get_token_for_server(db, server_db_id, provider_type)
         base = datetime.fromisoformat(expires_at)
         now = datetime.utcnow()
         if base < now:
@@ -2983,6 +3177,11 @@ async def adm_direct_confirm(call: CallbackQuery, state: FSMContext):
 # ---------------------------------------------------------------------------
 # پنل ادمین: مدیریت چند API Key هتزنر
 # ---------------------------------------------------------------------------
+async def get_setting_for_provider_type(provider_type):
+    async with aiosqlite.connect(DB_PATH) as db:
+        return await get_setting(db, f"priority_provider_{provider_type}")
+
+
 @router.callback_query(F.data == "adm_token")
 async def adm_token_list(call: CallbackQuery):
     if not is_admin(call.from_user.id):
@@ -2999,11 +3198,14 @@ async def adm_token_list(call: CallbackQuery):
         masked = f"...{token[-4:]}" if token and len(token) > 4 else "----"
         status = "✅ فعال" if active else "⚪️ غیرفعال"
         ptype_label = PROVIDER_LABELS.get(ptype, ptype)
-        lines.append(f"#{pid} [{ptype_label}] {label or 'بدون‌نام'} ({masked}) - {status}")
+        priority = await get_setting_for_provider_type(ptype)
+        is_priority = str(priority or "") == str(pid)
+        lines.append(f"#{pid} [{ptype_label}] {label or 'بدون‌نام'} ({masked}) - {status}" + (" | ⭐ اولویت فروش" if is_priority else ""))
         kb_rows.append(
             [
                 InlineKeyboardButton(text=f"مدیریت #{pid}", callback_data=f"prov_manage_{pid}"),
-                InlineKeyboardButton(text=f"فعال‌سازی #{pid}", callback_data=f"prov_act_{pid}"),
+                InlineKeyboardButton(text=("غیرفعال‌کردن" if active else "فعال‌سازی")+f" #{pid}", callback_data=f"prov_act_{pid}"),
+                InlineKeyboardButton(text=f"⭐ اولویت فروش #{pid}", callback_data=f"prov_priority_{pid}"),
                 InlineKeyboardButton(text=f"حذف #{pid}", callback_data=f"prov_del_{pid}"),
             ]
         )
@@ -3045,13 +3247,28 @@ async def adm_token_activate(call: CallbackQuery):
         return
     pid = int(call.data.replace("prov_act_", ""))
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT type FROM provider WHERE id=?", (pid,))
+        cur = await db.execute("SELECT active FROM provider WHERE id=?", (pid,))
         row = await cur.fetchone()
         if row:
-            await db.execute("UPDATE provider SET active=0 WHERE type=?", (row[0],))
-            await db.execute("UPDATE provider SET active=1 WHERE id=?", (pid,))
+            await db.execute("UPDATE provider SET active=? WHERE id=?", (0 if row[0] else 1, pid))
             await db.commit()
-    await call.answer("✅ فعال شد")
+    await call.answer("وضعیت API تغییر کرد")
+    await adm_token_list(call)
+
+
+@router.callback_query(F.data.startswith("prov_priority_"))
+async def adm_token_priority(call: CallbackQuery):
+    if not is_admin(call.from_user.id): return await call.answer("دسترسی ندارید", show_alert=True)
+    pid = int(call.data.rsplit("_", 1)[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT type, active FROM provider WHERE id=?", (pid,))
+        row = await cur.fetchone()
+        if not row:
+            return await call.answer("API پیدا نشد", show_alert=True)
+        if not row[1]:
+            return await call.answer("ابتدا API را فعال کنید؛ اولویت فروش فقط برای API فعال قابل انتخاب است.", show_alert=True)
+        await set_setting(db, f"priority_provider_{row[0]}", str(pid))
+    await call.answer("⭐ اولویت فروش تنظیم شد")
     await adm_token_list(call)
 
 
@@ -3138,11 +3355,16 @@ async def adm_token_save(message: Message, state: FSMContext):
         await state.clear()
         return
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE provider SET active=0 WHERE type=?", (ptype,))
+        cur = await db.execute("SELECT COUNT(*) FROM provider WHERE type=? AND active=1", (ptype,))
+        active_count = (await cur.fetchone())[0]
         await db.execute(
             "INSERT INTO provider (label, api_token, active, created_at, type) VALUES (?,?,1,?,?)",
             (data.get("label", "بدون‌نام"), token, datetime.utcnow().isoformat(), ptype),
         )
+        cur = await db.execute("SELECT last_insert_rowid()")
+        new_pid = (await cur.fetchone())[0]
+        if not active_count:
+            await set_setting(db, f"priority_provider_{ptype}", str(new_pid))
         await db.commit()
     await state.clear()
     await message.answer(f"✅ اتصال جدید ({PROVIDER_LABELS.get(ptype, ptype)}) با موفقیت اضافه و فعال شد.")

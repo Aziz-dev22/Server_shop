@@ -49,6 +49,7 @@ NAV_ITEMS = [
     ("/plans", "🧩 پلن‌ها"),
     ("/locations", "📍 لوکیشن‌ها"),
     ("/providers", "🔑 API های Hetzner"),
+    ("/support-settings", "🎫 تیکت و پشتیبانی"),
     ("/account-status", "📈 لیمیت، CPU و Usage اکانت‌ها"),
     ("/wallet-requests", "💳 درخواست‌های شارژ"),
     ("/orders", "📦 سفارش‌ها"),
@@ -1331,15 +1332,20 @@ async def providers_list(request: Request):
     if not sess:
         return RedirectResponse("/login")
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id, label, api_token, active FROM provider ORDER BY id DESC")
+        cur = await db.execute("SELECT id, label, api_token, active, COALESCE(type,'hetzner') FROM provider ORDER BY id DESC")
         rows_db = await cur.fetchall()
+        priorities = {}
+        for ptype in {r[4] for r in rows_db}:
+            priorities[ptype] = await core.get_setting(db, f"priority_provider_{ptype}", "")
     err = request.query_params.get("err")
     msg = f'<div class="msg err">اتصال ناموفق بود: {esc(err)}</div>' if err else ""
     rows = "".join(
         f"<tr><td>{esc(r[1] or 'بدون‌نام')}</td><td>...{esc(r[2][-4:]) if r[2] else '-'}</td>"
         f"<td>{'✅ فعال' if r[3] else '⚪️ غیرفعال'}</td>"
+        f"<td>{'⭐ اولویت فروش' if str(priorities.get(r[4], '')) == str(r[0]) else '—'}</td>"
         f"<td><a class='btn small' href='/account-status?pid={r[0]}'>📈 لیمیت و Usage</a> "
-        f"<form class='inline' method='post' action='/providers/{r[0]}/activate'><button class='btn small green' type='submit'>فعال‌سازی</button></form>"
+        f"<form class='inline' method='post' action='/providers/{r[0]}/activate'><button class='btn small green' type='submit'>{'غیرفعال‌کردن' if r[3] else 'فعال‌سازی'}</button></form> "
+        f"<form class='inline' method='post' action='/providers/{r[0]}/priority'><button class='btn small' type='submit'>⭐ اولویت فروش</button></form> "
         f"<form class='inline' method='post' action='/providers/{r[0]}/delete' onsubmit=\"return confirm('حذف این اتصال؟')\"><button class='btn small red' type='submit'>حذف</button></form></td></tr>"
         for r in rows_db
     )
@@ -1347,6 +1353,7 @@ async def providers_list(request: Request):
     <h1><span class="page-icon icon-yellow">🔑</span> API های Hetzner</h1>
     {msg}
     <div class="card">
+      <p class="muted">APIها مستقل از هم فعال می‌مانند. اولویت فروش فقط تعیین می‌کند خریدهای جدید از کدام اکانت شروع شوند؛ مدیریت سرورهای قبلی به API مالک همان سرور متصل می‌ماند.</p>
       <h3>افزودن اتصال جدید</h3>
       <form method="post" action="/providers/add">
         <label>نام دلخواه</label>
@@ -1357,8 +1364,8 @@ async def providers_list(request: Request):
       </form>
     </div>
     <div class="card"><table>
-      <tr><th>نام</th><th>توکن</th><th>وضعیت</th><th>عملیات</th></tr>
-      {rows or "<tr><td colspan=4>هنوز اتصالی اضافه نشده.</td></tr>"}
+      <tr><th>نام</th><th>توکن</th><th>وضعیت</th><th>اولویت</th><th>عملیات</th></tr>
+      {rows or "<tr><td colspan=5>هنوز اتصالی اضافه نشده.</td></tr>"}
     </table></div>
     """
     return page("API های Hetzner", body, "/providers")
@@ -1498,11 +1505,16 @@ async def providers_add(request: Request):
     except Exception as e:
         return RedirectResponse(f"/providers?err={urllib.parse.quote(str(e))}", status_code=303)
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE provider SET active=0")
+        cur = await db.execute("SELECT COUNT(*) FROM provider WHERE type='hetzner' AND active=1")
+        active_count = (await cur.fetchone())[0]
         await db.execute(
-            "INSERT INTO provider (label, api_token, active, created_at) VALUES (?,?,1,?)",
+            "INSERT INTO provider (label, api_token, active, created_at, type) VALUES (?,?,1,?,'hetzner')",
             (label, token, datetime.utcnow().isoformat()),
         )
+        cur = await db.execute("SELECT last_insert_rowid()")
+        new_pid = (await cur.fetchone())[0]
+        if not active_count:
+            await core.set_setting(db, "priority_provider_hetzner", str(new_pid))
         await db.commit()
     return RedirectResponse("/providers", status_code=303)
 
@@ -1513,9 +1525,30 @@ async def providers_activate(request: Request, pid: int):
     if not sess:
         return RedirectResponse("/login")
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE provider SET active=0")
-        await db.execute("UPDATE provider SET active=1 WHERE id=?", (pid,))
+        cur = await db.execute("SELECT active FROM provider WHERE id=?", (pid,))
+        row = await cur.fetchone()
+        if row:
+            await db.execute("UPDATE provider SET active=? WHERE id=?", (0 if row[0] else 1, pid))
+            if not row[0]:
+                cur = await db.execute("SELECT type FROM provider WHERE id=?", (pid,))
+                ptype = (await cur.fetchone())[0] or "hetzner"
+                current_priority = await core.get_setting(db, f"priority_provider_{ptype}", "")
+                if not current_priority:
+                    await core.set_setting(db, f"priority_provider_{ptype}", str(pid))
         await db.commit()
+    return RedirectResponse("/providers", status_code=303)
+
+
+@app.post("/providers/{pid}/priority")
+async def providers_priority(request: Request, pid: int):
+    sess = get_session(request)
+    if not sess:
+        return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT type, active FROM provider WHERE id=?", (pid,))
+        row = await cur.fetchone()
+        if row and row[1]:
+            await core.set_setting(db, f"priority_provider_{row[0] or 'hetzner'}", str(pid))
     return RedirectResponse("/providers", status_code=303)
 
 
@@ -1648,6 +1681,47 @@ async def orders_list(request: Request):
 # ---------------------------------------------------------------------------
 # تنظیمات درگاه (OxaPay / آدرس واریز دستی)
 # ---------------------------------------------------------------------------
+@app.get("/support-settings", response_class=HTMLResponse)
+async def support_settings_page(request: Request):
+    sess = get_session(request)
+    if not sess:
+        return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        enabled = await core.get_setting(db, "tickets_enabled", "1")
+        support_id = await core.get_setting(db, "support_id", "")
+        support_message = await core.get_setting(db, "support_message", "برای ارتباط با پشتیبانی از اطلاعات زیر استفاده کنید.")
+        cur = await db.execute("SELECT id, user_id, message, created_at, COALESCE(status,'open'), reply FROM tickets ORDER BY id DESC LIMIT 100")
+        tickets = await cur.fetchall()
+    ticket_rows = "".join(f"<tr><td>#{r[0]}</td><td>{esc(r[1])}</td><td>{esc((r[2] or '')[:200])}</td><td>{'باز' if r[4]=='open' else 'پاسخ‌داده‌شده'}</td><td>{esc((r[5] or '')[:200])}</td></tr>" for r in tickets)
+    body = f"""
+    <h1>🎫 تیکت و پشتیبانی</h1>
+    <div class='card'><h3>تنظیمات پشتیبانی</h3>
+      <form method='post' action='/support-settings/save'>
+        <label>وضعیت سیستم تیکت</label><select name='tickets_enabled'><option value='1' {'selected' if enabled=='1' else ''}>فعال</option><option value='0' {'selected' if enabled!='1' else ''}>غیرفعال</option></select>
+        <label>آیدی یا لینک پشتیبانی (مثلاً @support یا https://t.me/support)</label><input name='support_id' value='{esc(support_id)}' placeholder='@support'>
+        <label>متن نمایشی برای کاربر</label><textarea name='support_message' rows='4'>{esc(support_message)}</textarea>
+        <button class='btn' type='submit'>💾 ذخیره تنظیمات</button>
+      </form>
+    </div>
+    <div class='card'><h3>آخرین تیکت‌ها</h3><div class='table-wrap'><table><tr><th>شناسه</th><th>کاربر</th><th>پیام</th><th>وضعیت</th><th>آخرین پاسخ</th></tr>{ticket_rows or '<tr><td colspan="5">هنوز تیکتی ثبت نشده.</td></tr>'}</table></div>
+    <p class='muted'>برای پاسخ دادن به تیکت‌ها از منوی «🎫 تیکت‌ها و تنظیمات پشتیبانی» در ربات تلگرام استفاده کنید.</p></div>
+    """
+    return page("تیکت و پشتیبانی", body, "/support-settings")
+
+
+@app.post("/support-settings/save")
+async def support_settings_save(request: Request):
+    sess = get_session(request)
+    if not sess:
+        return RedirectResponse("/login")
+    form = await request.form()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await core.set_setting(db, "tickets_enabled", "1" if str(form.get("tickets_enabled", "0")) == "1" else "0")
+        await core.set_setting(db, "support_id", str(form.get("support_id", "")).strip())
+        await core.set_setting(db, "support_message", str(form.get("support_message", "")).strip())
+    return RedirectResponse("/support-settings", status_code=303)
+
+
 @app.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request):
     sess = get_session(request)
