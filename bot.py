@@ -155,6 +155,15 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS pending_ip_cleanup (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider_id INTEGER,
+    provider_type TEXT DEFAULT 'hetzner',
+    ip_id INTEGER,
+    ip_address TEXT,
+    cleanup_at TEXT
+);
 """
 
 
@@ -186,6 +195,17 @@ async def init_db():
         await _safe_add_column(db, "servers", "traffic_powered_off INTEGER DEFAULT 0")
         await _safe_add_column(db, "servers", "expired_powered_off_at TEXT")
         await _safe_add_column(db, "servers", "monthly_price REAL")
+        await _safe_add_column(db, "servers", "deletion_pending_reason TEXT")
+        await _safe_add_column(db, "servers", "deletion_requested_at TEXT")
+        await _safe_add_column(db, "servers", "deletion_notified INTEGER DEFAULT 0")
+        await _safe_add_column(db, "servers", "previous_ip_id INTEGER")
+        await _safe_add_column(db, "servers", "previous_ip_address TEXT")
+        await _safe_add_column(db, "servers", "previous_ip_cleanup_at TEXT")
+        await _safe_add_column(db, "servers", "traffic_in_bytes INTEGER DEFAULT 0")
+        await _safe_add_column(db, "servers", "traffic_out_bytes INTEGER DEFAULT 0")
+        await _safe_add_column(db, "servers", "traffic_included_bytes INTEGER DEFAULT 0")
+        await _safe_add_column(db, "servers", "traffic_synced_at TEXT")
+        await _safe_add_column(db, "servers", "traffic_limit_reviewed_at TEXT")
         await _safe_add_column(db, "provider", "type TEXT DEFAULT 'hetzner'")
         await _safe_add_column(db, "plans", "provider_type TEXT DEFAULT 'hetzner'")
         await _safe_add_column(db, "servers", "provider_type TEXT DEFAULT 'hetzner'")
@@ -207,6 +227,100 @@ async def init_db():
             if row:
                 await db.execute("UPDATE provider SET active=1 WHERE id=?", (row[0],))
                 await db.commit()
+
+
+def format_bytes(value):
+    try:
+        value = max(0, int(value or 0))
+    except Exception:
+        value = 0
+    units = ("B", "KB", "MB", "GB", "TB", "PB")
+    amount = float(value)
+    for unit in units:
+        if amount < 1000 or unit == units[-1]:
+            return f"{amount:.2f} {unit}"
+        amount /= 1000
+    return f"{amount:.2f} PB"
+
+
+def format_elapsed(started_at):
+    if not started_at:
+        return "نامشخص"
+    try:
+        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        if start.tzinfo:
+            start = start.astimezone().replace(tzinfo=None)
+        delta = max(timedelta(0), datetime.utcnow() - start)
+        days = delta.days
+        hours = delta.seconds // 3600
+        minutes = (delta.seconds % 3600) // 60
+        return f"{days} روز، {hours} ساعت، {minutes} دقیقه"
+    except Exception:
+        return "نامشخص"
+
+
+async def sync_server_usage(db, server_db_id, api):
+    cur = await db.execute("SELECT hetzner_id FROM servers WHERE id=?", (server_db_id,))
+    row = await cur.fetchone()
+    if not row:
+        return None
+    live = await api.get_server(row[0])
+    incoming = int(live.get("ingoing_traffic") or 0)
+    outgoing = int(live.get("outgoing_traffic") or 0)
+    included = int(live.get("included_traffic") or 0)
+    await db.execute(
+        "UPDATE servers SET traffic_in_bytes=?, traffic_out_bytes=?, traffic_included_bytes=?, traffic_synced_at=? WHERE id=?",
+        (incoming, outgoing, included, datetime.utcnow().isoformat(), server_db_id),
+    )
+    await db.commit()
+    return live
+
+
+async def request_server_deletion(bot, server_db_id, reason):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT name, hetzner_id, provider_type, provider_id, user_id, deletion_pending_reason FROM servers WHERE id=?", (server_db_id,))
+        row = await cur.fetchone()
+        if not row:
+            return False
+        name, remote_id, ptype, pid, owner_id, pending = row
+        if pending:
+            return False
+        token = await get_token_for_server(db, server_db_id, ptype or "hetzner")
+        await db.execute(
+            "UPDATE servers SET deletion_pending_reason=?, deletion_requested_at=?, deletion_notified=1, status='off' WHERE id=?",
+            (reason, datetime.utcnow().isoformat(), server_db_id),
+        )
+        await db.commit()
+    if token:
+        try:
+            await make_provider_api(ptype or "hetzner", token).power_action(remote_id, "poweroff")
+        except Exception as exc:
+            logger.warning("Power-off before deletion approval failed for server %s: %s", server_db_id, exc)
+    buttons = [
+        [InlineKeyboardButton(text="🗑 تأیید حذف سرور", callback_data=f"delapprove_{server_db_id}")],
+        [InlineKeyboardButton(text="⏳ تمدید ۳۰ روزه", callback_data=f"sv_renew_{server_db_id}")],
+    ]
+    if "درخواست حذف از منوی" in reason:
+        buttons.append([InlineKeyboardButton(text="❌ لغو درخواست حذف", callback_data=f"delcancel_{server_db_id}")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if owner_id:
+        try:
+            await bot.send_message(
+                owner_id,
+                f"⚠️ سرور «{name}» خاموش شده و درخواست حذف/تمدید به ادمین ارسال شد.\\nعلت: {reason}\\nتا تصمیم ادمین، سرور حذف نخواهد شد.",
+            )
+        except Exception:
+            pass
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"⚠️ درخواست بررسی حذف سرور\\n\\nسرور: {name} (DB #{server_db_id}, Provider ID {remote_id})\\nمالک: {owner_id}\\nعلت: {reason}\\n\\nسرور خاموش شده و تا تأیید ادمین حذف نخواهد شد.",
+                reply_markup=keyboard,
+            )
+        except Exception:
+            pass
+    return True
 
 
 async def get_user(db, tid):
@@ -237,6 +351,15 @@ async def get_active_provider_for(db, provider_type: str):
     cur = await db.execute("SELECT id, api_token FROM provider WHERE active=1 AND type=? ORDER BY id DESC LIMIT 1", (provider_type,))
     row = await cur.fetchone()
     return (row[0], row[1]) if row else (None, None)
+
+
+async def get_active_providers(db, provider_type: str):
+    cur = await db.execute("SELECT id, api_token FROM provider WHERE type=? AND active=1 ORDER BY id", (provider_type,))
+    rows = await cur.fetchall()
+    preferred = await get_setting(db, f"priority_provider_{provider_type}")
+    if preferred and str(preferred).isdigit():
+        rows.sort(key=lambda row: (0 if str(row[0]) == str(preferred) else 1, row[0]))
+    return rows
 
 
 async def get_active_token(db):
@@ -539,8 +662,8 @@ class HetznerAPI:
         return result
 
 
-async def change_server_ip(api: "HetznerAPI", hetzner_id: int) -> str:
-    """Replace the primary IPv4. Hetzner requires the server to be powered off."""
+async def change_server_ip(api: "HetznerAPI", hetzner_id: int):
+    """Replace the primary IPv4 while retaining the previous unassigned IP for delayed cleanup."""
     server = await api.get_server(hetzner_id)
     if server.get("status") != "off":
         raise RuntimeError("برای تغییر Primary IP، ابتدا سرور را خاموش کنید و وضعیت آن باید در هتزنر «off» باشد. پس از خاموش شدن دوباره تلاش کنید.")
@@ -577,12 +700,8 @@ async def change_server_ip(api: "HetznerAPI", hetzner_id: int) -> str:
             pass
         raise RuntimeError(f"اتصال IP جدید ناموفق بود؛ IP قبلی دوباره متصل شد. علت API: {exc}") from exc
 
-    try:
-        await api.delete_primary_ip(old["id"])
-    except Exception as cleanup_exc:
-        # New IP is active; report success with a cleanup warning in logs.
-        logger.warning("New IP assigned but old primary IP %s could not be deleted: %s", old.get("id"), cleanup_exc)
-    return new_address
+    # Keep the previous IP unassigned for 30 minutes; maintenance will delete it later.
+    return new_address, old["id"], old.get("ip")
 
 
 # =============================================================================
@@ -2084,8 +2203,18 @@ async def _render_location_plans(call: CallbackQuery, state: FSMContext, locatio
         kb_rows = []
         if provider_type == "hetzner":
             try:
-                pricing = await api.pricing()
-                stock = await available_types_for_location(api, location)
+                providers = await get_active_providers(db, provider_type)
+                if not providers:
+                    raise RuntimeError("هیچ API فعال هتزنری وجود ندارد")
+                pricing_api = make_provider_api(provider_type, providers[0][1])
+                pricing = await pricing_api.pricing()
+                stock_by_provider = []
+                for pid, ptoken in providers:
+                    try:
+                        stock_by_provider.append((pid, await available_types_for_location(HetznerAPI(ptoken), location)))
+                    except Exception:
+                        stock_by_provider.append((pid, None))
+                available_union = set().union(*(s for _, s in stock_by_provider if s is not None)) if any(s is not None for _, s in stock_by_provider) else None
             except Exception as e:
                 await call.answer("استعلام قیمت/موجودی ناموفق بود؛ دوباره تلاش کنید.", show_alert=True)
                 logger.warning("Hetzner plan/stock lookup failed for %s: %s", location, e)
@@ -2095,16 +2224,15 @@ async def _render_location_plans(call: CallbackQuery, state: FSMContext, locatio
                 price = await compute_price_usd(db, pricing, server_type, location, markup)
                 if price is None:
                     continue
-                # Unknown inventory must not be falsely labelled as available; show it distinctly.
-                in_stock = (stock is not None and server_type in stock)
-                if stock is None:
+                in_stock = (available_union is not None and server_type in available_union)
+                if available_union is None:
                     label = "⚠️ موجودی نامشخص"
                     callback = f"planout_{plan_id}"
                 elif in_stock:
-                    label = "✅ موجود"
+                    label = "✅ موجود (یکی از APIها)"
                     callback = f"plan_{plan_id}"
                 else:
-                    label = "❌ ناموجود"
+                    label = "❌ ناموجود در همه APIها"
                     callback = f"planout_{plan_id}"
                 kb_rows.append([InlineKeyboardButton(
                     text=f"{title} | {cpu} / {ram} / {disk} - {fmt_price(price)}/ماه | {label}",
@@ -2178,12 +2306,17 @@ async def buy_plan(call: CallbackQuery, state: FSMContext):
     if provider_type == "hetzner":
         data_now = await state.get_data()
         location_now = data_now.get("location")
-        try:
-            current_stock = await available_types_for_location(HetznerAPI(token), location_now)
-        except Exception:
-            current_stock = None
-        if current_stock is None or plan[1] not in current_stock:
-            await call.answer("❌ موجودی این پلن تأیید نشد یا ناموجود است. لطفاً موجودی را همگام‌سازی کنید.", show_alert=True)
+        async with aiosqlite.connect(DB_PATH) as db:
+            providers = await get_active_providers(db, provider_type)
+        stocks = []
+        for pid, ptoken in providers:
+            try:
+                stocks.append(await available_types_for_location(HetznerAPI(ptoken), location_now))
+            except Exception:
+                stocks.append(None)
+        available = set().union(*(s for s in stocks if s is not None)) if any(s is not None for s in stocks) else None
+        if available is None or plan[1] not in available:
+            await call.answer("❌ موجودی این پلن در هیچ API فعال تأیید نشد. لطفاً موجودی را همگام‌سازی کنید.", show_alert=True)
             return
     await state.update_data(plan_id=plan[0], server_type=plan[1], plan_title=plan[2], markup=plan[3])
     api = make_provider_api(provider_type, token)
@@ -2254,7 +2387,30 @@ async def buy_confirm(call: CallbackQuery, state: FSMContext):
             await state.clear()
             await call.answer()
             return
-        provider_id, token = await get_active_provider_for(db, provider_type)
+        providers = await get_active_providers(db, provider_type)
+        provider_id, token = (providers[0] if providers else (None, None))
+
+    if provider_type == "hetzner":
+        viable = []
+        for pid, ptoken in providers:
+            try:
+                stock = await available_types_for_location(HetznerAPI(ptoken), data["location"])
+                if stock is not None and data["server_type"] in stock:
+                    viable.append((pid, ptoken))
+            except Exception:
+                continue
+        if viable:
+            provider_id, token = viable[0]
+        else:
+            await call.message.edit_text("❌ موجودی این پلن در همه APIهای فعال تمام شده یا قابل استعلام نیست. خرید انجام نشد.")
+            await state.clear()
+            await call.answer()
+            return
+    if not token:
+        await call.message.edit_text("❌ هیچ API فعال برای ساخت سرور پیدا نشد.")
+        await state.clear()
+        await call.answer()
+        return
 
     await call.message.edit_text("⏳ در حال ساخت سرور شما... لطفاً چند لحظه صبر کنید.")
     api = make_provider_api(provider_type, token)
@@ -2263,11 +2419,35 @@ async def buy_confirm(call: CallbackQuery, state: FSMContext):
         server, root_password = await api.create_server(
             name=server_name, server_type=data["server_type"], image=data["image"], location=data["location"]
         )
-    except Exception as e:
-        await call.message.answer(f"❌ خطا در ساخت سرور: {e}")
-        await state.clear()
-        await call.answer()
-        return
+    except Exception as first_error:
+        if provider_type == "hetzner":
+            # Try other active accounts in priority order if the first provider's create fails.
+            created = None
+            for fallback_pid, fallback_token in providers:
+                if fallback_pid == provider_id:
+                    continue
+                try:
+                    stock = await available_types_for_location(HetznerAPI(fallback_token), data["location"])
+                    if stock is None or data["server_type"] not in stock:
+                        continue
+                    server, root_password = await HetznerAPI(fallback_token).create_server(
+                        name=server_name, server_type=data["server_type"], image=data["image"], location=data["location"]
+                    )
+                    provider_id, token, api = fallback_pid, fallback_token, HetznerAPI(fallback_token)
+                    created = True
+                    break
+                except Exception:
+                    continue
+            if not created:
+                await call.message.answer(f"❌ ساخت سرور در همه APIهای فعال ناموفق بود. خطای اول: {first_error}")
+                await state.clear()
+                await call.answer()
+                return
+        else:
+            await call.message.answer(f"❌ خطا در ساخت سرور: {first_error}")
+            await state.clear()
+            await call.answer()
+            return
 
     if not root_password:
         root_password = "از طریق دکمه «تغییر پسورد» در بخش سرورهای من دریافت کنید"
@@ -2319,7 +2499,8 @@ def server_actions_kb(server_id: int, back_callback: str = "my_servers_list"):
              InlineKeyboardButton(text="🛠 نصب مجدد", callback_data=f"sv_rebuild_{server_id}")],
             [InlineKeyboardButton(text="🌐 تغییر IP", callback_data=f"sv_ipchange_{server_id}"),
              InlineKeyboardButton(text="⏳ تمدید", callback_data=f"sv_renew_{server_id}")],
-            [InlineKeyboardButton(text="🗑 حذف", callback_data=f"sv_del_{server_id}")],
+            [InlineKeyboardButton(text="🔄 همگام‌سازی زمان و حجم", callback_data=f"svsync_{server_id}")],
+            [InlineKeyboardButton(text="🗑 درخواست حذف", callback_data=f"sv_del_{server_id}")],
             *([[InlineKeyboardButton(text="👤 تعیین / انتقال مالکیت", callback_data=f"admsvowner_{server_id}")]] if back_callback == "adm_servers" else []),
             [InlineKeyboardButton(text="🔙 بازگشت به فهرست", callback_data=back_callback)],
         ]
@@ -2361,20 +2542,18 @@ async def my_servers_list_callback(call: CallbackQuery):
 async def show_server_details(call: CallbackQuery):
     sid = int(call.data.rsplit("_", 1)[1])
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id, name, ip, location, plan_title, status FROM servers WHERE id=?", (sid,))
+        cur = await db.execute("SELECT user_id, name, ip, location, plan_title, status, created_at, expires_at, traffic_in_bytes, traffic_out_bytes, traffic_included_bytes, traffic_synced_at, deletion_pending_reason, provider_type FROM servers WHERE id=?", (sid,))
         row = await cur.fetchone()
     if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
         await call.answer("سرور پیدا نشد یا دسترسی ندارید.", show_alert=True)
         return
     status = row[5] or "نامشخص"
+    incoming, outgoing, included = int(row[8] or 0), int(row[9] or 0), int(row[10] or 0)
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT hetzner_id, provider_type FROM servers WHERE id=?", (sid,))
         live_row = await cur.fetchone()
-        if live_row:
-            provider_type = live_row[1] or "hetzner"
-            token = await get_active_token_for(db, provider_type)
-        else:
-            provider_type, token = "hetzner", None
+        provider_type = (live_row[1] or "hetzner") if live_row else "hetzner"
+        token = await get_token_for_server(db, sid, provider_type) if live_row else None
     if live_row and token:
         try:
             api = make_provider_api(provider_type, token)
@@ -2382,13 +2561,35 @@ async def show_server_details(call: CallbackQuery):
             raw_status = str(live_server.get("status") or "unknown").lower()
             status_map = {"running": "🟢 روشن", "off": "🔴 خاموش", "initializing": "🟡 در حال راه‌اندازی", "starting": "🟡 در حال روشن شدن", "stopping": "🟠 در حال خاموش شدن", "rebooting": "🟡 در حال راه‌اندازی مجدد", "unknown": "⚪ نامشخص"}
             status = status_map.get(raw_status, raw_status)
+            incoming = int(live_server.get("ingoing_traffic") or 0)
+            outgoing = int(live_server.get("outgoing_traffic") or 0)
+            included = int(live_server.get("included_traffic") or 0)
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE servers SET status=? WHERE id=?", (raw_status, sid))
+                await db.execute(
+                    "UPDATE servers SET status=?, traffic_in_bytes=?, traffic_out_bytes=?, traffic_included_bytes=?, traffic_synced_at=? WHERE id=?",
+                    (raw_status, incoming, outgoing, included, datetime.utcnow().isoformat(), sid),
+                )
                 await db.commit()
         except Exception:
             status = ("🟢 روشن" if str(status).lower() == "running" else "🔴 خاموش" if str(status).lower() == "off" else f"⚪ {status}")
-    text = f"🖥 {row[1]}\nآی‌پی: {row[2]}\nدیتاسنتر: {row[3]}\nپلن: {row[4]}\nوضعیت: {status}"
-    await call.message.edit_text(text, reply_markup=server_actions_kb(sid))
+    total = incoming + outgoing
+    remaining = max(0, included - total) if included else 0
+    exp_text = row[7] or "نامشخص"
+    try:
+        exp_text = datetime.fromisoformat(exp_text).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        pass
+    text = (
+        f"🖥 {row[1]}\\nآی‌پی: {row[2]}\\nدیتاسنتر: {row[3]}\\nپلن: {row[4]}\\nوضعیت: {status}\\n"
+        f"⏱ زمان سپری‌شده: {format_elapsed(row[6])}\\n"
+        f"📊 ترافیک مصرفی: {format_bytes(total)} (ورودی {format_bytes(incoming)} / خروجی {format_bytes(outgoing)})\\n"
+        f"📦 حجم مجاز: {format_bytes(included) if included else 'از API برنگشت'}\\n"
+        f"🟢 حجم باقی‌مانده: {format_bytes(remaining) if included else 'نامشخص'}\\n"
+        f"⏳ اعتبار تا: {exp_text}"
+    )
+    if row[12]:
+        text += f"\\n⚠️ درخواست حذف در انتظار ادمین: {row[12]}"
+    await call.message.edit_text(text, reply_markup=server_actions_kb(sid, "adm_servers" if is_admin(call.from_user.id) else "my_servers_list"))
     await call.answer()
 
 
@@ -2404,12 +2605,15 @@ async def server_action(call: CallbackQuery):
     _, action, server_db_id = call.data.split("_")
     server_db_id = int(server_db_id)
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id, hetzner_id, name, provider_type, provider_id FROM servers WHERE id=?", (server_db_id,))
+        cur = await db.execute("SELECT user_id, hetzner_id, name, provider_type, provider_id, deletion_pending_reason FROM servers WHERE id=?", (server_db_id,))
         row = await cur.fetchone()
         if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
             await call.answer("دسترسی غیرمجاز", show_alert=True)
             return
         provider_type = row[3] or "hetzner"
+        if row[5] and action != "del":
+            await call.answer("این سرور در انتظار تأیید حذف است و تا تعیین تکلیف ادمین خاموش می‌ماند. برای تمدید از دکمه تمدید استفاده کنید.", show_alert=True)
+            return
         token = await get_token_for_server(db, server_db_id, provider_type)
     if not token:
         await call.answer("اتصال این سرویس‌دهنده در حال حاضر فعال نیست.", show_alert=True)
@@ -2450,15 +2654,78 @@ async def server_action(call: CallbackQuery):
             )
             await call.answer()
         elif action == "del":
-            await api.delete_server(hetzner_id)
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("DELETE FROM servers WHERE id=?", (server_db_id,))
-                await db.commit()
-            await call.message.edit_text(f"🗑 سرور {row[2]} حذف شد.")
+            requested = await request_server_deletion(call.bot, server_db_id, "درخواست حذف از منوی سرور")
+            await call.message.edit_text(
+                "⏳ درخواست حذف برای ادمین ارسال شد. سرور خاموش می‌ماند تا ادمین تأیید کند."
+                if requested else "⚠️ برای این سرور قبلاً درخواست حذف ثبت شده است."
+            )
             await call.answer()
+            return
     except Exception as e:
         await call.message.answer(f"❌ خطا: {e}")
         await call.answer()
+
+
+@router.callback_query(F.data.startswith("delapprove_"))
+async def server_delete_approve(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("فقط ادمین می‌تواند حذف را تأیید کند.", show_alert=True)
+        return
+    sid = int(call.data.replace("delapprove_", ""))
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT hetzner_id, name, provider_type, deletion_pending_reason FROM servers WHERE id=?", (sid,))
+        row = await cur.fetchone()
+        if not row or not row[3]:
+            await call.answer("درخواست حذف پیدا نشد یا قبلاً تعیین تکلیف شده.", show_alert=True)
+            return
+        token = await get_token_for_server(db, sid, row[2] or "hetzner")
+    if not token:
+        await call.answer("API مالک سرور پیدا نشد؛ حذف انجام نشد.", show_alert=True)
+        return
+    try:
+        await make_provider_api(row[2] or "hetzner", token).delete_server(row[0])
+    except Exception as exc:
+        await call.answer(f"حذف از ارائه‌دهنده ناموفق: {str(exc)[:150]}", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM servers WHERE id=?", (sid,))
+        await db.commit()
+    await call.message.edit_text(f"✅ حذف سرور «{row[1]}» توسط ادمین تأیید و انجام شد.")
+    await call.answer("سرور حذف شد")
+
+
+@router.callback_query(F.data.startswith("delcancel_"))
+async def server_delete_cancel(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("فقط ادمین می‌تواند این درخواست را لغو کند.", show_alert=True)
+        return
+    sid = int(call.data.replace("delcancel_", ""))
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id, hetzner_id, name, provider_type FROM servers WHERE id=?", (sid,))
+        row = await cur.fetchone()
+        if not row:
+            await call.answer("سرور پیدا نشد.", show_alert=True)
+            return
+        token = await get_token_for_server(db, sid, row[3] or "hetzner")
+        await db.execute(
+            "UPDATE servers SET deletion_pending_reason=NULL, deletion_requested_at=NULL, deletion_notified=0, traffic_limit_reviewed_at=CASE WHEN deletion_pending_reason LIKE '%حجم%' OR deletion_pending_reason LIKE '%ترافیک%' THEN ? ELSE traffic_limit_reviewed_at END WHERE id=?",
+            (datetime.utcnow().isoformat(), sid),
+        )
+        await db.commit()
+    if token:
+        try:
+            await make_provider_api(row[3] or "hetzner", token).power_action(row[1], "poweron")
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE servers SET status='running' WHERE id=?", (sid,))
+                await db.commit()
+        except Exception:
+            pass
+    try:
+        await call.bot.send_message(row[0], f"✅ درخواست حذف سرور «{row[2]}» توسط ادمین لغو شد.")
+    except Exception:
+        pass
+    await call.message.edit_text(f"❌ درخواست حذف سرور «{row[2]}» لغو شد.")
+    await call.answer("درخواست لغو شد")
 
 
 @router.callback_query(F.data.startswith("svrbc_"))
@@ -2466,12 +2733,15 @@ async def server_rebuild_confirm(call: CallbackQuery):
     _, server_db_id, image_id = call.data.split("_")
     server_db_id = int(server_db_id)
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id, hetzner_id, name, provider_type, provider_id FROM servers WHERE id=?", (server_db_id,))
+        cur = await db.execute("SELECT user_id, hetzner_id, name, provider_type, provider_id, deletion_pending_reason FROM servers WHERE id=?", (server_db_id,))
         row = await cur.fetchone()
         if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
             await call.answer("دسترسی غیرمجاز", show_alert=True)
             return
         provider_type = row[3] or "hetzner"
+        if row[5]:
+            await call.answer("این سرور در انتظار تأیید حذف است؛ نصب مجدد تا تعیین تکلیف ادمین غیرفعال است.", show_alert=True)
+            return
         token = await get_token_for_server(db, server_db_id, provider_type)
     if not token:
         await call.answer("اتصال این سرویس‌دهنده در حال حاضر فعال نیست.", show_alert=True)
@@ -2556,7 +2826,7 @@ async def server_ipchange_confirm(call: CallbackQuery):
         if (row[4] or "hetzner") != "hetzner":
             await call.message.edit_text("❌ این قابلیت فقط برای سرورهای Hetzner در دسترس است.")
             return
-        owner_id, hetzner_id, name, count, _, _ = row
+        owner_id, hetzner_id, name, count, provider_type, provider_id = row
         count = count or 0
         free_count, ip_price = await get_ip_change_config(db)
         cost = 0 if count < free_count else ip_price
@@ -2569,13 +2839,16 @@ async def server_ipchange_confirm(call: CallbackQuery):
                 )
                 return
         token = await get_token_for_server(db, server_db_id, "hetzner")
+        cur = await db.execute("SELECT provider_id FROM servers WHERE id=?", (server_db_id,))
+        provider_id_row = await cur.fetchone()
+        provider_id = provider_id_row[0] if provider_id_row else provider_id
     if not token:
         await call.message.edit_text("❌ API مالک این سرور پیدا نشد؛ اگر API حذف شده باشد باید دوباره اضافه شود.")
         return
     api = HetznerAPI(token)
     try:
         await call.message.edit_text("⏳ درخواست تغییر IP ارسال شد؛ در حال انجام عملیات با هتزنر هستم. لطفاً چند دقیقه صبر کنید…")
-        new_ip = await change_server_ip(api, hetzner_id)
+        new_ip, old_ip_id, old_ip_address = await change_server_ip(api, hetzner_id)
     except Exception as e:
         logger.exception("IP change failed for local server id=%s, Hetzner id=%s", server_db_id, hetzner_id)
         try:
@@ -2584,7 +2857,15 @@ async def server_ipchange_confirm(call: CallbackQuery):
             await call.answer("تغییر IP ناموفق بود", show_alert=True)
         return
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE servers SET ip=?, ip_change_count=ip_change_count+1 WHERE id=?", (new_ip, server_db_id))
+        cleanup_at = (datetime.utcnow()+timedelta(minutes=30)).isoformat()
+        await db.execute(
+            "UPDATE servers SET ip=?, ip_change_count=ip_change_count+1, previous_ip_id=?, previous_ip_address=?, previous_ip_cleanup_at=? WHERE id=?",
+            (new_ip, old_ip_id, old_ip_address, cleanup_at, server_db_id),
+        )
+        await db.execute(
+            "INSERT INTO pending_ip_cleanup (provider_id, provider_type, ip_id, ip_address, cleanup_at) VALUES (?,?,?,?,?)",
+            (provider_id, "hetzner", old_ip_id, old_ip_address, cleanup_at),
+        )
         if cost > 0 and owner_id:
             await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=?", (cost, owner_id))
         await db.commit()
@@ -2629,14 +2910,14 @@ async def server_renew_confirm(call: CallbackQuery):
     server_db_id = int(call.data.replace("rncf_", ""))
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT user_id, hetzner_id, name, expires_at, monthly_price, expired_powered_off_at, provider_type, provider_id FROM servers WHERE id=?",
+            "SELECT user_id, hetzner_id, name, expires_at, monthly_price, expired_powered_off_at, provider_type, provider_id, traffic_powered_off, deletion_pending_reason FROM servers WHERE id=?",
             (server_db_id,),
         )
         row = await cur.fetchone()
         if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
             await call.answer("دسترسی غیرمجاز", show_alert=True)
             return
-        owner_id, hetzner_id, name, expires_at, monthly_price, expired_off_at, provider_type, provider_id = row
+        owner_id, hetzner_id, name, expires_at, monthly_price, expired_off_at, provider_type, provider_id, traffic_off, deletion_pending_reason = row
         provider_type = provider_type or "hetzner"
         if not expires_at or not monthly_price:
             await call.answer("این سرویس تحت سیستم تمدید خودکار نیست.", show_alert=True)
@@ -2658,11 +2939,11 @@ async def server_renew_confirm(call: CallbackQuery):
         was_expired_off = bool(expired_off_at)
         await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=?", (monthly_price, owner_id))
         await db.execute(
-            "UPDATE servers SET expires_at=?, expired_powered_off_at=NULL, traffic_powered_off=0 WHERE id=?",
-            (new_expiry.isoformat(), server_db_id),
+            "UPDATE servers SET expires_at=?, expired_powered_off_at=NULL, traffic_powered_off=0, deletion_pending_reason=NULL, deletion_requested_at=NULL, deletion_notified=0, traffic_limit_reviewed_at=CASE WHEN ? LIKE '%ترافیک%' OR ? LIKE '%حجم%' THEN ? ELSE traffic_limit_reviewed_at END WHERE id=?",
+            (new_expiry.isoformat(), deletion_pending_reason or "", deletion_pending_reason or "", datetime.utcnow().isoformat(), server_db_id),
         )
         await db.commit()
-    if was_expired_off and token:
+    if (was_expired_off or traffic_off or deletion_pending_reason) and token:
         try:
             await make_provider_api(provider_type, token).power_action(hetzner_id, "poweron")
         except Exception:
@@ -2917,10 +3198,11 @@ async def sync_hetzner_servers(db, api: "HetznerAPI", provider_id=None):
         sid = server["id"]
         ip = (server.get("public_net") or {}).get("ipv4", {}).get("ip", "-")
         loc = (server.get("datacenter") or {}).get("location", {}).get("name", "-")
+        server_created = server.get("created") or datetime.utcnow().isoformat()
         if sid in known_ids:
-            await db.execute("UPDATE servers SET name=?, ip=?, location=?, status=? WHERE provider_type='hetzner' AND provider_id IS ? AND hetzner_id=? AND user_id IS NULL", (server.get("name"), ip, loc, server.get("status", "unknown"), provider_id, sid))
+            await db.execute("UPDATE servers SET name=?, ip=?, location=?, status=?, created_at=? WHERE provider_type='hetzner' AND provider_id IS ? AND hetzner_id=? AND user_id IS NULL", (server.get("name"), ip, loc, server.get("status", "unknown"), server_created, provider_id, sid))
             continue
-        await db.execute("INSERT INTO servers (user_id, hetzner_id, name, ip, location, plan_title, os_image, root_password, status, created_at, provider_id, provider_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,'hetzner')", (None, sid, server.get("name"), ip, loc, "ساخته‌شده خارج از ربات", (server.get("image") or {}).get("name", "-"), "-", server.get("status", "unknown"), datetime.utcnow().isoformat(), provider_id))
+        await db.execute("INSERT INTO servers (user_id, hetzner_id, name, ip, location, plan_title, os_image, root_password, status, created_at, provider_id, provider_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,'hetzner')", (None, sid, server.get("name"), ip, loc, "ساخته‌شده خارج از ربات", (server.get("image") or {}).get("name", "-"), "-", server.get("status", "unknown"), server_created, provider_id))
         added += 1
     for local_id, sid in known_rows:
         if sid not in live_ids:
@@ -3044,12 +3326,21 @@ async def admin_show_server_details(call: CallbackQuery):
         await call.answer("دسترسی غیرمجاز", show_alert=True); return
     sid = int(call.data.rsplit("_", 1)[1])
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT name, ip, user_id, location, status FROM servers WHERE id=?", (sid,))
+        cur = await db.execute("SELECT name, ip, user_id, location, status, created_at, traffic_in_bytes, traffic_out_bytes, traffic_included_bytes, expires_at, deletion_pending_reason FROM servers WHERE id=?", (sid,))
         row = await cur.fetchone()
     if not row:
         await call.answer("سرور پیدا نشد.", show_alert=True); return
     owner = row[2] if row[2] is not None else "بدون مالک (خارج از ربات)"
-    await call.message.edit_text(f"🖥 {row[0]}\nIP: {row[1]}\nمالک: {owner}\nموقعیت: {row[3]}\nوضعیت: {row[4]}", reply_markup=server_actions_kb(sid, "adm_servers"))
+    used = int(row[6] or 0) + int(row[7] or 0)
+    remaining = max(0, int(row[8] or 0) - used) if row[8] else None
+    text = (
+        f"🖥 {row[0]}\\nIP: {row[1]}\\nمالک: {owner}\\nموقعیت: {row[3]}\\nوضعیت: {row[4]}\\n"
+        f"⏱ زمان سپری‌شده: {format_elapsed(row[5])}\\n📊 مصرف: {format_bytes(used)}\\n"
+        f"📦 حجم باقی‌مانده: {format_bytes(remaining) if remaining is not None else 'نامشخص'}\\n⏳ اعتبار: {row[9] or '—'}"
+    )
+    if row[10]:
+        text += f"\\n⚠️ حذف در انتظار ادمین: {row[10]}"
+    await call.message.edit_text(text, reply_markup=server_actions_kb(sid, "adm_servers"))
     await call.answer()
 
 
@@ -3809,25 +4100,33 @@ async def adm_broadcast_send(message: Message, state: FSMContext):
 # ---------------------------------------------------------------------------
 async def check_traffic_usage(bot: Bot):
     async with aiosqlite.connect(DB_PATH) as db:
-        token = await get_active_token(db)
-        if not token:
-            return
         cur = await db.execute(
-            "SELECT id, user_id, hetzner_id, name, traffic_powered_off FROM servers "
+            "SELECT id, user_id, hetzner_id, name, traffic_powered_off, provider_type, traffic_limit_reviewed_at FROM servers "
             "WHERE hetzner_id IS NOT NULL AND user_id IS NOT NULL AND provider_type='hetzner'"
         )
         rows = await cur.fetchall()
-    if not rows:
-        return
-    api = HetznerAPI(token)
-    for server_db_id, user_id, hetzner_id, name, traffic_off in rows:
+    for server_db_id, user_id, hetzner_id, name, traffic_off, provider_type, traffic_reviewed_at in rows:
+        async with aiosqlite.connect(DB_PATH) as db:
+            token = await get_token_for_server(db, server_db_id, provider_type or "hetzner")
+        if not token:
+            continue
+        api = HetznerAPI(token)
         try:
             server = await api.get_server(hetzner_id)
         except Exception:
             continue
-        total_bytes = (server.get("outgoing_traffic") or 0) + (server.get("ingoing_traffic") or 0)
-        included = server.get("included_traffic")
-        if total_bytes >= TRAFFIC_SOFT_LIMIT_BYTES and not traffic_off:
+        incoming = int(server.get("ingoing_traffic") or 0)
+        outgoing = int(server.get("outgoing_traffic") or 0)
+        total_bytes = incoming + outgoing
+        included = int(server.get("included_traffic") or 0)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE servers SET traffic_in_bytes=?, traffic_out_bytes=?, traffic_included_bytes=?, traffic_synced_at=? WHERE id=?",
+                (incoming, outgoing, included, datetime.utcnow().isoformat(), server_db_id),
+            )
+            await db.commit()
+        # Soft limit: power off at 19.5 TB, but never delete automatically.
+        if total_bytes >= TRAFFIC_SOFT_LIMIT_BYTES and not traffic_off and not traffic_reviewed_at:
             try:
                 await api.power_action(hetzner_id, "poweroff")
             except Exception:
@@ -3838,23 +4137,18 @@ async def check_traffic_usage(bot: Bot):
             try:
                 await bot.send_message(
                     user_id,
-                    f"⚠️ سرور «{name}» بیش از ۱۹.۵ ترابایت ترافیک مصرف کرده و به‌صورت خودکار خاموش شد.\n"
-                    "لطفاً هرچه سریع‌تر از اطلاعات خود بکاپ بگیرید. در صورت اتمام کامل حجم مجاز، این سرور برای همیشه حذف خواهد شد.",
+                    f"⚠️ سرور «{name}» به حد هشدار ترافیک ({format_bytes(total_bytes)}) رسیده و خاموش شده است. "
+                    "در صورت رسیدن به حجم مجاز، حذف فقط پس از تأیید ادمین انجام خواهد شد.",
                 )
             except Exception:
                 pass
-        elif traffic_off and included and total_bytes >= included:
-            try:
-                await api.delete_server(hetzner_id)
-            except Exception:
-                pass
+        hard_limit = included if included > 0 else int(20 * 1_000_000_000_000)
+        if total_bytes < TRAFFIC_SOFT_LIMIT_BYTES and traffic_reviewed_at:
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("DELETE FROM servers WHERE id=?", (server_db_id,))
+                await db.execute("UPDATE servers SET traffic_limit_reviewed_at=NULL WHERE id=?", (server_db_id,))
                 await db.commit()
-            try:
-                await bot.send_message(user_id, f"🗑 سرور «{name}» به‌دلیل اتمام کامل حجم ترافیک مجاز، حذف شد.")
-            except Exception:
-                pass
+        elif total_bytes >= hard_limit and not traffic_reviewed_at:
+            await request_server_deletion(bot, server_db_id, f"حجم مجاز ترافیک تکمیل شد ({format_bytes(total_bytes)} / {format_bytes(hard_limit)})")
 
 
 async def check_expirations(bot: Bot):
@@ -3885,18 +4179,7 @@ async def check_expirations(bot: Bot):
             except Exception:
                 continue
             if now - off_dt >= timedelta(hours=EXPIRY_GRACE_HOURS):
-                if api:
-                    try:
-                        await api.delete_server(hetzner_id)
-                    except Exception:
-                        pass
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("DELETE FROM servers WHERE id=?", (server_db_id,))
-                    await db.commit()
-                try:
-                    await bot.send_message(user_id, f"🗑 سرور «{name}» به‌دلیل عدم تمدید مهلت، برای همیشه حذف شد.")
-                except Exception:
-                    pass
+                await request_server_deletion(bot, server_db_id, "پایان مهلت سرویس و عدم تمدید پس از مهلت ارفاقی")
         elif exp_dt <= now:
             # مهلت تمام شده و هنوز خاموش نشده -> خاموش کن و شمارش معکوس حذف را شروع کن
             if api:
@@ -3930,6 +4213,43 @@ async def check_expirations(bot: Bot):
                 pass
 
 
+async def cleanup_old_primary_ips():
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id, provider_id, provider_type, ip_id FROM pending_ip_cleanup WHERE cleanup_at<=?", (now,))
+        rows = await cur.fetchall()
+    for queue_id, provider_id, ptype, ip_id in rows:
+        ptype = ptype or "hetzner"
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT api_token FROM provider WHERE id=? AND type=?", (provider_id, ptype))
+            row = await cur.fetchone()
+        if not row:
+            continue
+        try:
+            if ptype == "hetzner":
+                await HetznerAPI(row[0]).delete_primary_ip(ip_id)
+            else:
+                continue
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("DELETE FROM pending_ip_cleanup WHERE id=?", (queue_id,))
+                await db.execute(
+                    "UPDATE servers SET previous_ip_id=NULL, previous_ip_address=NULL, previous_ip_cleanup_at=NULL WHERE previous_ip_id=?",
+                    (ip_id,),
+                )
+                await db.commit()
+        except Exception as exc:
+            logger.warning("Old IP cleanup failed for queued IP %s: %s", ip_id, exc)
+
+
+async def ip_cleanup_poller():
+    while True:
+        try:
+            await cleanup_old_primary_ips()
+        except Exception as exc:
+            logger.warning("old IP cleanup poll error: %s", exc)
+        await asyncio.sleep(60)
+
+
 async def maintenance_poller(bot: Bot):
     """هر ۶ ساعت یک‌بار ترافیک مصرفی و مهلت سرویس‌های همه سرورها را چک می‌کند."""
     while True:
@@ -3942,6 +4262,10 @@ async def maintenance_poller(bot: Bot):
             await check_expirations(bot)
         except Exception as e:
             logger.warning(f"expiry check error: {e}")
+        try:
+            await cleanup_old_primary_ips()
+        except Exception as e:
+            logger.warning(f"old IP cleanup error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -3959,6 +4283,7 @@ async def main():
     asyncio.create_task(automatic_backup_poller(bot))
     asyncio.create_task(oxapay_poller(bot))
     asyncio.create_task(maintenance_poller(bot))
+    asyncio.create_task(ip_cleanup_poller())
     logger.info("Bot started.")
     await dp.start_polling(bot)
 

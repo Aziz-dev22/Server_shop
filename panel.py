@@ -860,16 +860,29 @@ async def server_transfer_submit(request: Request):
 # ---------------------------------------------------------------------------
 # سرورها
 # ---------------------------------------------------------------------------
-def server_action_buttons(server_id: int) -> str:
+def server_action_buttons(server_id: int, deletion_pending_reason: str = "") -> str:
+    if deletion_pending_reason:
+        delete_button = (
+            f"<a class='btn small green' href='/servers/{server_id}/delete-approve'>✅ تأیید حذف</a>"
+            f"<a class='btn small gray' href='/servers/{server_id}/renew'>⏳ تمدید</a>"
+        )
+        if "درخواست حذف از پنل" in deletion_pending_reason:
+            delete_button += f"<a class='btn small gray' href='/servers/{server_id}/delete-cancel'>لغو درخواست</a>"
+    else:
+        delete_button = (
+            f"<form class='inline' method='post' action='/servers/{server_id}/action/del'>"
+            f"<button class='btn small red' type='submit'>درخواست حذف</button></form>"
+        )
     return (
+        f"<a class='btn small gray' href='/servers/{server_id}/usage'>📊 زمان و حجم / همگام‌سازی</a>"
         f"<form class='inline' method='post' action='/servers/{server_id}/action/on'><button class='btn small green' type='submit'>روشن</button></form>"
         f"<form class='inline' method='post' action='/servers/{server_id}/action/off'><button class='btn small gray' type='submit'>خاموش</button></form>"
         f"<form class='inline' method='post' action='/servers/{server_id}/action/reboot'><button class='btn small' type='submit'>ریبوت</button></form>"
         f"<form class='inline' method='post' action='/servers/{server_id}/action/pass'><button class='btn small' type='submit'>تغییر پسورد</button></form>"
         f"<a class='btn small gray' href='/servers/{server_id}/rebuild'>Rebuild</a>"
-        f"<form class='inline' method='post' action='/servers/{server_id}/action/ipchange' onsubmit=\"return confirm('تغییر IP انجام شود؟ دفعات رایگان تمام‌شده باشد هزینه دارد.')\"><button class='btn small gray' type='submit'>تغییر IP</button></form>"
+        f"<form class='inline' method='post' action='/servers/{server_id}/action/ipchange'><button class='btn small gray' type='submit'>تغییر IP</button></form>"
         f"<a class='btn small gray' href='/servers/{server_id}/renew'>تمدید</a>"
-        f"<form class='inline' method='post' action='/servers/{server_id}/action/del' onsubmit=\"return confirm('حذف قطعی این سرور؟')\"><button class='btn small red' type='submit'>حذف</button></form>"
+        + delete_button
     )
 
 
@@ -880,11 +893,12 @@ async def servers_list(request: Request):
         return RedirectResponse("/login")
     added = 0
     async with aiosqlite.connect(DB_PATH) as db:
-        token = await core.get_active_token(db)
-        if token and request.query_params.get("sync") == "1":
-            added = await core.sync_hetzner_servers(db, core.HetznerAPI(token))
+        if request.query_params.get("sync") == "1":
+            cur_providers = await db.execute("SELECT id, api_token FROM provider WHERE type='hetzner' ORDER BY id")
+            for provider_id, provider_token in await cur_providers.fetchall():
+                added += await core.sync_hetzner_servers(db, core.HetznerAPI(provider_token), provider_id)
         cur = await db.execute(
-            "SELECT id, hetzner_id, provider_type, name, ip, user_id, location, status, root_password FROM servers ORDER BY CASE WHEN user_id IS NOT NULL THEN 0 ELSE 1 END, id DESC LIMIT 1000"
+            "SELECT id, hetzner_id, provider_type, name, ip, user_id, location, status, root_password, created_at, expires_at, traffic_in_bytes, traffic_out_bytes, traffic_included_bytes, deletion_pending_reason FROM servers ORDER BY CASE WHEN user_id IS NOT NULL THEN 0 ELSE 1 END, id DESC LIMIT 1000"
         )
         raw_servers = await cur.fetchall()
         # Deduplicate imported/unowned rows against customer-owned rows by provider + provider server ID.
@@ -894,11 +908,11 @@ async def servers_list(request: Request):
             if key in seen:
                 continue
             seen.add(key)
-            servers.append((r[0], r[3], r[4], r[5], r[6], r[7], r[8]))
+            servers.append((r[0], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14]))
     note = f'<div class="msg ok">{added} سرور جدید از پنل هتزنر همگام‌سازی شد.</div>' if added else ""
     rows = "".join(
         f"<tr><td>{esc(s[1])}</td><td>{esc(s[2])}</td><td>{s[3] or 'بدون مالک'}</td><td>{esc(s[4])}</td>"
-        f"<td>{esc(s[5])}</td><td>{server_action_buttons(s[0])}</td></tr>"
+        f"<td>{esc(s[5])}</td><td>{server_action_buttons(s[0], str(s[12] or ""))}</td></tr>"
         for s in servers
     )
     body = f"""
@@ -913,6 +927,49 @@ async def servers_list(request: Request):
     </table></div>
     """
     return page("سرورها", body, "/servers")
+
+
+@app.get("/servers/{server_id}/usage", response_class=HTMLResponse)
+async def server_usage_page(request: Request, server_id: int):
+    if not get_session(request):
+        return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT name, hetzner_id, provider_type, created_at, expires_at, traffic_in_bytes, traffic_out_bytes, traffic_included_bytes, traffic_synced_at, deletion_pending_reason, previous_ip_address, previous_ip_cleanup_at FROM servers WHERE id=?", (server_id,))
+        row = await cur.fetchone()
+        if not row:
+            return RedirectResponse("/servers")
+        ptype = row[2] or "hetzner"
+        token = await core.get_token_for_server(db, server_id, ptype)
+        live = None
+        error = None
+        if token:
+            try:
+                live = await core.sync_server_usage(db, server_id, core.make_provider_api(ptype, token))
+                row = await (await db.execute("SELECT name, hetzner_id, provider_type, created_at, expires_at, traffic_in_bytes, traffic_out_bytes, traffic_included_bytes, traffic_synced_at, deletion_pending_reason, previous_ip_address, previous_ip_cleanup_at FROM servers WHERE id=?", (server_id,))).fetchone()
+            except Exception as exc:
+                error = str(exc)
+    incoming, outgoing, included = int(row[5] or 0), int(row[6] or 0), int(row[7] or 0)
+    used = incoming + outgoing
+    remaining = max(0, included - used) if included else None
+    body = f"""
+    <h1>📊 زمان و حجم سرور «{esc(row[0])}»</h1>
+    <div class='card'>
+      <div class='system-list'>
+        <span>زمان سپری‌شده</span><strong>{esc(core.format_elapsed(row[3]))}</strong>
+        <span>ترافیک مصرف‌شده</span><strong>{esc(core.format_bytes(used))} (ورودی {esc(core.format_bytes(incoming))} / خروجی {esc(core.format_bytes(outgoing))})</strong>
+        <span>حجم مجاز از API</span><strong>{esc(core.format_bytes(included)) if included else 'API مقدار مجاز را برنگرداند'}</strong>
+        <span>حجم باقی‌مانده</span><strong>{esc(core.format_bytes(remaining)) if remaining is not None else 'نامشخص'}</strong>
+        <span>آخرین همگام‌سازی</span><strong>{esc(row[8] or '—')}</strong>
+        <span>اعتبار سرویس</span><strong>{esc(row[4] or '—')}</strong>
+        <span>درخواست حذف</span><strong>{esc(row[9] or 'ندارد')}</strong>
+        <span>IP قبلی در انتظار آزادسازی</span><strong>{esc(row[10] or 'ندارد')} {('تا '+esc(row[11])) if row[11] else ''}</strong>
+      </div>
+      {f"<div class='msg err'>همگام‌سازی ناموفق: {esc(error)}</div>" if error else ""}
+      <a class='btn' href='/servers/{server_id}/usage'>🔄 همگام‌سازی مجدد</a>
+      <a class='btn gray' href='/servers'>بازگشت به سرورها</a>
+    </div>
+    """
+    return page("زمان و حجم سرور", body, "/servers")
 
 
 @app.get("/ip-pricing", response_class=HTMLResponse)
@@ -964,12 +1021,21 @@ async def server_action_do(request: Request, server_id: int, action: str):
     if not sess:
         return RedirectResponse("/login")
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT hetzner_id, name, user_id, ip_change_count FROM servers WHERE id=?", (server_id,))
+        cur = await db.execute("SELECT hetzner_id, name, user_id, ip_change_count, provider_type, provider_id, deletion_pending_reason FROM servers WHERE id=?", (server_id,))
         row = await cur.fetchone()
-        token = await core.get_active_token(db)
+        token = await core.get_token_for_server(db, server_id, row[4] or "hetzner") if row else None
+        if row:
+            cur = await db.execute("SELECT provider_id FROM servers WHERE id=?", (server_id,))
+            provider_id_row = await cur.fetchone()
+            if provider_id_row:
+                row = (*row[:5], provider_id_row[0], row[6])
     if not row or not token:
         return RedirectResponse("/servers")
-    api = core.HetznerAPI(token)
+    if row[6] and action != "del":
+        referer = request.headers.get("referer", "/servers")
+        sep = "&" if "?" in referer else "?"
+        return RedirectResponse(f"{referer}{sep}err={urllib.parse.quote('سرور در انتظار تأیید حذف است و تا تعیین تکلیف خاموش می‌ماند.')}", status_code=303)
+    api = core.make_provider_api(row[4] or "hetzner", token)
     referer = request.headers.get("referer", "/servers")
     try:
         if action == "on":
@@ -984,6 +1050,9 @@ async def server_action_do(request: Request, server_id: int, action: str):
                 await db.execute("UPDATE servers SET root_password=? WHERE id=?", (new_pass, server_id))
                 await db.commit()
         elif action == "ipchange":
+            if (row[4] or "hetzner") != "hetzner":
+                sep = "&" if "?" in referer else "?"
+                return RedirectResponse(f"{referer}{sep}err={urllib.parse.quote('تغییر IP فقط برای سرورهای Hetzner در دسترس است')}", status_code=303)
             owner_id, count = row[2], (row[3] or 0)
             async with aiosqlite.connect(DB_PATH) as db:
                 free_count, ip_price = await core.get_ip_change_config(db)
@@ -995,21 +1064,86 @@ async def server_action_do(request: Request, server_id: int, action: str):
                 if not bal_row or bal_row[0] < cost:
                     sep = "&" if "?" in referer else "?"
                     return RedirectResponse(f"{referer}{sep}err={urllib.parse.quote('موجودی کیف پول کاربر کافی نیست')}", status_code=303)
-            new_ip = await core.change_server_ip(api, row[0])
+            new_ip, old_ip_id, old_ip_address = await core.change_server_ip(api, row[0])
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE servers SET ip=?, ip_change_count=ip_change_count+1 WHERE id=?", (new_ip, server_id))
+                cleanup_at = (datetime.utcnow()+timedelta(minutes=30)).isoformat()
+                await db.execute(
+                    "UPDATE servers SET ip=?, ip_change_count=ip_change_count+1, previous_ip_id=?, previous_ip_address=?, previous_ip_cleanup_at=? WHERE id=?",
+                    (new_ip, old_ip_id, old_ip_address, cleanup_at, server_id),
+                )
+                await db.execute(
+                    "INSERT INTO pending_ip_cleanup (provider_id, provider_type, ip_id, ip_address, cleanup_at) VALUES (?,?,?,?,?)",
+                    (row[5], "hetzner", old_ip_id, old_ip_address, cleanup_at),
+                )
                 if cost > 0 and owner_id:
                     await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=?", (cost, owner_id))
                 await db.commit()
         elif action == "del":
-            await api.delete_server(row[0])
+            try:
+                await api.power_action(row[0], "poweroff")
+            except Exception:
+                pass
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("DELETE FROM servers WHERE id=?", (server_id,))
+                await db.execute(
+                    "UPDATE servers SET deletion_pending_reason=?, deletion_requested_at=?, deletion_notified=1, status='off' WHERE id=?",
+                    ("درخواست حذف از پنل ادمین", datetime.utcnow().isoformat(), server_id),
+                )
                 await db.commit()
     except Exception as e:
         sep = "&" if "?" in referer else "?"
         return RedirectResponse(f"{referer}{sep}err={urllib.parse.quote(str(e))}", status_code=303)
     return RedirectResponse(referer, status_code=303)
+
+
+@app.get("/servers/{server_id}/delete-approve")
+async def server_delete_approve(request: Request, server_id: int):
+    if not get_session(request):
+        return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT hetzner_id, provider_type, deletion_pending_reason FROM servers WHERE id=?", (server_id,))
+        row = await cur.fetchone()
+        if not row or not row[2]:
+            return RedirectResponse("/servers", status_code=303)
+        token = await core.get_token_for_server(db, server_id, row[1] or "hetzner")
+    if not token:
+        return RedirectResponse("/servers?err=" + urllib.parse.quote("API مالک سرور پیدا نشد"), status_code=303)
+    try:
+        await core.make_provider_api(row[1] or "hetzner", token).delete_server(row[0])
+    except Exception as exc:
+        return RedirectResponse("/servers?err=" + urllib.parse.quote(str(exc)), status_code=303)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM servers WHERE id=?", (server_id,))
+        await db.commit()
+    return RedirectResponse("/servers?deleted=1", status_code=303)
+
+
+@app.get("/servers/{server_id}/delete-cancel")
+async def server_delete_cancel(request: Request, server_id: int):
+    if not get_session(request):
+        return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT hetzner_id, provider_type, deletion_pending_reason FROM servers WHERE id=?", (server_id,)
+        )
+        row = await cur.fetchone()
+        if not row:
+            return RedirectResponse("/servers", status_code=303)
+        if not row[2] or "درخواست حذف از پنل" not in row[2]:
+            return RedirectResponse("/servers", status_code=303)
+        token = await core.get_token_for_server(db, server_id, row[1] or "hetzner")
+        await db.execute(
+            "UPDATE servers SET deletion_pending_reason=NULL, deletion_requested_at=NULL, deletion_notified=0, traffic_limit_reviewed_at=CASE WHEN deletion_pending_reason LIKE '%حجم%' OR deletion_pending_reason LIKE '%ترافیک%' THEN ? ELSE traffic_limit_reviewed_at END WHERE id=?",
+            (datetime.utcnow().isoformat(), server_id),
+        )
+        await db.commit()
+    if token:
+        try:
+            await core.make_provider_api(row[1] or "hetzner", token).power_action(row[0], "poweron")
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE servers SET status='running' WHERE id=?", (server_id,))
+                await db.commit()
+        except Exception:
+            pass
+    return RedirectResponse("/servers?cancelled=1", status_code=303)
 
 
 @app.get("/servers/{server_id}/renew", response_class=HTMLResponse)
@@ -1018,11 +1152,11 @@ async def server_renew_form(request: Request, server_id: int):
     if not sess:
         return RedirectResponse("/login")
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT name, expires_at, monthly_price, user_id FROM servers WHERE id=?", (server_id,))
+        cur = await db.execute("SELECT name, expires_at, monthly_price, user_id, deletion_pending_reason FROM servers WHERE id=?", (server_id,))
         row = await cur.fetchone()
     if not row:
         return RedirectResponse("/servers")
-    name, expires_at, monthly_price, owner_id = row
+    name, expires_at, monthly_price, owner_id, pending_reason = row
     if not expires_at or not monthly_price:
         return page("تمدید سرویس", f"<h1><span class='page-icon icon-blue'>⏳</span> تمدید سرویس</h1><div class='card'>سرور «{esc(name)}» تحت سیستم تمدید خودکار نیست.</div>", "/servers")
     exp_dt = datetime.fromisoformat(expires_at)
@@ -1031,6 +1165,7 @@ async def server_renew_form(request: Request, server_id: int):
     <div class="card">
       <p>مهلت فعلی تا: <b>{exp_dt.strftime('%Y-%m-%d %H:%M')} (UTC)</b></p>
       <p>هزینه تمدید {core.RENEWAL_PERIOD_DAYS} روز دیگر: <b>{core.fmt_price(monthly_price)}</b> (از کیف پول کاربر {owner_id or '-'} کسر می‌شود)</p>
+      {f"<p class='msg err'>درخواست حذف در انتظار بررسی: {esc(pending_reason)}</p>" if pending_reason else ""}
       <form method="post" action="/servers/{server_id}/renew">
         <button class="btn green" type="submit">✅ تایید و تمدید</button>
       </form>
@@ -1046,20 +1181,20 @@ async def server_renew_do(request: Request, server_id: int):
         return RedirectResponse("/login")
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT user_id, hetzner_id, expires_at, monthly_price, expired_powered_off_at FROM servers WHERE id=?",
+            "SELECT user_id, hetzner_id, expires_at, monthly_price, expired_powered_off_at, provider_type, traffic_powered_off, deletion_pending_reason FROM servers WHERE id=?",
             (server_id,),
         )
         row = await cur.fetchone()
         if not row:
             return RedirectResponse("/servers")
-        owner_id, hetzner_id, expires_at, monthly_price, expired_off_at = row
+        owner_id, hetzner_id, expires_at, monthly_price, expired_off_at, provider_type, traffic_off, deletion_pending_reason = row
         if not expires_at or not monthly_price:
             return RedirectResponse("/servers")
         cur2 = await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,))
         bal_row = await cur2.fetchone()
         if not bal_row or bal_row[0] < monthly_price:
             return RedirectResponse(f"/servers/{server_id}/renew?err=" + urllib.parse.quote("موجودی کیف پول کاربر کافی نیست"), status_code=303)
-        token = await core.get_active_token(db)
+        token = await core.get_token_for_server(db, server_id, provider_type or "hetzner")
         base = datetime.fromisoformat(expires_at)
         now = datetime.utcnow()
         if base < now:
@@ -1068,13 +1203,13 @@ async def server_renew_do(request: Request, server_id: int):
         was_expired_off = bool(expired_off_at)
         await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=?", (monthly_price, owner_id))
         await db.execute(
-            "UPDATE servers SET expires_at=?, expired_powered_off_at=NULL, traffic_powered_off=0 WHERE id=?",
-            (new_expiry.isoformat(), server_id),
+            "UPDATE servers SET expires_at=?, expired_powered_off_at=NULL, traffic_powered_off=0, deletion_pending_reason=NULL, deletion_requested_at=NULL, deletion_notified=0, traffic_limit_reviewed_at=CASE WHEN ? LIKE '%ترافیک%' OR ? LIKE '%حجم%' THEN ? ELSE traffic_limit_reviewed_at END WHERE id=?",
+            (new_expiry.isoformat(), deletion_pending_reason or "", deletion_pending_reason or "", datetime.utcnow().isoformat(), server_id),
         )
         await db.commit()
-    if was_expired_off and token:
+    if (was_expired_off or traffic_off or deletion_pending_reason) and token:
         try:
-            await core.HetznerAPI(token).power_action(hetzner_id, "poweron")
+            await core.make_provider_api(provider_type or "hetzner", token).power_action(hetzner_id, "poweron")
         except Exception:
             pass
     return RedirectResponse("/servers", status_code=303)
@@ -1086,12 +1221,12 @@ async def server_rebuild_form(request: Request, server_id: int):
     if not sess:
         return RedirectResponse("/login")
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT name FROM servers WHERE id=?", (server_id,))
+        cur = await db.execute("SELECT name, provider_type, deletion_pending_reason FROM servers WHERE id=?", (server_id,))
         row = await cur.fetchone()
-        token = await core.get_active_token(db)
+        token = await core.get_token_for_server(db, server_id, row[1] or "hetzner") if row and not row[2] else None
     if not row or not token:
         return RedirectResponse("/servers")
-    api = core.HetznerAPI(token)
+    api = core.make_provider_api(row[1] or "hetzner", token)
     try:
         images = await api.images()
     except Exception as e:
@@ -1119,11 +1254,11 @@ async def server_rebuild_do(request: Request, server_id: int):
     form = await request.form()
     image = form.get("image")
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT hetzner_id FROM servers WHERE id=?", (server_id,))
+        cur = await db.execute("SELECT hetzner_id, provider_type, deletion_pending_reason FROM servers WHERE id=?", (server_id,))
         row = await cur.fetchone()
-        token = await core.get_active_token(db)
+        token = await core.get_token_for_server(db, server_id, row[1] or "hetzner") if row and not row[2] else None
     if row and token and image:
-        api = core.HetznerAPI(token)
+        api = core.make_provider_api(row[1] or "hetzner", token)
         try:
             new_pass = await api.rebuild_server(row[0], image)
             async with aiosqlite.connect(DB_PATH) as db:
