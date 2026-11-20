@@ -2499,7 +2499,7 @@ def server_actions_kb(server_id: int, back_callback: str = "my_servers_list"):
              InlineKeyboardButton(text="🛠 نصب مجدد", callback_data=f"sv_rebuild_{server_id}")],
             [InlineKeyboardButton(text="🌐 تغییر IP", callback_data=f"sv_ipchange_{server_id}"),
              InlineKeyboardButton(text="⏳ تمدید", callback_data=f"sv_renew_{server_id}")],
-            [InlineKeyboardButton(text="🔄 همگام‌سازی زمان و حجم", callback_data=f"svsync_{server_id}")],
+            [InlineKeyboardButton(text="📊 نمایش زمان و حجم", callback_data=f"svstats_{server_id}")],
             [InlineKeyboardButton(text="🗑 درخواست حذف", callback_data=f"sv_del_{server_id}")],
             *([[InlineKeyboardButton(text="👤 تعیین / انتقال مالکیت", callback_data=f"admsvowner_{server_id}")]] if back_callback == "adm_servers" else []),
             [InlineKeyboardButton(text="🔙 بازگشت به فهرست", callback_data=back_callback)],
@@ -2536,6 +2536,101 @@ async def my_servers_list_callback(call: CallbackQuery):
     ] + [[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="back_main")]])
     await call.message.edit_text("🖥 سرورهای شما\nیک سرور را برای مدیریت انتخاب کنید:", reply_markup=kb)
     await call.answer()
+
+
+def server_stats_kb(server_id: int, created_at, expires_at, incoming, outgoing, included):
+    total = int(incoming or 0) + int(outgoing or 0)
+    remaining_bytes = max(0, int(included or 0) - total) if included else 0
+    elapsed = format_elapsed(created_at)
+    remaining_time = "نامشخص"
+    try:
+        exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        now = datetime.now(exp.tzinfo) if exp.tzinfo else datetime.utcnow()
+        delta = exp - now
+        if delta.total_seconds() <= 0:
+            remaining_time = "پایان‌یافته"
+        else:
+            days = delta.days
+            hours = delta.seconds // 3600
+            minutes = (delta.seconds % 3600) // 60
+            remaining_time = f"{days} روز، {hours} ساعت، {minutes} دقیقه"
+    except Exception:
+        pass
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"⏱ سپری‌شده: {elapsed}", callback_data=f"svstat_{server_id}_elapsed")],
+        [InlineKeyboardButton(text=f"⌛ باقی‌مانده: {remaining_time}", callback_data=f"svstat_{server_id}_time")],
+        [InlineKeyboardButton(text=f"📤 مصرف‌شده: {format_bytes(total)}", callback_data=f"svstat_{server_id}_used")],
+        [InlineKeyboardButton(text=f"📦 باقی‌مانده: {format_bytes(remaining_bytes) if included else 'نامشخص'}", callback_data=f"svstat_{server_id}_left")],
+        [InlineKeyboardButton(text="🔄 همگام‌سازی", callback_data=f"svsync_{server_id}")],
+        [InlineKeyboardButton(text="🔙 بازگشت به تنظیمات سرور", callback_data=f"svshow_{server_id}")],
+    ])
+
+
+@router.callback_query(F.data.startswith("svstats_"))
+async def server_stats_menu(call: CallbackQuery):
+    sid = int(call.data.rsplit("_", 1)[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id, created_at, expires_at, traffic_in_bytes, traffic_out_bytes, traffic_included_bytes FROM servers WHERE id=?", (sid,))
+        row = await cur.fetchone()
+    if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
+        await call.answer("سرور پیدا نشد یا دسترسی ندارید.", show_alert=True)
+        return
+    kb = server_stats_kb(sid, row[1], row[2], row[3], row[4], row[5])
+    await call.message.edit_text("📊 آمار زمان و حجم سرور\nبرای مشاهده جزئیات، هر مورد را انتخاب کنید:", reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("svstat_"))
+async def server_stats_detail(call: CallbackQuery):
+    parts = call.data.split("_")
+    sid, kind = int(parts[1]), parts[2]
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id, created_at, expires_at, traffic_in_bytes, traffic_out_bytes, traffic_included_bytes FROM servers WHERE id=?", (sid,))
+        row = await cur.fetchone()
+    if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
+        await call.answer("دسترسی غیرمجاز", show_alert=True)
+        return
+    elapsed = format_elapsed(row[1])
+    total = int(row[3] or 0) + int(row[4] or 0)
+    included = int(row[5] or 0)
+    remaining = max(0, included-total) if included else None
+    try:
+        exp = datetime.fromisoformat(str(row[2]).replace("Z", "+00:00"))
+        now = datetime.now(exp.tzinfo) if exp.tzinfo else datetime.utcnow()
+        d = exp-now
+        rem_time = "پایان‌یافته" if d.total_seconds() <= 0 else f"{d.days} روز، {d.seconds//3600} ساعت، {(d.seconds%3600)//60} دقیقه"
+    except Exception:
+        rem_time = "نامشخص"
+    values = {"elapsed": f"زمان سپری‌شده: {elapsed}", "time": f"زمان باقی‌مانده: {rem_time}", "used": f"حجم مصرف‌شده: {format_bytes(total)}", "left": f"حجم باقی‌مانده: {format_bytes(remaining) if remaining is not None else 'نامشخص'}"}
+    await call.answer(values.get(kind, "اطلاعات سرور"), show_alert=True)
+
+
+@router.callback_query(F.data.startswith("svsync_"))
+async def server_stats_sync(call: CallbackQuery):
+    sid = int(call.data.rsplit("_", 1)[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id, hetzner_id, provider_type, created_at, expires_at, traffic_in_bytes, traffic_out_bytes, traffic_included_bytes FROM servers WHERE id=?", (sid,))
+        row = await cur.fetchone()
+        if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
+            await call.answer("دسترسی غیرمجاز", show_alert=True)
+            return
+        token = await get_token_for_server(db, sid, row[2] or "hetzner")
+    incoming, outgoing, included = row[5], row[6], row[7]
+    if token:
+        try:
+            live = await make_provider_api(row[2] or "hetzner", token).get_server(row[1])
+            incoming = int(live.get("ingoing_traffic") or 0)
+            outgoing = int(live.get("outgoing_traffic") or 0)
+            included = int(live.get("included_traffic") or 0)
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE servers SET traffic_in_bytes=?, traffic_out_bytes=?, traffic_included_bytes=?, traffic_synced_at=? WHERE id=?", (incoming, outgoing, included, datetime.utcnow().isoformat(), sid))
+                await db.commit()
+        except Exception as e:
+            await call.answer(f"همگام‌سازی ناموفق: {e}", show_alert=True)
+            return
+    kb = server_stats_kb(sid, row[3], row[4], incoming, outgoing, included)
+    await call.message.edit_text("📊 آمار زمان و حجم سرور\nاطلاعات به‌روزرسانی شد:", reply_markup=kb)
+    await call.answer("✅ همگام‌سازی انجام شد")
 
 
 @router.callback_query(F.data.startswith("svshow_"))
