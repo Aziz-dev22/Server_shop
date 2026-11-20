@@ -27,7 +27,7 @@ import httpx
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -69,6 +69,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger("hetzner_shop_bot")
 
 router = Router()
+
+
+@router.message(StateFilter("*"), F.text.in_({"❌ لغو عملیات", "لغو", "/cancel"}))
+async def universal_fsm_cancel(message: Message, state: FSMContext):
+    current = await state.get_state()
+    if current is None:
+        await message.answer("عملیات فعالی برای لغو وجود ندارد.", reply_markup=main_menu_kb(is_admin(message.from_user.id)))
+        return
+    await state.clear()
+    await message.answer("❌ عملیات لغو شد. به منوی اصلی برگشتید.", reply_markup=main_menu_kb(is_admin(message.from_user.id)))
+
+
+@router.callback_query(F.data == "cancel_fsm")
+async def universal_callback_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.answer("❌ عملیات لغو شد.", reply_markup=main_menu_kb(is_admin(call.from_user.id)))
+    await call.answer()
 
 
 class AdminSupportSettings(StatesGroup):
@@ -1192,6 +1209,7 @@ def main_menu_kb(admin: bool):
         [KeyboardButton(text="📦 سفارش‌های من"), KeyboardButton(text="💰 کیف پول")],
         [KeyboardButton(text="👤 پروفایل"), KeyboardButton(text="🆘 پشتیبانی")],
     ]
+    rows.append([KeyboardButton(text="❌ لغو عملیات")])
     if admin:
         rows.append([KeyboardButton(text="⚙️ پنل مدیریت")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
@@ -1671,9 +1689,10 @@ async def back_main(call: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data == "adm_back")
-async def adm_back(call: CallbackQuery):
+async def adm_back(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         return
+    await state.clear()
     await call.message.edit_text("⚙️ پنل مدیریت", reply_markup=admin_menu_kb())
     await call.answer()
 
@@ -2068,6 +2087,7 @@ async def buy_start(message: Message, state: FSMContext):
         [InlineKeyboardButton(text=PROVIDER_LABELS.get(p, p), callback_data=f"buyprov_{p}")] for p in enabled
     ]
     kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_main")])
+    kb_rows.append([InlineKeyboardButton(text="❌ لغو عملیات", callback_data="cancel_fsm")])
     await state.set_state(BuyFlow.provider)
     await message.answer("🌍 کدام سرویس‌دهنده را می‌خواهید؟", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
@@ -2123,6 +2143,7 @@ async def _buy_show_locations(message: Message, state: FSMContext, provider_type
         for loc in locations
     ]
     kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_main")])
+    kb_rows.append([InlineKeyboardButton(text="❌ لغو عملیات", callback_data="cancel_fsm")])
     await state.set_state(BuyFlow.location)
     text = "📍 یک دیتاسنتر انتخاب کنید:"
     if edit:
@@ -2256,6 +2277,7 @@ async def _render_location_plans(call: CallbackQuery, state: FSMContext, locatio
     await state.update_data(location=location, pricing=pricing, types_list=types_list)
     kb_rows.append([InlineKeyboardButton(text="🔄 همگام‌سازی موجودی", callback_data=f"stock_sync_{location}")])
     kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت به لوکیشن‌ها", callback_data="back_buy_locations")])
+    kb_rows.append([InlineKeyboardButton(text="❌ لغو عملیات", callback_data="cancel_fsm")])
     await state.set_state(BuyFlow.plan)
     text = "📦 پلن موردنظر را انتخاب کنید (قیمت ماهانه زنده است):"
     if call.message.text:
@@ -2327,9 +2349,47 @@ async def buy_plan(call: CallbackQuery, state: FSMContext):
         await call.answer()
         return
     kb_rows = [[InlineKeyboardButton(text=f"{img.get('name')}", callback_data=f"img_{img['id']}")] for img in images[:100]]
-    kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_main")])
+    kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت به پلن‌ها", callback_data="back_buy_plan")])
+    kb_rows.append([InlineKeyboardButton(text="❌ لغو عملیات", callback_data="cancel_fsm")])
     await state.set_state(BuyFlow.image)
     await call.message.edit_text("💿 سیستم‌عامل را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    await call.answer()
+
+
+@router.callback_query(F.data == "back_buy_plan")
+async def back_buy_plan(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    location = data.get("location")
+    if not location:
+        await state.clear()
+        await call.message.edit_text("اطلاعات خرید پیدا نشد. از منوی اصلی دوباره شروع کنید.")
+        await call.answer()
+        return
+    await _render_location_plans(call, state, location)
+
+
+@router.callback_query(F.data == "back_buy_image")
+async def back_buy_image(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    provider_type = data.get("provider_type", "hetzner")
+    async with aiosqlite.connect(DB_PATH) as db:
+        token = await get_active_token_for(db, provider_type)
+    if not token:
+        await state.clear()
+        await call.message.edit_text("اتصال سرویس‌دهنده در دسترس نیست. از منوی اصلی دوباره شروع کنید.")
+        await call.answer()
+        return
+    try:
+        images = deduplicate_images(await make_provider_api(provider_type, token).images())
+    except Exception as exc:
+        await call.answer("دریافت سیستم‌عامل‌ها ناموفق بود؛ دوباره تلاش کنید.", show_alert=True)
+        logger.warning("Back-to-image menu failed: %s", exc)
+        return
+    rows = [[InlineKeyboardButton(text=img.get("name", "سیستم‌عامل"), callback_data=f"img_{img['id']}")] for img in images[:100]]
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت به پلن‌ها", callback_data="back_buy_plan")])
+    rows.append([InlineKeyboardButton(text="❌ لغو عملیات", callback_data="cancel_fsm")])
+    await state.set_state(BuyFlow.image)
+    await call.message.edit_text("💿 سیستم‌عامل را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await call.answer()
 
 
@@ -2360,7 +2420,8 @@ async def buy_image(call: CallbackQuery, state: FSMContext):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ تایید و خرید", callback_data="confirm_buy")],
-            [InlineKeyboardButton(text="❌ انصراف", callback_data="back_main")],
+            [InlineKeyboardButton(text="🔙 بازگشت به سیستم‌عامل‌ها", callback_data="back_buy_image")],
+            [InlineKeyboardButton(text="❌ لغو عملیات", callback_data="cancel_fsm")],
         ]
     )
     await state.set_state(BuyFlow.confirm)
