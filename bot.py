@@ -12,6 +12,7 @@ Hetzner Shop Bot v2 - ربات فروش و مدیریت سرور مجازی (VPS
 """
 
 import asyncio
+import json
 import time
 import html
 import logging
@@ -530,6 +531,110 @@ def to_usd(amount, currency: str, rate: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# خطاهای Hetzner: تفکیک علت‌ها + نگه‌داشتن کامل پاسخ JSON خطا (برای لاگ و عیب‌یابی 422)
+# ---------------------------------------------------------------------------
+HETZNER_AUTH_CODES = {"unauthorized", "forbidden", "token_readonly"}
+HETZNER_LIMIT_CODES = {"resource_limit_exceeded", "server_limit_exceeded", "limit_exceeded"}
+HETZNER_UNAVAILABLE_CODES = {"resource_unavailable", "placement_error", "no_space_left_in_location"}
+HETZNER_INVALID_CODES = {"invalid_input", "json_error", "not_found", "protected"}
+HETZNER_TRANSIENT_CODES = {"locked", "conflict", "timeout", "unavailable", "maintenance", "service_error"}
+
+
+def classify_hetzner_error(status_code, code):
+    """علت خطا را به یکی از این دسته‌ها تبدیل می‌کند:
+    auth | limit | unavailable | invalid | duplicate | rate_limit | server_error | transient | unknown
+    """
+    code = (code or "").lower()
+    if code in HETZNER_LIMIT_CODES:
+        return "limit"
+    if code in HETZNER_AUTH_CODES or status_code == 401:
+        return "auth"
+    if code in HETZNER_UNAVAILABLE_CODES:
+        return "unavailable"
+    if code == "uniqueness_error":
+        return "duplicate"
+    if code == "rate_limit_exceeded" or status_code == 429:
+        return "rate_limit"
+    if status_code is not None and status_code >= 500:
+        return "server_error"
+    if code in HETZNER_INVALID_CODES or status_code in (400, 404, 422):
+        return "invalid"
+    if code in HETZNER_TRANSIENT_CODES:
+        return "transient"
+    if status_code == 403:
+        return "auth"
+    return "unknown"
+
+
+class HetznerError(Exception):
+    """پایه‌ی همه‌ی خطاهای Hetzner. kind علت را مشخص می‌کند (classify_hetzner_error + network_*)."""
+
+    kind = "unknown"
+    status_code = None
+    code = None
+    api_message = None
+    details = None
+    body = None
+    retry_after = None
+
+    def _fill(self, *, kind, status_code=None, code=None, api_message=None, details=None, body=None, retry_after=None):
+        self.kind = kind
+        self.status_code = status_code
+        self.code = code
+        self.api_message = api_message
+        self.details = details
+        self.body = body
+        self.retry_after = retry_after
+
+    def describe(self):
+        parts = []
+        if self.status_code is not None:
+            parts.append(f"HTTP {self.status_code}")
+        if self.code:
+            parts.append(f"code={self.code}")
+        if self.api_message:
+            parts.append(f"message={self.api_message}")
+        if self.details:
+            try:
+                parts.append("details=" + json.dumps(self.details, ensure_ascii=False))
+            except (TypeError, ValueError):
+                parts.append(f"details={self.details}")
+        return " | ".join(parts) if parts else str(self)
+
+
+class HetznerAPIError(HetznerError, httpx.HTTPStatusError):
+    """پاسخ خطای HTTP از Hetzner (زیرکلاس httpx.HTTPStatusError تا کدهای قبلی که آن را می‌گیرند سالم بمانند)."""
+
+    def __init__(self, message, *, request, response, kind, code=None, api_message=None, details=None, body=None, retry_after=None):
+        httpx.HTTPStatusError.__init__(self, message, request=request, response=response)
+        self._fill(kind=kind, status_code=response.status_code, code=code, api_message=api_message,
+                   details=details, body=body, retry_after=retry_after)
+
+
+class HetznerNetworkError(HetznerError):
+    """خطای ارتباطی. network_unsent = درخواست به Hetzner نرسیده؛ network_unknown = ممکن است رسیده باشد."""
+
+    def __init__(self, message, *, kind="network_unknown"):
+        Exception.__init__(self, message)
+        self._fill(kind=kind)
+
+
+class HetznerPreflightError(HetznerError):
+    """خطای پیش از ارسال درخواست (پارامتر نامعتبر/ناسازگار) - هیچ درخواست ساختی ارسال نشده است."""
+
+    def __init__(self, message, *, code="preflight", kind="invalid"):
+        Exception.__init__(self, message)
+        self._fill(kind=kind, code=code, api_message=message)
+
+
+def hetzner_image_usable(img):
+    """فقط ایمیج‌های available. (ایمیج‌های deprecated به‌صورت پیش‌فرض توسط خود API حذف می‌شوند.)"""
+    if not isinstance(img, dict):
+        return False
+    return img.get("status") in (None, "available")
+
+
+# ---------------------------------------------------------------------------
 # کلاس اتصال به Hetzner Cloud API
 # ---------------------------------------------------------------------------
 class HetznerAPI:
@@ -537,44 +642,130 @@ class HetznerAPI:
         self.token = token
         self.headers = {"Authorization": f"Bearer {token}"}
 
+    async def _request(self, method, path, *, params=None, json=None):
+        url = f"{HETZNER_API}{path}"
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.request(method, url, headers=self.headers, params=params, json=json)
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+            # اتصال برقرار نشد؛ درخواست قطعاً به Hetzner نرسیده است.
+            raise HetznerNetworkError(f"اتصال به Hetzner برقرار نشد ({type(exc).__name__})", kind="network_unsent") from exc
+        except httpx.TransportError as exc:
+            # timeout روی خواندن پاسخ، قطع شدن اتصال و...: ممکن است درخواست پردازش شده باشد.
+            raise HetznerNetworkError(f"ارتباط با Hetzner حین درخواست قطع شد ({type(exc).__name__})", kind="network_unknown") from exc
+        if r.status_code >= 400:
+            raise self._error_from_response(method, path, r)
+        return r
+
+    @staticmethod
+    def _error_from_response(method, path, r):
+        raw = (r.text or "")[:4000]
+        try:
+            payload = r.json()
+        except Exception:
+            payload = None
+        err = payload.get("error") if isinstance(payload, dict) else None
+        err = err if isinstance(err, dict) else {}
+        code, api_message, details = err.get("code"), err.get("message"), err.get("details")
+        kind = classify_hetzner_error(r.status_code, code)
+        message = f"Hetzner {method} {path} -> HTTP {r.status_code}"
+        if code:
+            message += f" [{code}]"
+        if api_message:
+            message += f": {api_message}"
+        try:
+            request = r.request
+        except RuntimeError:
+            request = None
+        retry_after = None
+        try:
+            retry_after = float(r.headers.get("retry-after")) if r.headers.get("retry-after") else None
+        except (TypeError, ValueError):
+            retry_after = None
+        return HetznerAPIError(message, request=request, response=r, kind=kind, code=code,
+                               api_message=api_message, details=details, body=raw, retry_after=retry_after)
+
     async def _get(self, path, params=None):
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(f"{HETZNER_API}{path}", headers=self.headers, params=params)
-            r.raise_for_status()
-            return r.json()
+        r = await self._request("GET", path, params=params)
+        return r.json()
 
     async def _post(self, path, json=None):
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(f"{HETZNER_API}{path}", headers=self.headers, json=json)
-            r.raise_for_status()
-            return r.json()
+        r = await self._request("POST", path, json=json)
+        return r.json()
 
     async def _delete(self, path):
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.delete(f"{HETZNER_API}{path}", headers=self.headers)
-            r.raise_for_status()
-            return True
+        await self._request("DELETE", path)
+        return True
+
+    async def _get_paged(self, path, key, params=None):
+        """همه‌ی صفحه‌های یک لیست Hetzner (پیش‌فرض API فقط ۲۵ مورد اول را برمی‌گرداند)."""
+        items, page = [], 1
+        while page <= 50:
+            query = dict(params or {})
+            query.update({"page": page, "per_page": 50})
+            data = await self._get(path, params=query)
+            items.extend(data.get(key, []))
+            next_page = (data.get("meta") or {}).get("pagination", {}).get("next_page")
+            if not next_page:
+                break
+            page = next_page
+        return items
 
     async def locations(self):
         data = await self._get("/locations")
         return data.get("locations", [])
 
     async def server_types(self):
-        data = await self._get("/server_types")
-        return [t for t in data.get("server_types", []) if t.get("deprecated") is not True]
+        types = await self._get_paged("/server_types", "server_types")
+        return [t for t in types if t.get("deprecated") is not True]
 
-    async def images(self):
-        """Fetch all system images, including newer releases, without duplicates."""
-        images, page = [], 1
-        while True:
-            data = await self._get("/images", params={"type": "system", "per_page": 50, "page": page})
-            images.extend(data.get("images", []))
-            pagination = data.get("meta", {}).get("pagination", {})
-            if not pagination.get("next_page"):
-                break
-            page = pagination["next_page"]
+    async def server_type_architecture(self, server_type_name):
+        """معماری (x86 / arm) یک پلن؛ در صورت پیدا نشدن None."""
+        data = await self._get("/server_types", params={"name": server_type_name})
+        items = data.get("server_types") or []
+        return items[0].get("architecture") if items else None
+
+    async def images(self, architecture=None):
+        """Fetch system images (optionally only one CPU architecture), without duplicates."""
+        params = {"type": "system", "status": "available"}
+        if architecture:
+            params["architecture"] = architecture
+        images = await self._get_paged("/images", "images", params)
         unique = {str(img.get("id")): img for img in images if img.get("id") is not None}
         return sorted(unique.values(), key=lambda img: (img.get("name") or "").lower())
+
+    async def resolve_image(self, image, server_type_name):
+        """ایمیج انتخاب‌شده را با معماری پلن هماهنگ می‌کند و مقداری برمی‌گرداند که برای ساخت سرور امن است.
+
+        ایمیج‌های هتزنر برای x86 و arm نام یکسان ولی ID متفاوت دارند؛ ارسال ID ایمیج ناسازگار با پلن (مثلاً
+        ubuntu-24.04 نسخه‌ی arm برای پلن x86) باعث خطای 422 می‌شود.
+        """
+        ref = str(image).strip() if image is not None else ""
+        if not ref:
+            raise HetznerPreflightError("سیستم‌عامل انتخاب نشده است.", code="image_missing")
+        if not ref.isdigit():
+            return ref  # نام ایمیج؛ خود Hetzner نسخه‌ی هم‌معماری را انتخاب می‌کند
+        arch = await self.server_type_architecture(server_type_name)
+        if not arch:
+            return ref  # معماری نامشخص؛ اعتبارسنجی به عهده‌ی خود Hetzner
+        try:
+            img = (await self._get(f"/images/{ref}")).get("image") or {}
+        except HetznerAPIError as exc:
+            if exc.status_code == 404:
+                raise HetznerPreflightError(f"سیستم‌عامل انتخاب‌شده (ID {ref}) دیگر در Hetzner وجود ندارد.", code="image_not_found") from exc
+            raise
+        if hetzner_image_usable(img) and img.get("architecture") in (None, arch):
+            return ref
+        name = img.get("name")
+        if name:
+            alt = await self._get("/images", params={"type": "system", "name": name, "architecture": arch, "status": "available"})
+            for cand in alt.get("images") or []:
+                if hetzner_image_usable(cand) and cand.get("id"):
+                    logger.info("Hetzner image %s (%s) is not compatible with %s plan; using %s instead", ref, name, arch, cand["id"])
+                    return str(cand["id"])
+        raise HetznerPreflightError(
+            f"سیستم‌عامل انتخاب‌شده با معماری پلن ({arch}) سازگار نیست.", code="image_architecture_mismatch"
+        )
 
     async def pricing(self):
         data = await self._get("/pricing")
@@ -612,10 +803,36 @@ class HetznerAPI:
             page = meta["next_page"]
         return servers
 
-    async def create_server(self, name, server_type, image, location):
-        payload = {"name": name, "server_type": server_type, "image": image, "location": location}
-        data = await self._post("/servers", json=payload)
-        return data["server"], data.get("root_password")
+    async def create_server(self, name, server_type, image, location, labels=None):
+        """POST /v1/servers. هر خطا با کامل‌ترین جزئیات (کد، پیام، details و بدنه‌ی خام JSON) لاگ می‌شود."""
+        missing = [k for k, v in (("name", name), ("server_type", server_type), ("image", image), ("location", location))
+                   if v is None or str(v).strip() == ""]
+        if missing:
+            raise HetznerPreflightError("پارامتر ساخت سرور ناقص است: " + ", ".join(missing), code="missing_parameter")
+        payload = {"name": str(name), "server_type": str(server_type), "image": str(image), "location": str(location)}
+        if labels:
+            payload["labels"] = {str(k): str(v) for k, v in labels.items()}
+        try:
+            data = await self._post("/servers", json=payload)
+        except HetznerError as exc:
+            logger.error(
+                "Hetzner POST /servers FAILED | kind=%s | %s | payload=%s | raw_response=%s",
+                exc.kind, exc.describe(), json.dumps(payload, ensure_ascii=False), exc.body,
+            )
+            raise
+        server = data.get("server") if isinstance(data, dict) else None
+        if not isinstance(server, dict) or not server.get("id"):
+            logger.error("Hetzner POST /servers returned an unexpected body: %s | payload=%s", str(data)[:2000], json.dumps(payload, ensure_ascii=False))
+            # سرور ممکن است ساخته شده باشد؛ فراخوان‌کننده باید با نام/لیبل بررسی کند.
+            raise HetznerNetworkError("پاسخ Hetzner به درخواست ساخت سرور نامعتبر بود.", kind="network_unknown")
+        logger.info("Hetzner server created | id=%s | name=%s | type=%s | location=%s", server.get("id"), name, server_type, location)
+        return server, data.get("root_password")
+
+    async def find_server_by_name(self, name):
+        """سرور با این نام دقیق (اگر وجود داشته باشد). برای جلوگیری از ساخت تکراری بعد از خطای ارتباطی."""
+        data = await self._get("/servers", params={"name": name})
+        servers = data.get("servers") or []
+        return servers[0] if servers else None
 
     async def delete_server(self, hetzner_id):
         return await self._delete(f"/servers/{hetzner_id}")
@@ -981,6 +1198,11 @@ async def available_types_for_location(api: "HetznerAPI", location_name: str):
         types = await api.server_types()
     except Exception:
         return None
+    return compute_available_types(types, location_name)
+
+
+def compute_available_types(types, location_name: str):
+    """Server-type names available in a location, computed from ONE account's server_types response."""
     available = set()
     known = False
     for server_type in types:
@@ -1044,6 +1266,186 @@ async def build_stock_map(api: "HetznerAPI"):
         # Prices alone are not proof of live inventory. Leave the map unknown if
         # the API response does not include any supported availability field.
     return stock_map if known else None
+
+
+# ---------------------------------------------------------------------------
+# ساخت سرور Hetzner با چند API (failover امن، بدون ترکیب اطلاعات APIهای مختلف)
+# ---------------------------------------------------------------------------
+HETZNER_KIND_PRIORITY = [
+    "unavailable", "limit", "auth", "invalid", "rate_limit", "server_error",
+    "network_unsent", "network_unknown", "transient", "duplicate", "stock_unknown", "unknown",
+]
+HETZNER_AMBIGUOUS_KINDS = {"network_unknown", "server_error"}  # ممکن است سرور واقعاً ساخته شده باشد
+HETZNER_ADMIN_ALERT_KINDS = {"limit", "auth", "invalid", "server_error", "network_unknown", "network_unsent", "transient", "unknown"}
+
+HETZNER_USER_MESSAGES = {
+    "unavailable": "❌ موجودی این پلن همین حالا در Hetzner تمام شد یا در این دیتاسنتر قابل ساخت نیست. مبلغی از کیف پول شما کسر نشد؛ لطفاً دیتاسنتر/پلن دیگری انتخاب کنید یا کمی بعد دوباره تلاش کنید.",
+    "stock_unknown": "❌ موجودی این پلن در APIهای فعال قابل تأیید نیست. مبلغی از کیف پول شما کسر نشد؛ کمی بعد دوباره تلاش کنید.",
+    "limit": "❌ سقف/محدودیت اکانت Hetzner برای ساخت سرور جدید پر شده است. موضوع به ادمین گزارش شد و مبلغی از کیف پول شما کسر نشد.",
+    "auth": "❌ احراز هویت API هتزنر ناموفق بود (توکن نامعتبر یا بدون دسترسی نوشتن). موضوع به ادمین گزارش شد و مبلغی کسر نشد.",
+    "invalid": "❌ Hetzner پارامترهای ساخت سرور را نپذیرفت (مثلاً سیستم‌عامل یا پلن). موضوع به ادمین گزارش شد؛ می‌توانید سیستم‌عامل دیگری را امتحان کنید. مبلغی کسر نشد.",
+    "rate_limit": "❌ Hetzner موقتاً تعداد درخواست‌ها را محدود کرده است. چند دقیقه بعد دوباره تلاش کنید. مبلغی کسر نشد.",
+    "network_unsent": "❌ ارتباط با Hetzner برقرار نشد. کمی بعد دوباره تلاش کنید. مبلغی کسر نشد.",
+    "transient": "❌ Hetzner موقتاً پاسخگو نیست. کمی بعد دوباره تلاش کنید. مبلغی کسر نشد.",
+    "duplicate": "❌ تداخل نام سرور رخ داد. دوباره تلاش کنید. مبلغی کسر نشد.",
+    "unknown": "❌ ساخت سرور ناموفق بود. موضوع به ادمین گزارش شد و مبلغی کسر نشد.",
+}
+HETZNER_USER_MESSAGES["server_error"] = HETZNER_USER_MESSAGES["transient"]
+HETZNER_USER_MESSAGES["network_unknown"] = HETZNER_USER_MESSAGES["transient"]
+HETZNER_UNCERTAIN_USER_MESSAGE = (
+    "⚠️ پاسخ Hetzner هنگام ساخت سرور نامشخص بود. برای جلوگیری از ساخت سرور تکراری، تلاش مجدد انجام نشد "
+    "و مبلغی از کیف پول شما کسر نشد. موضوع به ادمین گزارش شد؛ چند دقیقه بعد بخش «سرورهای من» را بررسی کنید."
+)
+
+
+class HetznerCreateFailed(Exception):
+    """ساخت سرور در هیچ‌یک از APIها موفق نبود. attempts: لیست تلاش‌ها با علت هرکدام."""
+
+    def __init__(self, attempts, uncertain=False, server_name=None, order_ref=None):
+        self.attempts = attempts
+        self.uncertain = uncertain
+        self.server_name = server_name
+        self.order_ref = order_ref
+        super().__init__("; ".join(f"API#{a.get('provider_id')}:{a.get('kind')}:{a.get('text')}" for a in attempts) or "no provider")
+
+    @property
+    def primary_kind(self):
+        kinds = {a.get("kind") for a in self.attempts}
+        for kind in HETZNER_KIND_PRIORITY:
+            if kind in kinds:
+                return kind
+        return "unknown"
+
+
+def hetzner_failure_user_text(exc: "HetznerCreateFailed") -> str:
+    text = HETZNER_UNCERTAIN_USER_MESSAGE if exc.uncertain else HETZNER_USER_MESSAGES.get(exc.primary_kind, HETZNER_USER_MESSAGES["unknown"])
+    if exc.order_ref and exc.primary_kind != "unavailable" and exc.primary_kind != "stock_unknown":
+        text += f"\nکد پیگیری: {exc.order_ref}"
+    return text
+
+
+async def _find_our_server(api: "HetznerAPI", server_name: str, order_ref: str, delays=(0, 3, 6)):
+    """بعد از خطای مبهم بررسی می‌کند سرور همین سفارش (هم‌نام و هم‌لیبل) واقعاً ساخته شده یا نه."""
+    for delay in delays:
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            server = await api.find_server_by_name(server_name)
+        except Exception as exc:
+            logger.warning("Could not verify server %s after ambiguous create error: %s", server_name, exc)
+            continue
+        if server and (server.get("labels") or {}).get("shop-order") == order_ref:
+            return server
+    return None
+
+
+async def create_hetzner_server_with_failover(providers, *, server_name, server_type, image, location, order_ref):
+    """سرور را روی اولین API که واقعاً توان ساخت دارد می‌سازد.
+
+    - موجودی، Server Type، Location، Image و Token همیشه از همان API (همان اکانت) بررسی و استفاده می‌شوند.
+    - اگر ساخت در یک API قطعاً شکست خورد (پلن ناموجود، پارامتر نامعتبر، محدودیت اکانت، احراز هویت...)، API بعدی امتحان می‌شود.
+    - اگر نتیجه مبهم باشد (timeout/قطع اتصال/خطای 5xx) ابتدا با نام و لیبل سفارش بررسی می‌شود که سرور ساخته شده یا نه؛
+      اگر ساخته شده بود همان پذیرفته می‌شود و اگر تکلیف روشن نشد، برای جلوگیری از سرور تکراری هیچ API دیگری امتحان نمی‌شود.
+    """
+    attempts = []
+    labels = {"shop-bot": "1", "shop-order": order_ref}
+
+    def note(pid, step, exc=None, kind=None, text=None):
+        entry = {
+            "provider_id": pid, "step": step,
+            "kind": kind or getattr(exc, "kind", "unknown"),
+            "text": text or (exc.describe() if isinstance(exc, HetznerError) else f"{type(exc).__name__}: {exc}"),
+            "code": getattr(exc, "code", None), "status": getattr(exc, "status_code", None),
+        }
+        attempts.append(entry)
+        logger.warning("Hetzner create attempt failed | API#%s | step=%s | kind=%s | %s", pid, step, entry["kind"], entry["text"])
+
+    def success(pid, token, server, root_password, image_ref, adopted=False):
+        return {"provider_id": pid, "token": token, "server": server, "root_password": root_password,
+                "image": image_ref, "adopted": adopted}
+
+    for pid, ptoken in providers:
+        api = HetznerAPI(ptoken)
+
+        # ۱) موجودی دقیقاً با توکن همین API
+        try:
+            types = await api.server_types()
+        except Exception as exc:
+            note(pid, "stock", exc)
+            continue
+        stock = compute_available_types(types, location)
+        if stock is None:
+            note(pid, "stock", kind="stock_unknown", text="API اطلاعات موجودی برنگرداند")
+            continue
+        if server_type not in stock:
+            note(pid, "stock", kind="unavailable", text=f"{server_type} در {location} موجود نیست")
+            continue
+
+        # ۲) هماهنگ‌سازی ایمیج با معماری پلن (روی همین API)
+        try:
+            image_ref = await api.resolve_image(image, server_type)
+        except Exception as exc:
+            note(pid, "image", exc)
+            continue
+
+        # ۳) ساخت
+        for attempt in (1, 2):
+            try:
+                server, root_password = await api.create_server(server_name, server_type, image_ref, location, labels=labels)
+                return success(pid, ptoken, server, root_password, image_ref)
+            except Exception as exc:
+                kind = getattr(exc, "kind", "network_unknown")
+                if kind == "rate_limit" and attempt == 1:
+                    await asyncio.sleep(min(getattr(exc, "retry_after", None) or 3, 10))
+                    continue
+                if kind in HETZNER_AMBIGUOUS_KINDS:
+                    found = await _find_our_server(api, server_name, order_ref)
+                    if found:
+                        logger.warning("Create reported %s but server %s exists on API#%s; adopting it", kind, found.get("id"), pid)
+                        return success(pid, ptoken, found, None, image_ref, adopted=True)
+                    note(pid, "create", exc)
+                    raise HetznerCreateFailed(attempts, uncertain=True, server_name=server_name, order_ref=order_ref) from exc
+                if kind == "duplicate":
+                    found = await _find_our_server(api, server_name, order_ref, delays=(0,))
+                    if found:
+                        return success(pid, ptoken, found, None, image_ref, adopted=True)
+                note(pid, "create", exc)
+                break
+    raise HetznerCreateFailed(attempts, uncertain=False, server_name=server_name, order_ref=order_ref)
+
+
+async def notify_admins(bot, text: str):
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text[:3900])
+        except Exception as exc:
+            logger.warning("Could not notify admin %s: %s", admin_id, exc)
+
+
+async def report_hetzner_create_failure(call, user_id, data, exc: "HetznerCreateFailed"):
+    """پیام مناسب به کاربر + گزارش کامل به ادمین (برای خطاهایی که نیاز به اقدام ادمین دارند)."""
+    logger.error("Hetzner server creation failed for user %s | ref=%s | uncertain=%s | attempts=%s",
+                 user_id, exc.order_ref, exc.uncertain, exc.attempts)
+    try:
+        await call.message.answer(hetzner_failure_user_text(exc))
+    except Exception as send_exc:
+        logger.warning("Could not send failure message to user %s: %s", user_id, send_exc)
+    if not exc.uncertain and exc.primary_kind not in HETZNER_ADMIN_ALERT_KINDS:
+        return
+    lines = [
+        "🚨 ساخت سرور برای کاربر ناموفق بود" + (" (نتیجه نامشخص؛ احتمال وجود سرور)" if exc.uncertain else ""),
+        f"کاربر: {user_id}",
+        f"پلن: {html.escape(str(data.get('plan_title')))} ({html.escape(str(data.get('server_type')))})",
+        f"دیتاسنتر: {html.escape(str(data.get('location')))}",
+        f"کد پیگیری/لیبل shop-order: {html.escape(str(exc.order_ref))}",
+        f"نام سرور: {html.escape(str(exc.server_name))}",
+        "علت‌ها به تفکیک API:",
+    ]
+    for a in exc.attempts:
+        lines.append(f"• API #{a.get('provider_id')} [{a.get('step')}/{a.get('kind')}] {html.escape(str(a.get('text')))[:500]}")
+    if exc.uncertain:
+        lines.append("برای جلوگیری از سرور تکراری تلاش مجدد انجام نشد؛ لطفاً در پنل Hetzner بررسی کنید که سروری با این نام ساخته شده یا نه.")
+    await notify_admins(call.bot, "\n".join(lines))
 
 
 def plan_has_stock(stock_map, plan_location, server_type, enabled_locations):
@@ -2167,6 +2569,18 @@ def compute_price_generic(types_list, server_type_id, markup_percent):
     return None
 
 
+async def images_for_plan(provider_type: str, api, server_type: str):
+    """لیست سیستم‌عامل‌ها؛ برای Hetzner فقط ایمیج‌های هم‌معماری (x86/arm) با پلن انتخاب‌شده."""
+    if provider_type != "hetzner":
+        return await api.images()
+    arch = None
+    try:
+        arch = await api.server_type_architecture(server_type)
+    except Exception as exc:
+        logger.warning("Could not read architecture of %s: %s", server_type, exc)
+    return await api.images(architecture=arch)
+
+
 def deduplicate_images(images):
     """Remove duplicate OS choices by display name, keeping the newest/first API entry."""
     result = []
@@ -2183,7 +2597,7 @@ def deduplicate_images(images):
 
 def extract_server_ip(provider_type: str, server: dict) -> str:
     if provider_type == "hetzner":
-        return server.get("public_net", {}).get("ipv4", {}).get("ip", "در حال تخصیص")
+        return ((server.get("public_net") or {}).get("ipv4") or {}).get("ip") or "در حال تخصیص"
     if provider_type == "digitalocean":
         for n in server.get("networks", {}).get("v4", []):
             if n.get("type") == "public":
@@ -2343,7 +2757,7 @@ async def buy_plan(call: CallbackQuery, state: FSMContext):
     await state.update_data(plan_id=plan[0], server_type=plan[1], plan_title=plan[2], markup=plan[3])
     api = make_provider_api(provider_type, token)
     try:
-        images = deduplicate_images(await api.images())
+        images = deduplicate_images(await images_for_plan(provider_type, api, plan[1]))
     except Exception as e:
         await call.message.answer(f"خطا در دریافت سیستم‌عامل‌ها: {e}")
         await call.answer()
@@ -2380,7 +2794,7 @@ async def back_buy_image(call: CallbackQuery, state: FSMContext):
         await call.answer()
         return
     try:
-        images = deduplicate_images(await make_provider_api(provider_type, token).images())
+        images = deduplicate_images(await images_for_plan(provider_type, make_provider_api(provider_type, token), data.get("server_type")))
     except Exception as exc:
         await call.answer("دریافت سیستم‌عامل‌ها ناموفق بود؛ دوباره تلاش کنید.", show_alert=True)
         logger.warning("Back-to-image menu failed: %s", exc)
@@ -2429,8 +2843,45 @@ async def buy_image(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+_BUY_IN_PROGRESS = set()  # جلوگیری از دو بار کلیک / دو سفارش هم‌زمان یک کاربر (ساخت سرور تکراری)
+
+
 @router.callback_query(BuyFlow.confirm, F.data == "confirm_buy")
 async def buy_confirm(call: CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
+    if user_id in _BUY_IN_PROGRESS:
+        await call.answer("⏳ سفارش قبلی شما هنوز در حال پردازش است؛ لطفاً صبر کنید.", show_alert=True)
+        return
+    _BUY_IN_PROGRESS.add(user_id)
+    try:
+        await _buy_confirm_impl(call, state)
+    finally:
+        _BUY_IN_PROGRESS.discard(user_id)
+
+
+async def _save_purchase(user_id, server, server_name, ip, root_password, os_image, data, price, expires_at, provider_type, provider_id):
+    """کسر هزینه + ثبت سرور + ثبت سفارش در یک تراکنش. در صورت خطا چیزی ثبت/کسر نمی‌شود."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=?", (price, user_id))
+        await db.execute(
+            "INSERT INTO servers (user_id, hetzner_id, name, ip, location, plan_title, os_image, root_password, status, created_at, expires_at, monthly_price, provider_type, provider_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                user_id, server["id"], server_name, ip, data["location"], data["plan_title"],
+                os_image, root_password, "running", datetime.utcnow().isoformat(), expires_at, price, provider_type, provider_id,
+            ),
+        )
+        cur = await db.execute("SELECT last_insert_rowid()")
+        server_db_id = (await cur.fetchone())[0]
+        await db.execute(
+            "INSERT INTO orders (user_id, server_id, plan_title, location, price, status, created_at) VALUES (?,?,?,?,?,?,?)",
+            (user_id, server_db_id, data["plan_title"], data["location"], price, "completed", datetime.utcnow().isoformat()),
+        )
+        await db.commit()
+    return server_db_id
+
+
+async def _buy_confirm_impl(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     provider_type = data.get("provider_type", "hetzner")
     user_id = call.from_user.id
@@ -2451,22 +2902,6 @@ async def buy_confirm(call: CallbackQuery, state: FSMContext):
         providers = await get_active_providers(db, provider_type)
         provider_id, token = (providers[0] if providers else (None, None))
 
-    if provider_type == "hetzner":
-        viable = []
-        for pid, ptoken in providers:
-            try:
-                stock = await available_types_for_location(HetznerAPI(ptoken), data["location"])
-                if stock is not None and data["server_type"] in stock:
-                    viable.append((pid, ptoken))
-            except Exception:
-                continue
-        if viable:
-            provider_id, token = viable[0]
-        else:
-            await call.message.edit_text("❌ موجودی این پلن در همه APIهای فعال تمام شده یا قابل استعلام نیست. خرید انجام نشد.")
-            await state.clear()
-            await call.answer()
-            return
     if not token:
         await call.message.edit_text("❌ هیچ API فعال برای ساخت سرور پیدا نشد.")
         await state.clear()
@@ -2474,37 +2909,32 @@ async def buy_confirm(call: CallbackQuery, state: FSMContext):
         return
 
     await call.message.edit_text("⏳ در حال ساخت سرور شما... لطفاً چند لحظه صبر کنید.")
-    api = make_provider_api(provider_type, token)
-    server_name = f"srv-{user_id}-{secrets.token_hex(2)}"
-    try:
-        server, root_password = await api.create_server(
-            name=server_name, server_type=data["server_type"], image=data["image"], location=data["location"]
-        )
-    except Exception as first_error:
-        if provider_type == "hetzner":
-            # Try other active accounts in priority order if the first provider's create fails.
-            created = None
-            for fallback_pid, fallback_token in providers:
-                if fallback_pid == provider_id:
-                    continue
-                try:
-                    stock = await available_types_for_location(HetznerAPI(fallback_token), data["location"])
-                    if stock is None or data["server_type"] not in stock:
-                        continue
-                    server, root_password = await HetznerAPI(fallback_token).create_server(
-                        name=server_name, server_type=data["server_type"], image=data["image"], location=data["location"]
-                    )
-                    provider_id, token, api = fallback_pid, fallback_token, HetznerAPI(fallback_token)
-                    created = True
-                    break
-                except Exception:
-                    continue
-            if not created:
-                await call.message.answer(f"❌ ساخت سرور در همه APIهای فعال ناموفق بود. خطای اول: {first_error}")
-                await state.clear()
-                await call.answer()
-                return
-        else:
+    server_name = f"srv-{user_id}-{secrets.token_hex(3)}"
+    order_ref = secrets.token_hex(8)
+    os_image = data["image"]
+
+    if provider_type == "hetzner":
+        try:
+            created = await create_hetzner_server_with_failover(
+                providers, server_name=server_name, server_type=data["server_type"],
+                image=data["image"], location=data["location"], order_ref=order_ref,
+            )
+        except HetznerCreateFailed as failure:
+            await report_hetzner_create_failure(call, user_id, data, failure)
+            await state.clear()
+            await call.answer()
+            return
+        server, root_password = created["server"], created["root_password"]
+        provider_id, token = created["provider_id"], created["token"]
+        os_image = created["image"]
+        server_name = server.get("name") or server_name
+    else:
+        api = make_provider_api(provider_type, token)
+        try:
+            server, root_password = await api.create_server(
+                name=server_name, server_type=data["server_type"], image=data["image"], location=data["location"]
+            )
+        except Exception as first_error:
             await call.message.answer(f"❌ خطا در ساخت سرور: {first_error}")
             await state.clear()
             await call.answer()
@@ -2516,25 +2946,38 @@ async def buy_confirm(call: CallbackQuery, state: FSMContext):
     ip = extract_server_ip(provider_type, server)
     expires_at = (datetime.utcnow() + timedelta(days=30)).isoformat()
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=?", (price, user_id))
-        await db.execute(
-            "INSERT INTO servers (user_id, hetzner_id, name, ip, location, plan_title, os_image, root_password, status, created_at, expires_at, monthly_price, provider_type, provider_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                user_id, server["id"], server_name, ip, data["location"], data["plan_title"],
-                data["image"], root_password, "running", datetime.utcnow().isoformat(), expires_at, price, provider_type, provider_id,
-            ),
-        )
-        cur = await db.execute("SELECT last_insert_rowid()")
-        server_db_id = (await cur.fetchone())[0]
-        await db.execute(
-            "INSERT INTO orders (user_id, server_id, plan_title, location, price, status, created_at) VALUES (?,?,?,?,?,?,?)",
-            (user_id, server_db_id, data["plan_title"], data["location"], price, "completed", datetime.utcnow().isoformat()),
-        )
-        await db.commit()
+    server_db_id = None
+    for attempt in range(1, 4):
+        try:
+            server_db_id = await _save_purchase(
+                user_id, server, server_name, ip, root_password, os_image, data, price, expires_at, provider_type, provider_id
+            )
+            break
+        except Exception:
+            logger.exception("Saving purchased server failed (attempt %s/3) | remote id=%s | name=%s", attempt, server.get("id"), server_name)
+            await asyncio.sleep(1)
 
     await state.clear()
+    if server_db_id is None:
+        # سرور واقعاً ساخته شده ولی ثبت دیتابیس ناموفق بود: مشتری بی‌خبر نماند و ادمین اطلاع داشته باشد.
+        logger.critical("Server %s (remote id %s, provider %s) was CREATED but could not be saved to the DB", server_name, server.get("id"), provider_id)
+        await notify_admins(
+            call.bot,
+            "🚨 سرور ساخته شد ولی ثبت در دیتابیس ناموفق بود و مبلغ از کیف پول کسر نشد!\n"
+            f"کاربر: {user_id}\nنام: {html.escape(str(server_name))}\nID هتزنر: {server.get('id')}\nAPI #{provider_id}\n"
+            f"آی‌پی: {html.escape(str(ip))}\nمبلغ: {fmt_price(price)}\nلطفاً دستی ثبت کنید یا از «همگام‌سازی سرورها» استفاده کنید.",
+        )
+        await call.message.answer(
+            "✅ سرور ساخته شد، اما ثبت نهایی سفارش با خطا مواجه شد و ادمین مطلع شد.\n\n"
+            f"نام: {server_name}\n"
+            f"آی‌پی: {ip}\n"
+            f"یوزر: root\n"
+            f"پسورد: {root_password}\n\n"
+            "لطفاً این اطلاعات را نگه دارید؛ ادمین سرور را به حساب شما متصل می‌کند."
+        )
+        await call.answer()
+        return
+
     await call.message.answer(
         "✅ سرور شما با موفقیت ساخته شد!\n\n"
         f"نام: {server_name}\n"
@@ -3555,7 +3998,7 @@ async def adm_direct_type(call: CallbackQuery, state: FSMContext):
     async with aiosqlite.connect(DB_PATH) as db:
         token = await get_active_token(db)
     api = HetznerAPI(token)
-    images = deduplicate_images(await api.images())
+    images = deduplicate_images(await images_for_plan("hetzner", api, call.data.replace("adtype_", "")))
     kb_rows = [[InlineKeyboardButton(text=img.get("name"), callback_data=f"adimg_{img['id']}")] for img in images[:100]]
     kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="adm_back")])
     await state.set_state(AdminDirect.image)
@@ -3593,17 +4036,19 @@ async def adm_direct_confirm(call: CallbackQuery, state: FSMContext):
     api = HetznerAPI(token)
     server_name = f"admin-{secrets.token_hex(3)}"
     try:
+        image_ref = await api.resolve_image(data["image"], data["server_type"])
         server, root_password = await api.create_server(
-            name=server_name, server_type=data["server_type"], image=data["image"], location=data["location"]
+            name=server_name, server_type=data["server_type"], image=image_ref, location=data["location"]
         )
     except Exception as e:
-        await call.message.answer(f"❌ خطا در ساخت سرور: {e}")
+        detail = e.describe() if isinstance(e, HetznerError) else str(e)
+        await call.message.answer(f"❌ خطا در ساخت سرور: {html.escape(detail)}")
         await state.clear()
         await call.answer()
         return
     if not root_password:
         root_password = "از طریق دکمه «تغییر پسورد» دریافت کنید"
-    ip = server.get("public_net", {}).get("ipv4", {}).get("ip", "در حال تخصیص")
+    ip = extract_server_ip("hetzner", server)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO servers (user_id, hetzner_id, name, ip, location, plan_title, os_image, root_password, status, created_at) "
