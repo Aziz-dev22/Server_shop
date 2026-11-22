@@ -15,13 +15,17 @@ import asyncio
 import json
 import time
 import html
+import hashlib
 import logging
+import math
 import os
 import secrets
 import zipfile
 import tempfile
+from urllib.parse import urlencode
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 import httpx
@@ -60,6 +64,17 @@ NOWPAYMENTS_PAY_CURRENCY = "usdttrc20"  # ارز پرداختی ثابت: تتر
 IP_CHANGE_FREE_COUNT = 2       # تعداد دفعات رایگان تغییر IP برای هر سرور
 IP_CHANGE_PRICE = 0.5          # هزینه هر تغییر IP بعد از دفعات رایگان (دلار)
 RENEWAL_PERIOD_DAYS = 30       # طول هر دوره تمدید سرویس
+TRAFFIC_INCLUDED_BYTES = 20 * 1_000_000_000_000  # حجم بسته: ۲۰ ترابایت
+IRAN_TZ = ZoneInfo("Asia/Tehran")
+
+def iran_time(value):
+    try:
+        dt = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(IRAN_TZ)
+    except Exception:
+        return None
+
 TRAFFIC_SOFT_LIMIT_BYTES = int(19.5 * 1_000_000_000_000)  # ۱۹.۵ ترابایت -> خاموش‌سازی هشداری
 EXPIRY_REMINDER_HOURS_BEFORE = 48   # چند ساعت قبل از پایان مهلت، یادآوری تمدید ارسال شود
 EXPIRY_GRACE_HOURS = 2               # چند ساعت بعد از پایان مهلت، قبل از حذف کامل سرور صبر شود
@@ -182,6 +197,15 @@ CREATE TABLE IF NOT EXISTS pending_ip_cleanup (
     ip_address TEXT,
     cleanup_at TEXT
 );
+CREATE TABLE IF NOT EXISTS product_categories (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, active INTEGER DEFAULT 1, created_at TEXT);
+CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, category_id INTEGER, name TEXT NOT NULL, description TEXT DEFAULT '', image_url TEXT DEFAULT '', price_usd REAL NOT NULL DEFAULT 0, price_toman INTEGER NOT NULL DEFAULT 0, stock INTEGER NOT NULL DEFAULT 0, active INTEGER DEFAULT 1, created_at TEXT, updated_at TEXT, delivery_mode TEXT DEFAULT 'manual');
+CREATE TABLE IF NOT EXISTS product_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL, product_name TEXT NOT NULL, quantity INTEGER NOT NULL, customer_name TEXT NOT NULL, mobile TEXT NOT NULL, email TEXT DEFAULT '', amount_usd REAL NOT NULL DEFAULT 0, amount_toman INTEGER NOT NULL DEFAULT 0, status TEXT DEFAULT 'pending', authority TEXT UNIQUE, ref_id TEXT, created_at TEXT, paid_at TEXT, delivery_note TEXT DEFAULT '', delivery_token_hash TEXT);
+CREATE TABLE IF NOT EXISTS product_inventory (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL, payload TEXT NOT NULL, status TEXT DEFAULT 'available', order_id INTEGER, created_at TEXT, delivered_at TEXT);
+CREATE TABLE IF NOT EXISTS customer_login_codes (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, code_hash TEXT NOT NULL, expires_at TEXT NOT NULL, attempts INTEGER DEFAULT 0, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS customer_web_tokens (id INTEGER PRIMARY KEY AUTOINCREMENT, token_hash TEXT NOT NULL UNIQUE, telegram_id INTEGER NOT NULL, redirect_path TEXT DEFAULT '/shop', expires_at TEXT NOT NULL, used_at TEXT);
+CREATE TABLE IF NOT EXISTS wallet_transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, amount_usd REAL NOT NULL, kind TEXT NOT NULL, reference TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS web_server_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, provider_type TEXT NOT NULL, location TEXT NOT NULL, plan_id INTEGER NOT NULL, plan_title TEXT NOT NULL, server_type TEXT NOT NULL, image TEXT NOT NULL, price_usd REAL NOT NULL, wallet_used_usd REAL DEFAULT 0, wallet_refunded INTEGER DEFAULT 0, gateway_method TEXT DEFAULT 'wallet', gateway_track_id TEXT, authority TEXT UNIQUE, gateway_due_usd REAL DEFAULT 0, gateway_due_toman INTEGER DEFAULT 0, status TEXT DEFAULT 'pending_payment', server_db_id INTEGER, created_at TEXT NOT NULL, paid_at TEXT);
+
 """
 
 
@@ -199,6 +223,30 @@ async def init_db():
         await _safe_add_column(db, "provider", "label TEXT")
         await _safe_add_column(db, "provider", "active INTEGER DEFAULT 0")
         await _safe_add_column(db, "plans", "markup_percent REAL DEFAULT 20")
+        await _safe_add_column(db, "products", "delivery_mode TEXT DEFAULT 'manual'")
+        await _safe_add_column(db, "products", "price_usd REAL NOT NULL DEFAULT 0")
+        await _safe_add_column(db, "product_orders", "amount_usd REAL NOT NULL DEFAULT 0")
+        await _safe_add_column(db, "product_orders", "delivery_token_hash TEXT")
+        await _safe_add_column(db, "users", "email TEXT")
+        await _safe_add_column(db, "users", "email_verified INTEGER DEFAULT 0")
+        await _safe_add_column(db, "product_orders", "user_id INTEGER")
+        await _safe_add_column(db, "product_orders", "wallet_used_usd REAL DEFAULT 0")
+        await _safe_add_column(db, "product_orders", "wallet_refunded INTEGER DEFAULT 0")
+        await _safe_add_column(db, "product_orders", "gateway_method TEXT DEFAULT 'zarinpal'")
+        await _safe_add_column(db, "product_orders", "gateway_track_id TEXT")
+        await _safe_add_column(db, "product_orders", "gateway_due_toman INTEGER DEFAULT 0")
+        await _safe_add_column(db, "product_orders", "currency_rate REAL DEFAULT 100000")
+        await _safe_add_column(db, "web_server_orders", "gateway_due_toman INTEGER DEFAULT 0")
+        await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users(email) WHERE email IS NOT NULL AND email != ''")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_product_orders_status_gateway ON product_orders(status,gateway_method)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_web_server_orders_status_gateway ON web_server_orders(status,gateway_method)")
+        await db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('wallet_usd_to_toman','100000')")
+        # Legacy prices were stored in Toman; convert them once using the configured rate.
+        _rate_row = await (await db.execute("SELECT value FROM settings WHERE key='wallet_usd_to_toman'")).fetchone()
+        _rate = float((_rate_row[0] if _rate_row else 100000) or 100000)
+        if _rate > 0:
+            await db.execute("UPDATE products SET price_usd=ROUND(price_toman / ?, 6) WHERE price_usd=0 AND price_toman>0", (_rate,))
+            await db.execute("UPDATE product_orders SET amount_usd=ROUND(amount_toman / ?, 6) WHERE amount_usd=0 AND amount_toman>0", (_rate,))
         await _safe_add_column(db, "wallet_requests", "method TEXT DEFAULT 'manual'")
         await _safe_add_column(db, "wallet_requests", "track_id TEXT")
         await _safe_add_column(db, "tickets", "status TEXT DEFAULT 'open'")
@@ -224,6 +272,16 @@ async def init_db():
         await _safe_add_column(db, "servers", "traffic_included_bytes INTEGER DEFAULT 0")
         await _safe_add_column(db, "servers", "traffic_synced_at TEXT")
         await _safe_add_column(db, "servers", "traffic_limit_reviewed_at TEXT")
+        await _safe_add_column(db, "servers", "is_admin_owned INTEGER DEFAULT 0")
+        await _safe_add_column(db, "servers", "is_protected INTEGER DEFAULT 0")
+        await _safe_add_column(db, "servers", "source TEXT DEFAULT 'bot'")
+        if ADMIN_IDS:
+            marks = ",".join("?" for _ in ADMIN_IDS)
+            await db.execute(f"UPDATE servers SET is_admin_owned=1, is_protected=1 WHERE user_id IN ({marks}) AND COALESCE(source,'bot') != 'external'", ADMIN_IDS)
+        await db.execute("UPDATE servers SET is_protected=1 WHERE user_id IS NULL")
+        await db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('timezone','Asia/Tehran')")
+        await db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('zarinpal_merchant_id','')")
+        await db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('zarinpal_sandbox','0')")
         await _safe_add_column(db, "provider", "type TEXT DEFAULT 'hetzner'")
         await _safe_add_column(db, "plans", "provider_type TEXT DEFAULT 'hetzner'")
         await _safe_add_column(db, "servers", "provider_type TEXT DEFAULT 'hetzner'")
@@ -301,6 +359,11 @@ async def request_server_deletion(bot, server_db_id, reason):
         if not row:
             return False
         name, remote_id, ptype, pid, owner_id, pending = row
+        cur = await db.execute("SELECT COALESCE(is_protected,0) FROM servers WHERE id=?", (server_db_id,))
+        protected = (await cur.fetchone() or (0,))[0]
+        if protected:
+            logger.info("Skipping automatic deletion request for protected server %s", server_db_id)
+            return False
         if pending:
             return False
         token = await get_token_for_server(db, server_db_id, ptype or "hetzner")
@@ -1481,7 +1544,7 @@ async def compute_price_usd(db, pricing: dict, type_name: str, location: str, ma
 # ---------------------------------------------------------------------------
 # درگاه پرداخت ارز دیجیتال (OxaPay)
 # ---------------------------------------------------------------------------
-async def oxapay_create_invoice(api_key: str, amount_usd: float, order_id: str):
+async def oxapay_create_invoice(api_key: str, amount_usd: float, order_id: str, description: str = "شارژ کیف پول"):
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(
             f"{OXAPAY_API}/payment/invoice",
@@ -1491,7 +1554,7 @@ async def oxapay_create_invoice(api_key: str, amount_usd: float, order_id: str):
                 "currency": "USD",
                 "lifetime": 60,
                 "order_id": order_id,
-                "description": "شارژ کیف پول",
+                "description": str(description)[:120],
             },
         )
         r.raise_for_status()
@@ -1509,6 +1572,57 @@ async def oxapay_check_status(api_key: str, track_id: str) -> str:
         return str(r.json().get("data", {}).get("status", ""))
 
 
+async def refund_product_wallet(order_id: int):
+    """Refund wallet contribution exactly once when the gateway payment fails."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        row = await (await db.execute("SELECT user_id,wallet_used_usd,wallet_refunded,status FROM product_orders WHERE id=?", (order_id,))).fetchone()
+        if row and row[3] not in ("delivered", "paid", "paid_stock_issue"):
+            if row[0] and float(row[1] or 0) > 0 and not row[2]:
+                await db.execute("UPDATE users SET balance=balance+? WHERE telegram_id=?", (float(row[1]), row[0]))
+                await db.execute("INSERT OR IGNORE INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)", (row[0], float(row[1]), "refund", f"product-order-{order_id}-refund", datetime.utcnow().isoformat()))
+            await db.execute("UPDATE product_orders SET wallet_refunded=1,status='payment_failed' WHERE id=?", (order_id,))
+        await db.commit()
+
+
+async def complete_product_order(order_id: int, reference: str = ""):
+    """Finalize a product order atomically; inventory is reserved and delivered once."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        row = await (await db.execute("SELECT product_id,quantity,status FROM product_orders WHERE id=?", (order_id,))).fetchone()
+        if not row or row[2] != "pending_payment":
+            await db.commit()
+            return None
+        pid, qty, _ = row
+        product = await (await db.execute("SELECT delivery_mode FROM products WHERE id=?", (pid,))).fetchone()
+        if not product:
+            await db.execute("UPDATE product_orders SET status='paid_stock_issue',ref_id=?,paid_at=? WHERE id=?", (reference, datetime.utcnow().isoformat(), order_id))
+            await db.commit(); return None
+        token = None
+        if product[0] == "automatic":
+            items = await (await db.execute("SELECT id FROM product_inventory WHERE product_id=? AND status='available' ORDER BY id LIMIT ?", (pid, qty))).fetchall()
+            if len(items) != qty:
+                await db.execute("UPDATE product_orders SET status='paid_stock_issue',ref_id=?,paid_at=? WHERE id=?", (reference, datetime.utcnow().isoformat(), order_id))
+                await db.commit(); return None
+            now = datetime.utcnow().isoformat()
+            for item in items:
+                cur = await db.execute("UPDATE product_inventory SET status='sold',order_id=?,delivered_at=? WHERE id=? AND status='available'", (order_id, now, item[0]))
+                if cur.rowcount != 1:
+                    await db.rollback(); return None
+            await db.execute("UPDATE products SET stock=(SELECT COUNT(*) FROM product_inventory WHERE product_id=? AND status='available') WHERE id=?", (pid, pid))
+            token = secrets.token_urlsafe(32)
+            token_hash = hashlib.sha256(token.encode()).hexdigest()
+            await db.execute("UPDATE product_orders SET status='delivered',ref_id=?,paid_at=?,delivery_token_hash=? WHERE id=?", (reference, now, token_hash, order_id))
+        else:
+            cur = await db.execute("UPDATE products SET stock=stock-? WHERE id=? AND stock>=?", (qty, pid, qty))
+            if cur.rowcount != 1:
+                await db.execute("UPDATE product_orders SET status='paid_stock_issue',ref_id=?,paid_at=? WHERE id=?", (reference, datetime.utcnow().isoformat(), order_id))
+            else:
+                await db.execute("UPDATE product_orders SET status='paid',ref_id=?,paid_at=? WHERE id=?", (reference, datetime.utcnow().isoformat(), order_id))
+        await db.commit()
+        return token
+
+
 async def oxapay_poller(bot: Bot):
     """هر ۴۵ ثانیه وضعیت فاکتورهای ارزی در انتظار (OxaPay و NOWPayments) را چک می‌کند (بدون نیاز به وب‌هوک/دامنه)."""
     while True:
@@ -1522,6 +1636,8 @@ async def oxapay_poller(bot: Bot):
                     "WHERE status='pending' AND method IN ('oxapay','nowpayments') AND track_id IS NOT NULL"
                 )
                 rows = await cur.fetchall()
+                product_rows = await (await db.execute("SELECT id,user_id,gateway_track_id,gateway_method FROM product_orders WHERE status='pending_payment' AND gateway_method IN ('oxapay','nowpayments') AND gateway_track_id IS NOT NULL")).fetchall()
+                server_rows = await (await db.execute("SELECT id,user_id,gateway_track_id,gateway_method FROM web_server_orders WHERE status='pending_payment' AND gateway_method IN ('oxapay','nowpayments') AND gateway_track_id IS NOT NULL")).fetchall()
             for req_id, user_id, amount, track_id, method in rows:
                 try:
                     if method == "oxapay":
@@ -1547,6 +1663,47 @@ async def oxapay_poller(bot: Bot):
                         )
                     except Exception:
                         pass
+            for order_id, user_id, track_id, method in product_rows:
+                try:
+                    if method == "oxapay":
+                        if not oxapay_key: continue
+                        status = await oxapay_check_status(oxapay_key, track_id)
+                        paid = "paid" in status.lower() or "complet" in status.lower() or "confirm" in status.lower()
+                        failed = any(x in status.lower() for x in ("expired", "failed", "cancel"))
+                    else:
+                        if not nowpayments_key: continue
+                        status = await nowpayments_check_status(nowpayments_key, track_id)
+                        paid = status.lower() == "finished"
+                        failed = status.lower() in ("failed", "expired", "refunded")
+                    if paid:
+                        token = await complete_product_order(order_id, str(track_id))
+                        if token and user_id:
+                            base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+                            try: await bot.send_message(user_id, f"✅ پرداخت و تحویل سفارش #{order_id} انجام شد.\nلینک امن دریافت: {base}/shop/delivery/{token}")
+                            except Exception: pass
+                    elif failed:
+                        await refund_product_wallet(order_id)
+                except Exception as exc:
+                    logger.warning("product payment poll failed for order %s: %s", order_id, exc)
+            for order_id, user_id, track_id, method in server_rows:
+                try:
+                    if method == "oxapay":
+                        if not oxapay_key: continue
+                        status = await oxapay_check_status(oxapay_key, track_id)
+                        paid = "paid" in status.lower() or "complet" in status.lower() or "confirm" in status.lower()
+                        failed = any(x in status.lower() for x in ("expired", "failed", "cancel"))
+                    else:
+                        if not nowpayments_key: continue
+                        status = await nowpayments_check_status(nowpayments_key, track_id)
+                        paid = status.lower() == "finished"; failed = status.lower() in ("failed", "expired", "refunded")
+                    if paid:
+                        server_id = await complete_web_server_order(order_id, str(track_id))
+                        if server_id:
+                            try: await bot.send_message(user_id, f"✅ سرور سفارش #{order_id} ساخته شد. شناسه سرور: {server_id}\nبرای مشاهده، از بخش سرورهای من اقدام کنید.")
+                            except Exception: pass
+                    elif failed: await refund_web_server_wallet(order_id)
+                except Exception as exc:
+                    logger.warning("web server payment poll failed for order %s: %s", order_id, exc)
         except Exception as e:
             logger.warning(f"crypto poller error: {e}")
 
@@ -1554,7 +1711,7 @@ async def oxapay_poller(bot: Bot):
 # ---------------------------------------------------------------------------
 # درگاه پرداخت ارز دیجیتال (NOWPayments)
 # ---------------------------------------------------------------------------
-async def nowpayments_create_payment(api_key: str, amount_usd: float, order_id: str, pay_currency: str = None):
+async def nowpayments_create_payment(api_key: str, amount_usd: float, order_id: str, pay_currency: str = None, description: str = "شارژ کیف پول"):
     pay_currency = (pay_currency or NOWPAYMENTS_PAY_CURRENCY).strip().lower()
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(
@@ -1565,7 +1722,7 @@ async def nowpayments_create_payment(api_key: str, amount_usd: float, order_id: 
                 "price_currency": "usd",
                 "pay_currency": pay_currency,
                 "order_id": order_id,
-                "order_description": "شارژ کیف پول",
+                "order_description": str(description)[:120],
             },
         )
         if r.status_code >= 400:
@@ -1608,8 +1765,9 @@ async def nowpayments_available_currencies(api_key: str):
 def main_menu_kb(admin: bool):
     rows = [
         [KeyboardButton(text="🛒 خرید سرور"), KeyboardButton(text="🖥 سرورهای من")],
-        [KeyboardButton(text="📦 سفارش‌های من"), KeyboardButton(text="💰 کیف پول")],
-        [KeyboardButton(text="👤 پروفایل"), KeyboardButton(text="🆘 پشتیبانی")],
+        [KeyboardButton(text="🛍 فروشگاه اکانت"), KeyboardButton(text="📦 سفارش‌های من")],
+        [KeyboardButton(text="💰 کیف پول"), KeyboardButton(text="👤 پروفایل")],
+        [KeyboardButton(text="🆘 پشتیبانی")],
     ]
     rows.append([KeyboardButton(text="❌ لغو عملیات")])
     if admin:
@@ -2833,7 +2991,8 @@ async def buy_image(call: CallbackQuery, state: FSMContext):
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✅ تایید و خرید", callback_data="confirm_buy")],
+            [InlineKeyboardButton(text="✅ خرید با کیف پول", callback_data="confirm_buy")],
+            [InlineKeyboardButton(text="💳 پرداخت مستقیم یا ترکیبی با درگاه", callback_data="webpay_server")],
             [InlineKeyboardButton(text="🔙 بازگشت به سیستم‌عامل‌ها", callback_data="back_buy_image")],
             [InlineKeyboardButton(text="❌ لغو عملیات", callback_data="cancel_fsm")],
         ]
@@ -2841,6 +3000,21 @@ async def buy_image(call: CallbackQuery, state: FSMContext):
     await state.set_state(BuyFlow.confirm)
     await call.message.edit_text(text, reply_markup=kb)
     await call.answer()
+
+
+@router.callback_query(BuyFlow.confirm, F.data == "webpay_server")
+async def webpay_server_checkout(call: CallbackQuery, state: FSMContext):
+    data=await state.get_data();base=os.getenv("PUBLIC_BASE_URL","").rstrip("/")
+    if not base or not data.get("plan_id") or not data.get("image"):
+        await call.answer("آدرس عمومی سایت یا اطلاعات سفارش تنظیم نشده است.",show_alert=True);return
+    params=urlencode({"provider":data.get("provider_type","hetzner"),"location":data.get("location",""),"plan_id":data.get("plan_id"),"image":data.get("image")})
+    raw=secrets.token_urlsafe(24)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO customer_web_tokens(token_hash,telegram_id,redirect_path,expires_at) VALUES(?,?,?,?)",(hashlib.sha256(raw.encode()).hexdigest(),call.from_user.id,"/servers/buy?"+params,(datetime.utcnow()+timedelta(minutes=15)).isoformat()))
+        await db.commit()
+    url=f"{base}/auth/telegram/link/{raw}"
+    await call.message.answer("روش پرداخت را در سایت انتخاب کنید؛ می‌توانید کل مبلغ را از درگاه بدهید یا موجودی کیف پول را کسر کرده و فقط مابه‌التفاوت را پرداخت کنید.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="ادامه پرداخت امن",url=url)]]))
+    await state.clear();await call.answer()
 
 
 _BUY_IN_PROGRESS = set()  # جلوگیری از دو بار کلیک / دو سفارش هم‌زمان یک کاربر (ساخت سرور تکراری)
@@ -2859,16 +3033,20 @@ async def buy_confirm(call: CallbackQuery, state: FSMContext):
         _BUY_IN_PROGRESS.discard(user_id)
 
 
-async def _save_purchase(user_id, server, server_name, ip, root_password, os_image, data, price, expires_at, provider_type, provider_id):
-    """کسر هزینه + ثبت سرور + ثبت سفارش در یک تراکنش. در صورت خطا چیزی ثبت/کسر نمی‌شود."""
+async def _save_purchase(user_id, server, server_name, ip, root_password, os_image, data, price, expires_at, provider_type, provider_id, charge_wallet=True):
+    """ثبت سرور و سفارش؛ در خرید وب سهم کیف پول پیش‌تر به‌صورت اتمیک رزرو شده است."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=?", (price, user_id))
+        if charge_wallet:
+            cur = await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=? AND balance>=?", (price, user_id, price))
+            if cur.rowcount != 1:
+                await db.rollback()
+                raise ValueError("موجودی کیف پول کافی نیست")
         await db.execute(
-            "INSERT INTO servers (user_id, hetzner_id, name, ip, location, plan_title, os_image, root_password, status, created_at, expires_at, monthly_price, provider_type, provider_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO servers (user_id, hetzner_id, name, ip, location, plan_title, os_image, root_password, status, created_at, expires_at, monthly_price, provider_type, provider_id, is_admin_owned, is_protected) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 user_id, server["id"], server_name, ip, data["location"], data["plan_title"],
-                os_image, root_password, "running", datetime.utcnow().isoformat(), expires_at, price, provider_type, provider_id,
+                os_image, root_password, "running", datetime.utcnow().isoformat(), expires_at, price, provider_type, provider_id, int(user_id in ADMIN_IDS), int(user_id in ADMIN_IDS),
             ),
         )
         cur = await db.execute("SELECT last_insert_rowid()")
@@ -2895,7 +3073,17 @@ async def _buy_confirm_impl(call: CallbackQuery, state: FSMContext):
             price = data.get("price")
         user = await get_user(db, user_id)
         if not user or user[3] < price:
-            await call.message.edit_text("❌ موجودی کیف پول شما کافی نیست. ابتدا کیف پول را شارژ کنید.")
+            base=os.getenv("PUBLIC_BASE_URL","").rstrip("/")
+            if base and data.get("plan_id") and data.get("image"):
+                params=urlencode({"provider":provider_type,"location":data.get("location",""),"plan_id":data.get("plan_id"),"image":data.get("image")})
+                raw=secrets.token_urlsafe(24); digest=hashlib.sha256(raw.encode()).hexdigest()
+                await db.execute("INSERT INTO customer_web_tokens(token_hash,telegram_id,redirect_path,expires_at) VALUES(?,?,?,?)",(digest,user_id,"/servers/buy?"+params,(datetime.utcnow()+timedelta(minutes=15)).isoformat()))
+                await db.commit()
+                url=f"{base}/auth/telegram/link/{raw}"
+                kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💳 ادامه خرید با کیف پول + درگاه",url=url)]])
+                await call.message.edit_text(f"موجودی کیف پول شما برای پرداخت کامل کافی نیست. می‌توانید موجودی فعلی را کسر کرده و فقط مابه‌التفاوت را از زرین‌پال یا درگاه ارزی پرداخت کنید.\nقیمت سرور: {fmt_price(price)}",reply_markup=kb)
+            else:
+                await call.message.edit_text("❌ موجودی کیف پول کافی نیست. برای پرداخت ترکیبی، آدرس عمومی سایت را در تنظیمات PUBLIC_BASE_URL وارد کنید.")
             await state.clear()
             await call.answer()
             return
@@ -3009,6 +3197,128 @@ def server_actions_kb(server_id: int, back_callback: str = "my_servers_list"):
             [InlineKeyboardButton(text="🔙 بازگشت به فهرست", callback_data=back_callback)],
         ]
     )
+
+
+@router.message(Command("shop"))
+@router.message(F.text == "🛍 فروشگاه اکانت")
+async def telegram_shop(message: Message):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await ensure_user(db,message.from_user.id,message.from_user.username,message.from_user.full_name)
+        rows = await (await db.execute("SELECT id,name,price_usd,stock FROM products WHERE active=1 AND stock>0 ORDER BY id DESC LIMIT 30")).fetchall()
+        rate=float(await get_setting(db,"wallet_usd_to_toman","100000") or 100000)
+    if not rows:
+        await message.answer("در حال حاضر محصول فعالی برای فروش وجود ندارد.")
+        return
+    buttons=[]
+    base=os.getenv("PUBLIC_BASE_URL","").rstrip("/")
+    for pid,name,price,stock in rows:
+        buttons.append([InlineKeyboardButton(text=f"🛍 {name[:24]} · ${float(price):.2f}",callback_data=f"tgprod_{pid}")])
+        if base:
+            raw=secrets.token_urlsafe(24); digest=hashlib.sha256(raw.encode()).hexdigest()
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("INSERT INTO customer_web_tokens(token_hash,telegram_id,redirect_path,expires_at) VALUES(?,?,?,?)",(digest,message.from_user.id,f"/shop/{pid}",(datetime.utcnow()+timedelta(minutes=15)).isoformat())); await db.commit()
+            buttons.append([InlineKeyboardButton(text="💳 پرداخت کامل / ترکیبی در سایت",url=f"{base}/auth/telegram/link/{raw}")])
+    buttons.append([InlineKeyboardButton(text="📦 سفارش‌های دیجیتال من",callback_data="tg_my_product_orders")])
+    await message.answer("🛍 محصولات فروشگاه\nبرای مشاهده جزئیات و خرید انتخاب کنید. پرداخت ترکیبی یا درگاه از طریق لینک امن سایت در دسترس است.",reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("tgprod_"))
+async def telegram_product_detail(call: CallbackQuery):
+    try: pid=int(call.data.split("_",1)[1])
+    except: await call.answer("محصول نامعتبر",show_alert=True); return
+    async with aiosqlite.connect(DB_PATH) as db:
+        row=await (await db.execute("SELECT name,description,price_usd,stock,delivery_mode FROM products WHERE id=? AND active=1",(pid,))).fetchone()
+        rate=float(await get_setting(db,"wallet_usd_to_toman","100000") or 100000)
+        user=await ensure_user(db,call.from_user.id,call.from_user.username,call.from_user.full_name)
+    if not row or row[3]<1:
+        await call.answer("موجودی این محصول تمام شده است.",show_alert=True); return
+    need=round(float(row[2]),2)
+    base=os.getenv("PUBLIC_BASE_URL","").rstrip("/")
+    buttons=[[InlineKeyboardButton(text=f"💰 خرید با کیف پول (${need:.2f})",callback_data=f"tg_buy_{pid}")]]
+    if base:
+        raw=secrets.token_urlsafe(24)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT INTO customer_web_tokens(token_hash,telegram_id,redirect_path,expires_at) VALUES(?,?,?,?)",(hashlib.sha256(raw.encode()).hexdigest(),call.from_user.id,f"/shop/{pid}",(datetime.utcnow()+timedelta(minutes=15)).isoformat())); await db.commit()
+        buttons.append([InlineKeyboardButton(text="💳 پرداخت ترکیبی یا با درگاه",url=f"{base}/auth/telegram/link/{raw}")])
+    await call.message.answer(f"<b>{html.escape(row[0])}</b>\n{html.escape(row[1] or '')}\n\nقیمت: ${float(row[2]):.2f}\nموجودی: {row[3]}\nموجودی کیف پول: ${float(user[3] or 0):.2f}",reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("tg_buy_"))
+async def telegram_product_wallet_buy(call: CallbackQuery):
+    try: pid=int(call.data.rsplit("_",1)[1])
+    except: await call.answer("محصول نامعتبر",show_alert=True); return
+    order_id=None
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        prod=await (await db.execute("SELECT name,price_usd,stock FROM products WHERE id=? AND active=1",(pid,))).fetchone()
+        user=await ensure_user(db,call.from_user.id,call.from_user.username,call.from_user.full_name)
+        rate=float(await get_setting(db,"wallet_usd_to_toman","100000") or 100000)
+        if not prod or prod[2]<1 or rate<=0:
+            await db.rollback();await call.answer("موجودی محصول تمام شده است.",show_alert=True);return
+        amount=math.ceil(float(prod[1])*1_000_000)/1_000_000
+        if float(user[3] or 0)<amount:
+            await db.rollback();await call.answer("موجودی کیف پول کافی نیست؛ از گزینه پرداخت ترکیبی استفاده کنید.",show_alert=True);return
+        cur=await db.execute("INSERT INTO product_orders(product_id,product_name,quantity,customer_name,mobile,email,amount_usd,amount_toman,status,created_at,user_id,wallet_used_usd,gateway_method,gateway_due_toman,currency_rate) VALUES(?,?,1,?,?,?,?,?,'pending_payment',?,?,?,'wallet',0,?)",(pid,prod[0],call.from_user.full_name or call.from_user.username or str(call.from_user.id),"", "",float(prod[1]),int(round(float(prod[1])*rate)),datetime.utcnow().isoformat(),call.from_user.id,amount,rate))
+        order_id=cur.lastrowid
+        changed=await db.execute("UPDATE users SET balance=balance-? WHERE telegram_id=? AND balance>=?",(amount,call.from_user.id,amount))
+        if changed.rowcount!=1:
+            await db.rollback();await call.answer("موجودی کیف پول تغییر کرده؛ دوباره تلاش کنید.",show_alert=True);return
+        await db.execute("INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",(call.from_user.id,-amount,"product_purchase",f"product-order-{order_id}-debit",datetime.utcnow().isoformat()))
+        await db.commit()
+    token=await complete_product_order(order_id,"TELEGRAM_WALLET")
+    if token:
+        async with aiosqlite.connect(DB_PATH) as db: items=await (await db.execute("SELECT payload FROM product_inventory WHERE order_id=? ORDER BY id",(order_id,))).fetchall()
+        payload="\n\n".join(x[0] for x in items)
+        await call.message.answer(f"✅ خرید موفق؛ سفارش #{order_id}\n\nاطلاعات محصول شما:\n<code>{html.escape(payload)}</code>")
+    else:
+        await call.message.answer(f"✅ مبلغ از کیف پول کسر شد و سفارش #{order_id} ثبت شد. برای تحویل با پشتیبانی در ارتباط باشید.")
+    await call.answer("خرید ثبت شد")
+
+
+@router.callback_query(F.data == "tg_my_product_orders")
+async def telegram_my_product_orders(call: CallbackQuery):
+    async with aiosqlite.connect(DB_PATH) as db:
+        rows=await (await db.execute("SELECT id,product_name,quantity,status FROM product_orders WHERE user_id=? ORDER BY id DESC LIMIT 20",(call.from_user.id,))).fetchall()
+    if not rows:
+        await call.message.answer("سفارش دیجیتالی ندارید.")
+    else:
+        lines=["📦 سفارش‌های دیجیتال شما:"]
+        buttons=[]
+        for r in rows:
+            lines.append(f"#{r[0]} | {html.escape(r[1])} ×{r[2]} | {r[3]}")
+            if r[3] == "delivered": buttons.append([InlineKeyboardButton(text=f"دریافت دوباره سفارش #{r[0]}",callback_data=f"tg_order_{r[0]}")])
+        await call.message.answer("\n".join(lines),reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("tg_order_"))
+async def telegram_product_order_details(call: CallbackQuery):
+    try: oid=int(call.data.rsplit("_",1)[1])
+    except: await call.answer("سفارش نامعتبر است",show_alert=True); return
+    async with aiosqlite.connect(DB_PATH) as db:
+        order=await (await db.execute("SELECT product_name,status FROM product_orders WHERE id=? AND user_id=?",(oid,call.from_user.id))).fetchone()
+        items=await (await db.execute("SELECT payload FROM product_inventory WHERE order_id=? AND status='sold' ORDER BY id",(oid,))).fetchall() if order and order[1]=="delivered" else []
+    if not order or order[1]!="delivered" or not items:
+        await call.answer("اطلاعات تحویل در دسترس نیست",show_alert=True); return
+    payload="\n\n".join(x[0] for x in items)
+    await call.message.answer(f"📦 سفارش #{oid} - {html.escape(order[0])}\n<code>{html.escape(payload)}</code>")
+    await call.answer()
+
+
+@router.message(Command("shoporders"))
+async def telegram_shop_orders(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        rows = await (await db.execute("SELECT id,product_name,customer_name,mobile,amount_toman,status,ref_id FROM product_orders ORDER BY id DESC LIMIT 20")).fetchall()
+    if not rows:
+        await message.answer("هنوز سفارشی ثبت نشده است.")
+        return
+    lines = ["🧾 آخرین سفارش‌های فروشگاه:"]
+    for r in rows:
+        lines.append(f"#{r[0]} | {r[1]} ×{r[2]} | {r[3]} | {int(r[4]):,} تومان | {r[5]} | کد: {r[6] or '-'}")
+    await message.answer("\n".join(lines))
 
 
 @router.message(F.text == "🖥 سرورهای من")
@@ -3175,7 +3485,7 @@ async def show_server_details(call: CallbackQuery):
     remaining = max(0, included - total) if included else 0
     exp_text = row[7] or "نامشخص"
     try:
-        exp_text = datetime.fromisoformat(exp_text).strftime("%Y-%m-%d %H:%M UTC")
+        exp_text = (iran_time(exp_text).strftime("%Y-%m-%d %H:%M (به وقت ایران)") if iran_time(exp_text) else exp_text)
     except Exception:
         pass
     text = (
@@ -3204,12 +3514,15 @@ async def server_action(call: CallbackQuery):
     _, action, server_db_id = call.data.split("_")
     server_db_id = int(server_db_id)
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id, hetzner_id, name, provider_type, provider_id, deletion_pending_reason FROM servers WHERE id=?", (server_db_id,))
+        cur = await db.execute("SELECT user_id, hetzner_id, name, provider_type, provider_id, deletion_pending_reason, COALESCE(is_protected,0) FROM servers WHERE id=?", (server_db_id,))
         row = await cur.fetchone()
         if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
             await call.answer("دسترسی غیرمجاز", show_alert=True)
             return
         provider_type = row[3] or "hetzner"
+        if row[6] and action in ("off", "del"):
+            await call.answer("این سرور متعلق به ادمین و محافظت‌شده است.", show_alert=True)
+            return
         if row[5] and action != "del":
             await call.answer("این سرور در انتظار تأیید حذف است و تا تعیین تکلیف ادمین خاموش می‌ماند. برای تمدید از دکمه تمدید استفاده کنید.", show_alert=True)
             return
@@ -3272,10 +3585,13 @@ async def server_delete_approve(call: CallbackQuery):
         return
     sid = int(call.data.replace("delapprove_", ""))
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT hetzner_id, name, provider_type, deletion_pending_reason FROM servers WHERE id=?", (sid,))
+        cur = await db.execute("SELECT hetzner_id, name, provider_type, deletion_pending_reason, COALESCE(is_protected,0) FROM servers WHERE id=?", (sid,))
         row = await cur.fetchone()
         if not row or not row[3]:
             await call.answer("درخواست حذف پیدا نشد یا قبلاً تعیین تکلیف شده.", show_alert=True)
+            return
+        if row[4]:
+            await call.answer("این سرور محافظت‌شده است و حذف آن مجاز نیست.", show_alert=True)
             return
         token = await get_token_for_server(db, sid, row[2] or "hetzner")
     if not token:
@@ -3486,7 +3802,7 @@ async def server_renew_start(call: CallbackQuery):
         await call.answer("دسترسی غیرمجاز", show_alert=True)
         return
     owner_id, name, expires_at, monthly_price = row
-    if not expires_at or not monthly_price:
+    if not expires_at or monthly_price is None:
         await call.answer("این سرویس تحت سیستم تمدید خودکار نیست.", show_alert=True)
         return
     exp_dt = datetime.fromisoformat(expires_at)
@@ -3497,8 +3813,8 @@ async def server_renew_start(call: CallbackQuery):
         ]
     )
     await call.message.answer(
-        f"سرویس «{html.escape(name)}» تا تاریخ {exp_dt.strftime('%Y-%m-%d %H:%M')} (UTC) اعتبار دارد.\n"
-        f"هزینه تمدید {RENEWAL_PERIOD_DAYS} روز دیگر: {fmt_price(monthly_price)}",
+        f"سرویس «{html.escape(name)}» تا تاریخ {iran_time(exp_dt).strftime('%Y-%m-%d %H:%M')} (به وقت ایران) اعتبار دارد.\n"
+        f"هزینه تمدید {RENEWAL_PERIOD_DAYS} روز دیگر: {fmt_price(monthly_price) if monthly_price else 'رایگان'}",
         reply_markup=kb,
     )
     await call.answer()
@@ -3518,12 +3834,12 @@ async def server_renew_confirm(call: CallbackQuery):
             return
         owner_id, hetzner_id, name, expires_at, monthly_price, expired_off_at, provider_type, provider_id, traffic_off, deletion_pending_reason = row
         provider_type = provider_type or "hetzner"
-        if not expires_at or not monthly_price:
+        if not expires_at or monthly_price is None:
             await call.answer("این سرویس تحت سیستم تمدید خودکار نیست.", show_alert=True)
             return
-        cur2 = await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,))
-        bal_row = await cur2.fetchone()
-        if not bal_row or bal_row[0] < monthly_price:
+        cur2 = await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,)) if owner_id is not None else None
+        bal_row = await cur2.fetchone() if cur2 else None
+        if monthly_price > 0 and (not bal_row or bal_row[0] < monthly_price):
             await call.message.edit_text(
                 f"❌ موجودی کافی نیست. موجودی فعلی: {fmt_price(bal_row[0] if bal_row else 0)}\nلطفاً ابتدا کیف پول خود را شارژ کنید."
             )
@@ -3536,7 +3852,8 @@ async def server_renew_confirm(call: CallbackQuery):
             base = now
         new_expiry = base + timedelta(days=RENEWAL_PERIOD_DAYS)
         was_expired_off = bool(expired_off_at)
-        await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=?", (monthly_price, owner_id))
+        if monthly_price > 0 and owner_id is not None:
+            await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=?", (monthly_price, owner_id))
         await db.execute(
             "UPDATE servers SET expires_at=?, expired_powered_off_at=NULL, traffic_powered_off=0, deletion_pending_reason=NULL, deletion_requested_at=NULL, deletion_notified=0, traffic_limit_reviewed_at=CASE WHEN ? LIKE '%ترافیک%' OR ? LIKE '%حجم%' THEN ? ELSE traffic_limit_reviewed_at END WHERE id=?",
             (new_expiry.isoformat(), deletion_pending_reason or "", deletion_pending_reason or "", datetime.utcnow().isoformat(), server_db_id),
@@ -3549,7 +3866,7 @@ async def server_renew_confirm(call: CallbackQuery):
             pass
     poweron_note = "\n▶️ سرور مجدداً روشن شد." if was_expired_off else ""
     await call.message.edit_text(
-        f"✅ سرویس «{html.escape(name)}» با موفقیت تمدید شد.\nمهلت جدید: {new_expiry.strftime('%Y-%m-%d %H:%M')} (UTC){poweron_note}"
+        f"✅ سرویس «{html.escape(name)}» با موفقیت تمدید شد.\nمهلت جدید: {iran_time(new_expiry).strftime('%Y-%m-%d %H:%M')} (به وقت ایران){poweron_note}"
     )
     await call.answer()
 
@@ -3788,7 +4105,7 @@ async def sync_hetzner_servers(db, api: "HetznerAPI", provider_id=None):
     except Exception as exc:
         logger.warning("Could not sync Hetzner provider %s: %s", provider_id, exc)
         return 0
-    cur = await db.execute("SELECT id, hetzner_id FROM servers WHERE provider_type='hetzner' AND provider_id IS ? AND user_id IS NULL", (provider_id,))
+    cur = await db.execute("SELECT id, hetzner_id FROM servers WHERE provider_type='hetzner' AND provider_id IS ? AND (user_id IS NULL OR source='external')", (provider_id,))
     known_rows = await cur.fetchall()
     known_ids = {r[1] for r in known_rows}
     live_ids = {server["id"] for server in hz_servers}
@@ -3799,13 +4116,27 @@ async def sync_hetzner_servers(db, api: "HetznerAPI", provider_id=None):
         loc = (server.get("datacenter") or {}).get("location", {}).get("name", "-")
         server_created = server.get("created") or datetime.utcnow().isoformat()
         if sid in known_ids:
-            await db.execute("UPDATE servers SET name=?, ip=?, location=?, status=?, created_at=? WHERE provider_type='hetzner' AND provider_id IS ? AND hetzner_id=? AND user_id IS NULL", (server.get("name"), ip, loc, server.get("status", "unknown"), server_created, provider_id, sid))
+            try:
+                created_dt = datetime.fromisoformat(str(server_created).replace("Z", "+00:00"))
+                if created_dt.tzinfo:
+                    created_dt = created_dt.astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception:
+                created_dt = datetime.utcnow()
+            expiry = (created_dt + timedelta(days=RENEWAL_PERIOD_DAYS)).isoformat()
+            await db.execute("UPDATE servers SET name=?, ip=?, location=?, status=?, created_at=?, user_id=COALESCE(user_id,?), expires_at=COALESCE(expires_at,?), monthly_price=COALESCE(monthly_price,0), is_admin_owned=0, is_protected=0, source='external' WHERE provider_type='hetzner' AND provider_id IS ? AND hetzner_id=? AND (user_id IS NULL OR source='external')", (server.get("name"), ip, loc, server.get("status", "unknown"), server_created, ADMIN_IDS[0] if ADMIN_IDS else None, expiry, provider_id, sid))
             continue
-        await db.execute("INSERT INTO servers (user_id, hetzner_id, name, ip, location, plan_title, os_image, root_password, status, created_at, provider_id, provider_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,'hetzner')", (None, sid, server.get("name"), ip, loc, "ساخته‌شده خارج از ربات", (server.get("image") or {}).get("name", "-"), "-", server.get("status", "unknown"), server_created, provider_id))
+        try:
+            created_dt = datetime.fromisoformat(str(server_created).replace("Z", "+00:00"))
+            if created_dt.tzinfo:
+                created_dt = created_dt.astimezone(timezone.utc).replace(tzinfo=None)
+        except Exception:
+            created_dt = datetime.utcnow()
+        expiry = (created_dt + timedelta(days=RENEWAL_PERIOD_DAYS)).isoformat()
+        await db.execute("INSERT INTO servers (user_id, hetzner_id, name, ip, location, plan_title, os_image, root_password, status, created_at, expires_at, monthly_price, provider_id, provider_type, is_admin_owned, is_protected, source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'hetzner',0,0,'external')", (ADMIN_IDS[0] if ADMIN_IDS else None, sid, server.get("name"), ip, loc, "ساخته‌شده خارج از ربات", (server.get("image") or {}).get("name", "-"), "-", server.get("status", "unknown"), server_created, expiry, 0, provider_id))
         added += 1
     for local_id, sid in known_rows:
         if sid not in live_ids:
-            await db.execute("DELETE FROM servers WHERE id=? AND user_id IS NULL", (local_id,))
+            await db.execute("DELETE FROM servers WHERE id=? AND source='external'", (local_id,))
     await db.commit()
     return added
 
@@ -4051,11 +4382,12 @@ async def adm_direct_confirm(call: CallbackQuery, state: FSMContext):
     ip = extract_server_ip("hetzner", server)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO servers (user_id, hetzner_id, name, ip, location, plan_title, os_image, root_password, status, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO servers (user_id, hetzner_id, name, ip, location, plan_title, os_image, root_password, status, created_at, expires_at, monthly_price, is_admin_owned, is_protected, source) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,1,'admin')",
             (
                 call.from_user.id, server["id"], server_name, ip, data["location"], "ادمین (رایگان)",
                 data["image"], root_password, "running", datetime.utcnow().isoformat(),
+                (datetime.utcnow() + timedelta(days=RENEWAL_PERIOD_DAYS)).isoformat(), 0,
             ),
         )
         await db.commit()
@@ -4069,6 +4401,57 @@ async def adm_direct_confirm(call: CallbackQuery, state: FSMContext):
 # ---------------------------------------------------------------------------
 # پنل ادمین: مدیریت چند API Key هتزنر
 # ---------------------------------------------------------------------------
+async def refund_web_server_wallet(order_id: int, failure_status: str = "payment_failed"):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        row=await (await db.execute("SELECT user_id,wallet_used_usd,wallet_refunded,status FROM web_server_orders WHERE id=?",(order_id,))).fetchone()
+        if row and row[3] not in ("completed",):
+            if row[0] and row[1] and not row[2]:
+                await db.execute("UPDATE users SET balance=balance+? WHERE telegram_id=?",(float(row[1]),row[0]))
+                await db.execute("INSERT OR IGNORE INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",(row[0],float(row[1]),"refund",f"web-server-{order_id}-refund",datetime.utcnow().isoformat()))
+            status = failure_status if failure_status in ("payment_failed", "creation_failed") else "payment_failed"
+            await db.execute("UPDATE web_server_orders SET wallet_refunded=1,status=? WHERE id=?",(status,order_id))
+        await db.commit()
+
+
+async def complete_web_server_order(order_id: int, reference: str = ""):
+    """Create a paid web server order exactly once and persist it without charging wallet twice."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        row=await (await db.execute("SELECT user_id,provider_type,location,plan_id,plan_title,server_type,image,price_usd,status FROM web_server_orders WHERE id=?",(order_id,))).fetchone()
+        if not row or row[8] != "pending_payment":
+            await db.commit(); return None
+        await db.execute("UPDATE web_server_orders SET status='creating',paid_at=? WHERE id=?",(datetime.utcnow().isoformat(),order_id))
+        await db.commit()
+    user_id,ptype,location,plan_id,plan_title,server_type,image,price,_=row
+    server_name=f"srv-{user_id}-{secrets.token_hex(3)}"; order_ref=secrets.token_hex(8); provider_id=None
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            providers=await get_active_providers(db,ptype)
+            cur=await db.execute("SELECT markup_percent FROM plans WHERE id=?",(plan_id,)); await cur.fetchone()
+        if not providers: raise RuntimeError("هیچ API فعالی برای این سرویس‌دهنده وجود ندارد")
+        if ptype=="hetzner":
+            created=await create_hetzner_server_with_failover(providers,server_name=server_name,server_type=server_type,image=image,location=location,order_ref=order_ref)
+            server,root_password=created["server"],created["root_password"]; provider_id=created["provider_id"]; ptype="hetzner"; image=created.get("image") or image; server_name=server.get("name") or server_name
+        else:
+            provider_id,token=providers[0]; api=make_provider_api(ptype,token)
+            server,root_password=await api.create_server(name=server_name,server_type=server_type,image=image,location=location)
+        if not root_password: root_password="از طریق بخش مدیریت سرورها امکان تغییر رمز وجود دارد"
+        ip=extract_server_ip(ptype,server); expires=(datetime.utcnow()+timedelta(days=30)).isoformat()
+        data={"location":location,"plan_title":plan_title}
+        server_db_id=await _save_purchase(user_id,server,server_name,ip,root_password,image,data,float(price),expires,ptype,provider_id,charge_wallet=False)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE web_server_orders SET status='completed',server_db_id=? WHERE id=?",(server_db_id,order_id)); await db.commit()
+        return server_db_id
+    except Exception as exc:
+        logger.exception("Paid web server order %s failed during creation",order_id)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE web_server_orders SET status='creation_failed' WHERE id=?",(order_id,)); await db.commit()
+        await refund_web_server_wallet(order_id, failure_status="creation_failed")
+        logger.critical("Web server order %s paid but creation failed for user %s: %s", order_id, user_id, str(exc)[:500])
+        return None
+
+
 async def get_setting_for_provider_type(provider_type):
     async with aiosqlite.connect(DB_PATH) as db:
         return await get_setting(db, f"priority_provider_{provider_type}")
@@ -4703,7 +5086,7 @@ async def check_traffic_usage(bot: Bot):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT id, user_id, hetzner_id, name, traffic_powered_off, provider_type, traffic_limit_reviewed_at FROM servers "
-            "WHERE hetzner_id IS NOT NULL AND user_id IS NOT NULL AND provider_type='hetzner'"
+            "WHERE hetzner_id IS NOT NULL AND user_id IS NOT NULL AND provider_type='hetzner' AND COALESCE(is_protected,0)=0"
         )
         rows = await cur.fetchall()
     for server_db_id, user_id, hetzner_id, name, traffic_off, provider_type, traffic_reviewed_at in rows:
@@ -4743,7 +5126,7 @@ async def check_traffic_usage(bot: Bot):
                 )
             except Exception:
                 pass
-        hard_limit = included if included > 0 else int(20 * 1_000_000_000_000)
+        hard_limit = min(included, TRAFFIC_INCLUDED_BYTES) if included > 0 else TRAFFIC_INCLUDED_BYTES
         if total_bytes < TRAFFIC_SOFT_LIMIT_BYTES and traffic_reviewed_at:
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("UPDATE servers SET traffic_limit_reviewed_at=NULL WHERE id=?", (server_db_id,))
@@ -4757,17 +5140,15 @@ async def check_expirations(bot: Bot):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT id, user_id, hetzner_id, name, expires_at, expired_powered_off_at, provider_type FROM servers "
-            "WHERE expires_at IS NOT NULL AND user_id IS NOT NULL"
+            "WHERE expires_at IS NOT NULL AND user_id IS NOT NULL AND COALESCE(is_protected,0)=0"
         )
         rows = await cur.fetchall()
-        tokens_by_type = {}
-        for ptype in ("hetzner", "digitalocean", "vultr", "gcore"):
-            tokens_by_type[ptype] = await get_active_token_for(db, ptype)
     if not rows:
         return
     for server_db_id, user_id, hetzner_id, name, expires_at, expired_off_at, provider_type in rows:
         provider_type = provider_type or "hetzner"
-        token = tokens_by_type.get(provider_type)
+        async with aiosqlite.connect(DB_PATH) as db:
+            token = await get_token_for_server(db, server_db_id, provider_type)
         api = make_provider_api(provider_type, token) if token else None
         try:
             exp_dt = datetime.fromisoformat(expires_at)
