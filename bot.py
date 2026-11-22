@@ -75,10 +75,10 @@ def iran_time(value):
     except Exception:
         return None
 
-TRAFFIC_SOFT_LIMIT_BYTES = int(19.5 * 1_000_000_000_000)  # ۱۹.۵ ترابایت -> خاموش‌سازی هشداری
+TRAFFIC_SOFT_LIMIT_BYTES = int(19.5 * 1_000_000_000_000)  # هشدار اولیه در ۱۹.۵ ترابایت
 EXPIRY_REMINDER_HOURS_BEFORE = 48   # چند ساعت قبل از پایان مهلت، یادآوری تمدید ارسال شود
 EXPIRY_GRACE_HOURS = 2               # چند ساعت بعد از پایان مهلت، قبل از حذف کامل سرور صبر شود
-MAINTENANCE_INTERVAL_SECONDS = 6 * 3600  # فاصله چک ترافیک/مهلت (هر ۶ ساعت)
+MAINTENANCE_INTERVAL_SECONDS = 15 * 60  # بررسی مصرف و مهلت هر ۱۵ دقیقه
 DEFAULT_EUR_USD_RATE = 1.08  # فقط در صورتی که دریافت نرخ زنده ناموفق باشد
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -272,6 +272,10 @@ async def init_db():
         await _safe_add_column(db, "servers", "traffic_included_bytes INTEGER DEFAULT 0")
         await _safe_add_column(db, "servers", "traffic_synced_at TEXT")
         await _safe_add_column(db, "servers", "traffic_limit_reviewed_at TEXT")
+        await _safe_add_column(db, "servers", "expiry_reminder_sent INTEGER DEFAULT 0")
+        await _safe_add_column(db, "servers", "traffic_warning_sent INTEGER DEFAULT 0")
+        await _safe_add_column(db, "servers", "admin_reactivated INTEGER DEFAULT 0")
+        await db.execute("UPDATE servers SET traffic_included_bytes=? WHERE hetzner_id IS NOT NULL", (TRAFFIC_INCLUDED_BYTES,))
         await _safe_add_column(db, "servers", "is_admin_owned INTEGER DEFAULT 0")
         await _safe_add_column(db, "servers", "is_protected INTEGER DEFAULT 0")
         await _safe_add_column(db, "servers", "source TEXT DEFAULT 'bot'")
@@ -365,7 +369,7 @@ async def sync_server_usage(db, server_db_id, api):
     live = await api.get_server(row[0])
     incoming = int(live.get("ingoing_traffic") or 0)
     outgoing = int(live.get("outgoing_traffic") or 0)
-    included = int(live.get("included_traffic") or 0)
+    included = TRAFFIC_INCLUDED_BYTES
     await db.execute(
         "UPDATE servers SET traffic_in_bytes=?, traffic_out_bytes=?, traffic_included_bytes=?, traffic_synced_at=? WHERE id=?",
         (incoming, outgoing, included, datetime.utcnow().isoformat(), server_db_id),
@@ -410,7 +414,8 @@ async def request_server_deletion(bot, server_db_id, reason):
         try:
             await bot.send_message(
                 owner_id,
-                f"⚠️ سرور «{name}» خاموش شده و درخواست حذف/تمدید به ادمین ارسال شد.\\nعلت: {reason}\\nتا تصمیم ادمین، سرور حذف نخواهد شد.",
+                f"⚠️ سرور «{name}» خاموش شده و درخواست بررسی برای ادمین ارسال شد.\nعلت: {reason}\nمی‌توانید تمدید یا درخواست حذف را انتخاب کنید.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏳ تمدید", callback_data=f"sv_renew_{server_db_id}")],[InlineKeyboardButton(text="🗑 درخواست حذف", callback_data=f"sv_del_{server_db_id}")]]),
             )
         except Exception:
             pass
@@ -1632,6 +1637,7 @@ async def complete_product_order(order_id: int, reference: str = ""):
                 if cur.rowcount != 1:
                     await db.rollback(); return None
             await db.execute("UPDATE products SET stock=(SELECT COUNT(*) FROM product_inventory WHERE product_id=? AND status='available') WHERE id=?", (pid, pid))
+            await db.execute("DELETE FROM products WHERE id=? AND stock<=0", (pid,))
             token = secrets.token_urlsafe(32)
             token_hash = hashlib.sha256(token.encode()).hexdigest()
             await db.execute("UPDATE product_orders SET status='delivered',ref_id=?,paid_at=?,delivery_token_hash=? WHERE id=?", (reference, now, token_hash, order_id))
@@ -3203,22 +3209,26 @@ async def _buy_confirm_impl(call: CallbackQuery, state: FSMContext):
 # ---------------------------------------------------------------------------
 # سرورهای من (کاربر) - و پایه مشترک برای پنل ادمین
 # ---------------------------------------------------------------------------
-def server_actions_kb(server_id: int, back_callback: str = "my_servers_list"):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="▶️ روشن", callback_data=f"sv_on_{server_id}"),
-             InlineKeyboardButton(text="⏹ خاموش", callback_data=f"sv_off_{server_id}"),
-             InlineKeyboardButton(text="🔄 ریبوت", callback_data=f"sv_reboot_{server_id}")],
-            [InlineKeyboardButton(text="🔑 تغییر پسورد", callback_data=f"sv_pass_{server_id}"),
-             InlineKeyboardButton(text="🛠 نصب مجدد", callback_data=f"sv_rebuild_{server_id}")],
-            [InlineKeyboardButton(text="🌐 تغییر IP", callback_data=f"sv_ipchange_{server_id}"),
-             InlineKeyboardButton(text="⏳ تمدید", callback_data=f"sv_renew_{server_id}")],
-            [InlineKeyboardButton(text="📊 نمایش زمان و حجم", callback_data=f"svstats_{server_id}")],
-            [InlineKeyboardButton(text="🗑 درخواست حذف", callback_data=f"sv_del_{server_id}")],
-            *([[InlineKeyboardButton(text="👤 تعیین / انتقال مالکیت", callback_data=f"admsvowner_{server_id}")]] if back_callback == "adm_servers" else []),
+def server_actions_kb(server_id: int, back_callback: str = "my_servers_list", restricted: bool = False):
+    if restricted and back_callback != "adm_servers":
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏳ تمدید", callback_data=f"sv_renew_{server_id}"),
+             InlineKeyboardButton(text="🗑 درخواست حذف", callback_data=f"sv_del_{server_id}")],
             [InlineKeyboardButton(text="🔙 بازگشت به فهرست", callback_data=back_callback)],
-        ]
-    )
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▶️ روشن", callback_data=f"sv_on_{server_id}"),
+         InlineKeyboardButton(text="⏹ خاموش", callback_data=f"sv_off_{server_id}"),
+         InlineKeyboardButton(text="🔄 ریبوت", callback_data=f"sv_reboot_{server_id}")],
+        [InlineKeyboardButton(text="🔑 تغییر پسورد", callback_data=f"sv_pass_{server_id}"),
+         InlineKeyboardButton(text="🛠 نصب مجدد", callback_data=f"sv_rebuild_{server_id}")],
+        [InlineKeyboardButton(text="🌐 تغییر IP", callback_data=f"sv_ipchange_{server_id}"),
+         InlineKeyboardButton(text="⏳ تمدید", callback_data=f"sv_renew_{server_id}")],
+        [InlineKeyboardButton(text="📊 نمایش زمان و حجم", callback_data=f"svstats_{server_id}")],
+        [InlineKeyboardButton(text="🗑 درخواست حذف", callback_data=f"sv_del_{server_id}")],
+        *([[InlineKeyboardButton(text="👤 تعیین / انتقال مالکیت", callback_data=f"admsvowner_{server_id}")]] if back_callback == "adm_servers" else []),
+        [InlineKeyboardButton(text="🔙 بازگشت به فهرست", callback_data=back_callback)],
+    ])
 
 
 @router.message(Command("shop"))
@@ -3226,22 +3236,57 @@ def server_actions_kb(server_id: int, back_callback: str = "my_servers_list"):
 async def telegram_shop(message: Message):
     async with aiosqlite.connect(DB_PATH) as db:
         await ensure_user(db,message.from_user.id,message.from_user.username,message.from_user.full_name)
+        cats = await (await db.execute("SELECT id,name FROM product_categories WHERE active=1 ORDER BY name")).fetchall()
         rows = await (await db.execute("SELECT id,name,price_usd,stock FROM products WHERE active=1 AND stock>0 ORDER BY id DESC LIMIT 30")).fetchall()
-        rate=float(await get_setting(db,"wallet_usd_to_toman","100000") or 100000)
-    if not rows:
-        await message.answer("در حال حاضر محصول فعالی برای فروش وجود ندارد.")
-        return
-    buttons=[]
-    base=os.getenv("PUBLIC_BASE_URL","").rstrip("/")
+    buttons = [[InlineKeyboardButton(text=f"📂 {name}", callback_data=f"tgcat_{cid}")] for cid,name in cats]
+    base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
     for pid,name,price,stock in rows:
-        buttons.append([InlineKeyboardButton(text=f"🛍 {name[:24]} · ${float(price):.2f}",callback_data=f"tgprod_{pid}")])
+        buttons.append([InlineKeyboardButton(text=f"🛍 {name[:24]} · ${float(price):.2f}", callback_data=f"tgprod_{pid}")])
         if base:
-            raw=secrets.token_urlsafe(24); digest=hashlib.sha256(raw.encode()).hexdigest()
+            raw = secrets.token_urlsafe(24)
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("INSERT INTO customer_web_tokens(token_hash,telegram_id,redirect_path,expires_at) VALUES(?,?,?,?)",(digest,message.from_user.id,f"/shop/{pid}",(datetime.utcnow()+timedelta(minutes=15)).isoformat())); await db.commit()
-            buttons.append([InlineKeyboardButton(text="💳 پرداخت کامل / ترکیبی در سایت",url=f"{base}/auth/telegram/link/{raw}")])
-    buttons.append([InlineKeyboardButton(text="📦 سفارش‌های دیجیتال من",callback_data="tg_my_product_orders")])
-    await message.answer("🛍 محصولات فروشگاه\nبرای مشاهده جزئیات و خرید انتخاب کنید. پرداخت ترکیبی یا درگاه از طریق لینک امن سایت در دسترس است.",reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+                await db.execute("INSERT INTO customer_web_tokens(token_hash,telegram_id,redirect_path,expires_at) VALUES(?,?,?,?)", (hashlib.sha256(raw.encode()).hexdigest(),message.from_user.id,f"/shop/{pid}",(datetime.utcnow()+timedelta(minutes=15)).isoformat()))
+                await db.commit()
+            buttons.append([InlineKeyboardButton(text="💳 پرداخت ترکیبی / درگاه", url=f"{base}/auth/telegram/link/{raw}")])
+    buttons.append([InlineKeyboardButton(text="📦 سفارش‌های دیجیتال من", callback_data="tg_my_product_orders")])
+    await message.answer("🛍 فروشگاه اکانت\nدسته‌بندی‌ها حتی در صورت اتمام موجودی نیز نمایش داده می‌شوند:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("tgcat_"))
+async def telegram_category_products(call: CallbackQuery):
+    try: cid = int(call.data.split("_",1)[1])
+    except Exception:
+        await call.answer("دسته‌بندی نامعتبر", show_alert=True); return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cat = await (await db.execute("SELECT name FROM product_categories WHERE id=? AND active=1", (cid,))).fetchone()
+        rows = await (await db.execute("SELECT id,name,price_usd,stock FROM products WHERE category_id=? AND active=1 AND stock>0 ORDER BY id DESC", (cid,))).fetchall()
+    if not cat:
+        await call.answer("دسته‌بندی پیدا نشد", show_alert=True); return
+    buttons = [[InlineKeyboardButton(text=f"🛍 {name[:24]} · ${float(price):.2f}", callback_data=f"tgprod_{pid}")] for pid,name,price,stock in rows]
+    if not buttons: buttons = []
+    buttons.append([InlineKeyboardButton(text="🔙 بازگشت به دسته‌بندی‌ها", callback_data="tg_shop_home")])
+    await call.message.edit_text(f"📂 {cat[0]}\nمحصولات موجود:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await call.answer()
+
+
+@router.callback_query(F.data == "tg_shop_home")
+async def telegram_shop_home_callback(call: CallbackQuery):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cats = await (await db.execute("SELECT id,name FROM product_categories WHERE active=1 ORDER BY name")).fetchall()
+        rows = await (await db.execute("SELECT id,name,price_usd,stock FROM products WHERE active=1 AND stock>0 ORDER BY id DESC LIMIT 30")).fetchall()
+    buttons = [[InlineKeyboardButton(text=f"📂 {name}", callback_data=f"tgcat_{cid}")] for cid,name in cats]
+    base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+    for pid,name,price,stock in rows:
+        buttons.append([InlineKeyboardButton(text=f"🛍 {name[:24]} · ${float(price):.2f}", callback_data=f"tgprod_{pid}")])
+        if base:
+            raw = secrets.token_urlsafe(24)
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("INSERT INTO customer_web_tokens(token_hash,telegram_id,redirect_path,expires_at) VALUES(?,?,?,?)", (hashlib.sha256(raw.encode()).hexdigest(),call.from_user.id,f"/shop/{pid}",(datetime.utcnow()+timedelta(minutes=15)).isoformat()))
+                await db.commit()
+            buttons.append([InlineKeyboardButton(text="💳 پرداخت ترکیبی / درگاه", url=f"{base}/auth/telegram/link/{raw}")])
+    buttons.append([InlineKeyboardButton(text="📦 سفارش‌های دیجیتال من", callback_data="tg_my_product_orders")])
+    await call.message.edit_text("🛍 فروشگاه اکانت", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await call.answer()
 
 
 @router.callback_query(F.data.startswith("tgprod_"))
@@ -3465,7 +3510,7 @@ async def server_stats_sync(call: CallbackQuery):
             live = await make_provider_api(row[2] or "hetzner", token).get_server(row[1])
             incoming = int(live.get("ingoing_traffic") or 0)
             outgoing = int(live.get("outgoing_traffic") or 0)
-            included = int(live.get("included_traffic") or 0)
+            included = TRAFFIC_INCLUDED_BYTES
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("UPDATE servers SET traffic_in_bytes=?, traffic_out_bytes=?, traffic_included_bytes=?, traffic_synced_at=? WHERE id=?", (incoming, outgoing, included, datetime.utcnow().isoformat(), sid))
                 await db.commit()
@@ -3502,7 +3547,7 @@ async def show_server_details(call: CallbackQuery):
             status = status_map.get(raw_status, raw_status)
             incoming = int(live_server.get("ingoing_traffic") or 0)
             outgoing = int(live_server.get("outgoing_traffic") or 0)
-            included = int(live_server.get("included_traffic") or 0)
+            included = TRAFFIC_INCLUDED_BYTES
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute(
                     "UPDATE servers SET status=?, traffic_in_bytes=?, traffic_out_bytes=?, traffic_included_bytes=?, traffic_synced_at=? WHERE id=?",
@@ -3528,8 +3573,20 @@ async def show_server_details(call: CallbackQuery):
     )
     if row[12]:
         text += f"\\n⚠️ درخواست حذف در انتظار ادمین: {row[12]}"
-    await call.message.edit_text(text, reply_markup=server_actions_kb(sid, "adm_servers" if is_admin(call.from_user.id) else "my_servers_list"))
+    await call.message.edit_text(text, reply_markup=server_actions_kb(sid, "adm_servers" if is_admin(call.from_user.id) else "my_servers_list", restricted=bool(row[12]) or bool(row[7] and row[7] <= datetime.utcnow().isoformat())))
     await call.answer()
+
+
+async def _server_is_expired(db, server_db_id):
+    row = await (await db.execute("SELECT expires_at, deletion_pending_reason FROM servers WHERE id=?", (server_db_id,))).fetchone()
+    if not row:
+        return True
+    if row[1]:
+        return True
+    try:
+        return bool(row[0] and datetime.fromisoformat(row[0]) <= datetime.utcnow())
+    except Exception:
+        return False
 
 
 @router.callback_query(
@@ -3544,17 +3601,21 @@ async def server_action(call: CallbackQuery):
     _, action, server_db_id = call.data.split("_")
     server_db_id = int(server_db_id)
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id, hetzner_id, name, provider_type, provider_id, deletion_pending_reason, COALESCE(is_protected,0) FROM servers WHERE id=?", (server_db_id,))
+        cur = await db.execute("SELECT user_id, hetzner_id, name, provider_type, provider_id, deletion_pending_reason, COALESCE(is_protected,0), expires_at FROM servers WHERE id=?", (server_db_id,))
         row = await cur.fetchone()
         if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
             await call.answer("دسترسی غیرمجاز", show_alert=True)
             return
         provider_type = row[3] or "hetzner"
+        expired_now = False
+        try: expired_now = bool(row[7] and datetime.fromisoformat(row[7]) <= datetime.utcnow())
+        except Exception: pass
+        restricted_now = bool(row[5]) or expired_now
         if row[6] and action in ("off", "del"):
             await call.answer("این سرور متعلق به ادمین و محافظت‌شده است.", show_alert=True)
             return
-        if row[5] and action != "del":
-            await call.answer("این سرور در انتظار تأیید حذف است و تا تعیین تکلیف ادمین خاموش می‌ماند. برای تمدید از دکمه تمدید استفاده کنید.", show_alert=True)
+        if restricted_now and action != "del" and not is_admin(call.from_user.id):
+            await call.answer("این سرور به علت پایان مهلت/حجم محدود شده است؛ فقط تمدید یا درخواست حذف مجاز است.", show_alert=True)
             return
         token = await get_token_for_server(db, server_db_id, provider_type)
     if not token:
@@ -3565,6 +3626,10 @@ async def server_action(call: CallbackQuery):
     try:
         if action == "on":
             await api.power_action(hetzner_id, "poweron")
+            if is_admin(call.from_user.id) and restricted_now:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("UPDATE servers SET admin_reactivated=1,deletion_pending_reason=NULL,deletion_requested_at=NULL,deletion_notified=0,expired_powered_off_at=NULL,status='running' WHERE id=?", (server_db_id,))
+                    await db.commit()
             await call.answer("✅ دستور روشن کردن ارسال شد")
         elif action == "off":
             await api.power_action(hetzner_id, "poweroff")
@@ -3653,7 +3718,7 @@ async def server_delete_cancel(call: CallbackQuery):
             return
         token = await get_token_for_server(db, sid, row[3] or "hetzner")
         await db.execute(
-            "UPDATE servers SET deletion_pending_reason=NULL, deletion_requested_at=NULL, deletion_notified=0, traffic_limit_reviewed_at=CASE WHEN deletion_pending_reason LIKE '%حجم%' OR deletion_pending_reason LIKE '%ترافیک%' THEN ? ELSE traffic_limit_reviewed_at END WHERE id=?",
+            "UPDATE servers SET deletion_pending_reason=NULL, deletion_requested_at=NULL, deletion_notified=0, expiry_reminder_sent=0, traffic_warning_sent=0, admin_reactivated=0, traffic_limit_reviewed_at=CASE WHEN deletion_pending_reason LIKE '%حجم%' OR deletion_pending_reason LIKE '%ترافیک%' THEN ? ELSE traffic_limit_reviewed_at END WHERE id=?",
             (datetime.utcnow().isoformat(), sid),
         )
         await db.commit()
@@ -3869,7 +3934,7 @@ async def server_renew_confirm(call: CallbackQuery):
             return
         cur2 = await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,)) if owner_id is not None else None
         bal_row = await cur2.fetchone() if cur2 else None
-        if monthly_price > 0 and (not bal_row or bal_row[0] < monthly_price):
+        if monthly_price > 0 and (not bal_row or bal_row[0] < monthly_price) and not is_admin(call.from_user.id):
             await call.message.edit_text(
                 f"❌ موجودی کافی نیست. موجودی فعلی: {fmt_price(bal_row[0] if bal_row else 0)}\nلطفاً ابتدا کیف پول خود را شارژ کنید."
             )
@@ -3882,10 +3947,10 @@ async def server_renew_confirm(call: CallbackQuery):
             base = now
         new_expiry = base + timedelta(days=RENEWAL_PERIOD_DAYS)
         was_expired_off = bool(expired_off_at)
-        if monthly_price > 0 and owner_id is not None:
+        if monthly_price > 0 and owner_id is not None and bal_row and bal_row[0] >= monthly_price:
             await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=?", (monthly_price, owner_id))
         await db.execute(
-            "UPDATE servers SET expires_at=?, expired_powered_off_at=NULL, traffic_powered_off=0, deletion_pending_reason=NULL, deletion_requested_at=NULL, deletion_notified=0, traffic_limit_reviewed_at=CASE WHEN ? LIKE '%ترافیک%' OR ? LIKE '%حجم%' THEN ? ELSE traffic_limit_reviewed_at END WHERE id=?",
+            "UPDATE servers SET expires_at=?, expired_powered_off_at=NULL, traffic_powered_off=0, deletion_pending_reason=NULL, deletion_requested_at=NULL, deletion_notified=0, expiry_reminder_sent=0, traffic_warning_sent=0, admin_reactivated=0, traffic_limit_reviewed_at=CASE WHEN ? LIKE '%ترافیک%' OR ? LIKE '%حجم%' THEN ? ELSE traffic_limit_reviewed_at END WHERE id=?",
             (new_expiry.isoformat(), deletion_pending_reason or "", deletion_pending_reason or "", datetime.utcnow().isoformat(), server_db_id),
         )
         await db.commit()
@@ -5162,116 +5227,66 @@ async def adm_broadcast_send(message: Message, state: FSMContext):
 # نگهداری خودکار: هر ۶ ساعت چک ترافیک مصرفی و مهلت سرویس‌ها
 # ---------------------------------------------------------------------------
 async def check_traffic_usage(bot: Bot):
+    """سقف فروشگاه دقیقاً ۲۰ ترابایت است؛ ۱۹.۵ ترابایت فقط هشدار می‌دهد."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT id, user_id, hetzner_id, name, traffic_powered_off, provider_type, traffic_limit_reviewed_at FROM servers "
-            "WHERE hetzner_id IS NOT NULL AND user_id IS NOT NULL AND provider_type='hetzner' AND COALESCE(is_protected,0)=0"
-        )
-        rows = await cur.fetchall()
-    for server_db_id, user_id, hetzner_id, name, traffic_off, provider_type, traffic_reviewed_at in rows:
+        rows = await (await db.execute(
+            "SELECT id,user_id,hetzner_id,name,traffic_warning_sent,provider_type FROM servers "
+            "WHERE hetzner_id IS NOT NULL AND user_id IS NOT NULL AND COALESCE(is_protected,0)=0 AND COALESCE(admin_reactivated,0)=0 AND deletion_pending_reason IS NULL"
+        )).fetchall()
+    for sid, owner_id, remote_id, name, warning_sent, ptype in rows:
         async with aiosqlite.connect(DB_PATH) as db:
-            token = await get_token_for_server(db, server_db_id, provider_type or "hetzner")
+            token = await get_token_for_server(db, sid, ptype or "hetzner")
         if not token:
             continue
-        api = HetznerAPI(token)
+        api = make_provider_api(ptype or "hetzner", token)
         try:
-            server = await api.get_server(hetzner_id)
-        except Exception:
+            live = await api.get_server(remote_id)
+            incoming = int(live.get("ingoing_traffic") or 0)
+            outgoing = int(live.get("outgoing_traffic") or 0)
+            total = incoming + outgoing
+        except Exception as exc:
+            logger.warning("Traffic sync failed for server %s: %s", sid, exc)
             continue
-        incoming = int(server.get("ingoing_traffic") or 0)
-        outgoing = int(server.get("outgoing_traffic") or 0)
-        total_bytes = incoming + outgoing
-        included = int(server.get("included_traffic") or 0)
+        now = datetime.utcnow().isoformat()
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE servers SET traffic_in_bytes=?, traffic_out_bytes=?, traffic_included_bytes=?, traffic_synced_at=? WHERE id=?",
-                (incoming, outgoing, included, datetime.utcnow().isoformat(), server_db_id),
-            )
+            await db.execute("UPDATE servers SET traffic_in_bytes=?,traffic_out_bytes=?,traffic_included_bytes=?,traffic_synced_at=? WHERE id=?", (incoming,outgoing,TRAFFIC_INCLUDED_BYTES,now,sid))
+            if total >= TRAFFIC_SOFT_LIMIT_BYTES and not warning_sent:
+                await db.execute("UPDATE servers SET traffic_warning_sent=1 WHERE id=?", (sid,))
             await db.commit()
-        # Soft limit: power off at 19.5 TB, but never delete automatically.
-        if total_bytes >= TRAFFIC_SOFT_LIMIT_BYTES and not traffic_off and not traffic_reviewed_at:
-            try:
-                await api.power_action(hetzner_id, "poweroff")
-            except Exception:
-                pass
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE servers SET traffic_powered_off=1, status='off' WHERE id=?", (server_db_id,))
-                await db.commit()
-            try:
-                await bot.send_message(
-                    user_id,
-                    f"⚠️ سرور «{name}» به حد هشدار ترافیک ({format_bytes(total_bytes)}) رسیده و خاموش شده است. "
-                    "در صورت رسیدن به حجم مجاز، حذف فقط پس از تأیید ادمین انجام خواهد شد.",
-                )
-            except Exception:
-                pass
-        hard_limit = min(included, TRAFFIC_INCLUDED_BYTES) if included > 0 else TRAFFIC_INCLUDED_BYTES
-        if total_bytes < TRAFFIC_SOFT_LIMIT_BYTES and traffic_reviewed_at:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE servers SET traffic_limit_reviewed_at=NULL WHERE id=?", (server_db_id,))
-                await db.commit()
-        elif total_bytes >= hard_limit and not traffic_reviewed_at:
-            await request_server_deletion(bot, server_db_id, f"حجم مجاز ترافیک تکمیل شد ({format_bytes(total_bytes)} / {format_bytes(hard_limit)})")
+        if total >= TRAFFIC_SOFT_LIMIT_BYTES and not warning_sent:
+            msg = f"⚠️ هشدار مصرف سرور «{name}»: {format_bytes(total)} از سقف ۲۰ ترابایت مصرف شده است. با رسیدن به ۲۰ ترابایت، سرور خودکار خاموش و برای تمدید/حذف به ادمین ارجاع می‌شود."
+            try: await bot.send_message(owner_id, msg)
+            except Exception: pass
+            await notify_admins(bot, f"{msg}\nمالک: {owner_id} | شناسه سرور: {sid}")
+        if total >= TRAFFIC_INCLUDED_BYTES:
+            await request_server_deletion(bot, sid, f"سقف قطعی مصرف ۲۰ ترابایت تکمیل شد ({format_bytes(total)} / ۲۰ ترابایت)")
 
 
 async def check_expirations(bot: Bot):
     now = datetime.utcnow()
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT id, user_id, hetzner_id, name, expires_at, expired_powered_off_at, provider_type FROM servers "
-            "WHERE expires_at IS NOT NULL AND user_id IS NOT NULL AND COALESCE(is_protected,0)=0"
-        )
-        rows = await cur.fetchall()
-    if not rows:
-        return
-    for server_db_id, user_id, hetzner_id, name, expires_at, expired_off_at, provider_type in rows:
-        provider_type = provider_type or "hetzner"
-        async with aiosqlite.connect(DB_PATH) as db:
-            token = await get_token_for_server(db, server_db_id, provider_type)
-        api = make_provider_api(provider_type, token) if token else None
-        try:
-            exp_dt = datetime.fromisoformat(expires_at)
-        except Exception:
+        rows = await (await db.execute(
+            "SELECT id,user_id,name,expires_at,COALESCE(expiry_reminder_sent,0),deletion_pending_reason "
+            "FROM servers WHERE expires_at IS NOT NULL AND user_id IS NOT NULL AND COALESCE(is_protected,0)=0 AND COALESCE(admin_reactivated,0)=0"
+        )).fetchall()
+    for sid, owner_id, name, expires_at, reminder_sent, pending in rows:
+        if pending:
             continue
-        if expired_off_at:
-            # قبلاً به‌خاطر پایان مهلت خاموش شده -> بررسی سپری‌شدن مهلت گریس ۲ ساعته برای حذف کامل
-            try:
-                off_dt = datetime.fromisoformat(expired_off_at)
-            except Exception:
-                continue
-            if now - off_dt >= timedelta(hours=EXPIRY_GRACE_HOURS):
-                await request_server_deletion(bot, server_db_id, "پایان مهلت سرویس و عدم تمدید پس از مهلت ارفاقی")
-        elif exp_dt <= now:
-            # مهلت تمام شده و هنوز خاموش نشده -> خاموش کن و شمارش معکوس حذف را شروع کن
-            if api:
-                try:
-                    await api.power_action(hetzner_id, "poweroff")
-                except Exception:
-                    pass
+        try: exp = datetime.fromisoformat(expires_at)
+        except Exception: continue
+        if exp <= now:
+            await request_server_deletion(bot, sid, "پایان مهلت اعتبار سرور؛ برای ادامه سرویس تمدید کنید یا درخواست حذف را ثبت کنید")
+            continue
+        if exp - now <= timedelta(hours=EXPIRY_REMINDER_HOURS_BEFORE) and not reminder_sent:
+            remain = exp - now
+            msg = (f"⏳ اخطار پایان مهلت سرور «{name}»: {remain.days} روز و {remain.seconds // 3600} ساعت باقی مانده است.\n"
+                   "برای جلوگیری از خاموشی، تمدید کنید.")
+            try: await bot.send_message(owner_id, msg)
+            except Exception: pass
+            await notify_admins(bot, f"{msg}\nمالک: {owner_id} | شناسه سرور: {sid}")
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "UPDATE servers SET expired_powered_off_at=?, status='off' WHERE id=?", (now.isoformat(), server_db_id)
-                )
+                await db.execute("UPDATE servers SET expiry_reminder_sent=1 WHERE id=?", (sid,))
                 await db.commit()
-            try:
-                await bot.send_message(
-                    user_id,
-                    f"⛔ مهلت سرویس «{name}» به پایان رسید و سرور خاموش شد.\n"
-                    f"در صورت عدم تمدید ظرف {EXPIRY_GRACE_HOURS} ساعت آینده، این سرور برای همیشه حذف خواهد شد.\n"
-                    "برای تمدید به «🖥 سرورهای من» مراجعه کنید.",
-                )
-            except Exception:
-                pass
-        elif exp_dt - now <= timedelta(hours=EXPIRY_REMINDER_HOURS_BEFORE):
-            remaining = exp_dt - now
-            try:
-                await bot.send_message(
-                    user_id,
-                    f"⏳ مهلت سرویس «{name}» تا {remaining.days} روز و {remaining.seconds // 3600} ساعت دیگر به پایان می‌رسد.\n"
-                    "برای جلوگیری از خاموش شدن سرویس، از بخش «🖥 سرورهای من» تمدید کنید.",
-                )
-            except Exception:
-                pass
 
 
 async def cleanup_old_primary_ips():
@@ -5312,9 +5327,8 @@ async def ip_cleanup_poller():
 
 
 async def maintenance_poller(bot: Bot):
-    """هر ۶ ساعت یک‌بار ترافیک مصرفی و مهلت سرویس‌های همه سرورها را چک می‌کند."""
+    """بررسی فوری در شروع و سپس هر ۱۵ دقیقه برای ترافیک و مهلت همه سرورها."""
     while True:
-        await asyncio.sleep(MAINTENANCE_INTERVAL_SECONDS)
         try:
             await check_traffic_usage(bot)
         except Exception as e:
@@ -5327,6 +5341,7 @@ async def maintenance_poller(bot: Bot):
             await cleanup_old_primary_ips()
         except Exception as e:
             logger.warning(f"old IP cleanup error: {e}")
+        await asyncio.sleep(MAINTENANCE_INTERVAL_SECONDS)
 
 
 # ---------------------------------------------------------------------------

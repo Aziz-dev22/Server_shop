@@ -1237,7 +1237,7 @@ async def server_action_do(request: Request, server_id: int, action: str):
     if not sess:
         return RedirectResponse("/login")
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT hetzner_id, name, user_id, ip_change_count, provider_type, provider_id, deletion_pending_reason, COALESCE(is_protected,0) FROM servers WHERE id=?", (server_id,))
+        cur = await db.execute("SELECT hetzner_id, name, user_id, ip_change_count, provider_type, provider_id, deletion_pending_reason, COALESCE(is_protected,0), expires_at FROM servers WHERE id=?", (server_id,))
         row = await cur.fetchone()
         token = await core.get_token_for_server(db, server_id, row[4] or "hetzner") if row else None
 
@@ -1247,7 +1247,7 @@ async def server_action_do(request: Request, server_id: int, action: str):
         referer = request.headers.get("referer", "/servers")
         sep = "&" if "?" in referer else "?"
         return RedirectResponse(f"{referer}{sep}err=" + urllib.parse.quote("این سرور محافظت‌شده است و خاموش/حذف نمی‌شود."), status_code=303)
-    if row[6] and action != "del":
+    if row[6] and action not in ("del", "on", "renew"):
         referer = request.headers.get("referer", "/servers")
         sep = "&" if "?" in referer else "?"
         return RedirectResponse(f"{referer}{sep}err={urllib.parse.quote('سرور در انتظار تأیید حذف است و تا تعیین تکلیف خاموش می‌ماند.')}", status_code=303)
@@ -1256,6 +1256,13 @@ async def server_action_do(request: Request, server_id: int, action: str):
     try:
         if action == "on":
             await api.power_action(row[0], "poweron")
+            expired_now = False
+            try: expired_now = bool(row[8] and datetime.fromisoformat(row[8]) <= datetime.utcnow())
+            except Exception: pass
+            if row[6] or expired_now:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("UPDATE servers SET admin_reactivated=1,deletion_pending_reason=NULL,deletion_requested_at=NULL,deletion_notified=0,expired_powered_off_at=NULL,status='running' WHERE id=?", (server_id,))
+                    await db.commit()
         elif action == "off":
             await api.power_action(row[0], "poweroff")
         elif action == "reboot":
@@ -1347,7 +1354,7 @@ async def server_delete_cancel(request: Request, server_id: int):
             return RedirectResponse("/servers", status_code=303)
         token = await core.get_token_for_server(db, server_id, row[1] or "hetzner")
         await db.execute(
-            "UPDATE servers SET deletion_pending_reason=NULL, deletion_requested_at=NULL, deletion_notified=0, traffic_limit_reviewed_at=CASE WHEN deletion_pending_reason LIKE '%حجم%' OR deletion_pending_reason LIKE '%ترافیک%' THEN ? ELSE traffic_limit_reviewed_at END WHERE id=?",
+            "UPDATE servers SET deletion_pending_reason=NULL, deletion_requested_at=NULL, deletion_notified=0, expiry_reminder_sent=0, traffic_warning_sent=0, admin_reactivated=0, traffic_limit_reviewed_at=CASE WHEN deletion_pending_reason LIKE '%حجم%' OR deletion_pending_reason LIKE '%ترافیک%' THEN ? ELSE traffic_limit_reviewed_at END WHERE id=?",
             (datetime.utcnow().isoformat(), server_id),
         )
         await db.commit()
@@ -1408,8 +1415,7 @@ async def server_renew_do(request: Request, server_id: int):
             return RedirectResponse("/servers?err=" + urllib.parse.quote("قیمت تمدید سرور به پلن فعال متصل نشده است"), status_code=303)
         cur2 = await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,)) if owner_id is not None else None
         bal_row = await cur2.fetchone() if cur2 else None
-        if monthly_price > 0 and (not bal_row or bal_row[0] < monthly_price):
-            return RedirectResponse(f"/servers/{server_id}/renew?err=" + urllib.parse.quote("موجودی کیف پول کاربر کافی نیست"), status_code=303)
+        # پنل مدیریت اجازه تمدید اضطراری حتی با موجودی ناکافی را دارد؛ در صورت کفایت، مبلغ کسر می‌شود.
         token = await core.get_token_for_server(db, server_id, provider_type or "hetzner")
         base = datetime.fromisoformat(expires_at)
         now = datetime.utcnow()
@@ -1417,10 +1423,10 @@ async def server_renew_do(request: Request, server_id: int):
             base = now
         new_expiry = base + timedelta(days=core.RENEWAL_PERIOD_DAYS)
         was_expired_off = bool(expired_off_at)
-        if monthly_price > 0 and owner_id is not None:
+        if monthly_price > 0 and owner_id is not None and bal_row and bal_row[0] >= monthly_price:
             await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=?", (monthly_price, owner_id))
         await db.execute(
-            "UPDATE servers SET expires_at=?, expired_powered_off_at=NULL, traffic_powered_off=0, deletion_pending_reason=NULL, deletion_requested_at=NULL, deletion_notified=0, traffic_limit_reviewed_at=CASE WHEN ? LIKE '%ترافیک%' OR ? LIKE '%حجم%' THEN ? ELSE traffic_limit_reviewed_at END WHERE id=?",
+            "UPDATE servers SET expires_at=?, expired_powered_off_at=NULL, traffic_powered_off=0, deletion_pending_reason=NULL, deletion_requested_at=NULL, deletion_notified=0, expiry_reminder_sent=0, traffic_warning_sent=0, admin_reactivated=0, traffic_limit_reviewed_at=CASE WHEN ? LIKE '%ترافیک%' OR ? LIKE '%حجم%' THEN ? ELSE traffic_limit_reviewed_at END WHERE id=?",
             (new_expiry.isoformat(), deletion_pending_reason or "", deletion_pending_reason or "", datetime.utcnow().isoformat(), server_id),
         )
         await db.commit()
@@ -2248,12 +2254,20 @@ def _zarinpal_endpoints(sandbox):
 async def shop_home(request: Request):
     customer = get_customer_session(request)
     async with aiosqlite.connect(DB_PATH) as db:
-        rows = await (await db.execute("SELECT p.id,p.name,p.description,p.image_url,p.price_usd,p.stock,c.name FROM products p LEFT JOIN product_categories c ON c.id=p.category_id WHERE p.active=1 AND p.stock>0 AND (c.active=1 OR p.category_id IS NULL) ORDER BY c.name,p.id DESC")).fetchall()
+        cats = await (await db.execute("SELECT id,name FROM product_categories WHERE active=1 ORDER BY name")).fetchall()
+        category_filter = request.query_params.get("category")
+        query = "SELECT p.id,p.name,p.description,p.image_url,p.price_usd,p.stock,c.name FROM products p LEFT JOIN product_categories c ON c.id=p.category_id WHERE p.active=1 AND p.stock>0 AND (c.active=1 OR p.category_id IS NULL)"
+        args = []
+        if category_filter and category_filter.isdigit():
+            query += " AND p.category_id=?"; args.append(int(category_filter))
+        query += " ORDER BY c.name,p.id DESC"
+        rows = await (await db.execute(query, args)).fetchall()
     cards=[]
     for r in rows:
         img=f'<img src="{esc(r[3])}" style="max-width:100%;max-height:180px;object-fit:contain">' if r[3] else ''
         cards.append(f'<div class="card">{img}<h3>{esc(r[1])}</h3><p>{esc(r[6] or "بدون دسته")}</p><p>{esc((r[2] or "")[:220])}</p><b>${float(r[4]):.2f}</b><p>موجودی: {r[5]}</p><a class="btn" href="/shop/{r[0]}">مشاهده و خرید</a></div>')
-    return storefront_page("فروشگاه", '<h1>🛍 فروشگاه</h1><div class="grid">'+(''.join(cards) or '<div class="card">محصول فعالی موجود نیست.</div>')+'</div>', customer)
+    cat_html = '<div class="card"><h3>دسته‌بندی‌ها</h3>'+' '.join(f'<a class="btn gray" href="/shop?category={c[0]}">{esc(c[1])}</a>' for c in cats)+'</div>' if cats else ""
+    return storefront_page("فروشگاه", '<h1>🛍 فروشگاه</h1>'+cat_html+'<div class="grid">'+(''.join(cards) or '<div class="card">در این دسته فعلاً محصولی موجود نیست.</div>')+'</div>', customer)
 
 
 @app.get("/shop/{pid}", response_class=HTMLResponse)
@@ -2560,7 +2574,7 @@ async def products_admin(request:Request):
     opts=''.join(f'<option value="{c[0]}">{esc(c[1])}</option>' for c in cats)
     catrows=''.join(f'<tr><td>{esc(c[1])}</td><td>{"فعال" if c[2] else "غیرفعال"}</td><td><form method="post" action="/product-categories/{c[0]}/toggle"><button class="btn small gray">تغییر وضعیت</button></form></td></tr>' for c in cats)
     rows=''.join(f'<tr><td>#{r[0]}</td><td>{esc(r[1])}</td><td>{esc(r[2] or "-")}</td><td>${float(r[3]):.2f}</td><td>{r[4]}</td><td>{"تحویل خودکار" if r[6]=="automatic" else "دستی"}</td><td>{"فعال" if r[5] else "غیرفعال"}</td><td><a class="btn small" href="/products/{r[0]}/inventory">مدیریت اکانت‌ها</a> <a class="btn small" href="/products/{r[0]}/edit">ویرایش</a> <form style="display:inline" method="post" action="/products/{r[0]}/toggle"><button class="btn small gray">تغییر وضعیت</button></form></td></tr>' for r in prods)
-    body=f'''<h1>مدیریت فروشگاه</h1><div class="grid"><div class="card"><h3>دسته جدید</h3><form method="post" action="/product-categories/add"><input name="name" required placeholder="نام دسته"><button class="btn">ثبت</button></form></div><div class="card"><h3>محصول جدید</h3><form method="post" action="/products/add"><label>نام</label><input name="name" required><label>دسته</label><select name="category_id"><option value="">بدون دسته</option>{opts}</select><label>توضیحات</label><textarea name="description"></textarea><label>آدرس تصویر</label><input name="image_url"><label>قیمت دلار (USD)</label><input type="number" name="price" min="0.01" step="0.01" required><label>موجودی اولیه (برای تحویل دستی)</label><input type="number" name="stock" min="0" required><label>روش تحویل</label><select name="delivery_mode"><option value="manual">دستی</option><option value="automatic">خودکار از موجودی اکانت‌های آماده</option></select><button class="btn green">ذخیره محصول</button></form></div></div><div class="card"><h3>دسته‌بندی‌ها</h3><table>{catrows}</table></div><div class="card"><h3>محصولات</h3><table><tr><th>شناسه</th><th>نام</th><th>دسته</th><th>قیمت</th><th>موجودی</th><th>تحویل</th><th>وضعیت</th><th>عملیات</th></tr>{rows}</table></div>'''
+    body=f'''<h1>مدیریت فروشگاه</h1><div class="grid"><div class="card"><h3>دسته جدید</h3><form method="post" action="/product-categories/add"><input name="name" required placeholder="نام دسته"><button class="btn">ثبت</button></form></div><div class="card"><h3>محصول جدید</h3><form method="post" action="/products/add"><label>نام</label><input name="name" required><label>دسته</label><select name="category_id"><option value="">بدون دسته</option>{opts}</select><label>توضیحات</label><textarea name="description"></textarea><label>آدرس تصویر</label><input name="image_url"><label>قیمت دلار (USD)</label><input type="number" name="price" min="0.01" step="0.01" required><label>موجودی اولیه (برای تحویل دستی)</label><input type="number" name="stock" min="0" value="1" required><label>روش تحویل</label><select name="delivery_mode"><option value="manual">دستی</option><option value="automatic">خودکار از موجودی اکانت‌های آماده</option></select><button class="btn green">ذخیره محصول</button></form></div></div><div class="card"><h3>دسته‌بندی‌ها</h3><table>{catrows}</table></div><div class="card"><h3>محصولات</h3><table><tr><th>شناسه</th><th>نام</th><th>دسته</th><th>قیمت</th><th>موجودی</th><th>تحویل</th><th>وضعیت</th><th>عملیات</th></tr>{rows}</table></div>'''
     return page("فروشگاه",body,"/products")
 
 @app.post("/product-categories/add")
@@ -2581,7 +2595,7 @@ async def category_toggle(request:Request,cid:int):
 async def product_add(request:Request):
     if not get_session(request): return RedirectResponse("/login")
     f=await request.form(); name=str(f.get("name","")).strip()[:150]; desc=str(f.get("description", ""))[:5000]; img=str(f.get("image_url", ""))[:1000]; mode=str(f.get("delivery_mode","manual")); mode=mode if mode in ("manual","automatic") else "manual"
-    try: price=float(f.get("price",0)); stock=int(f.get("stock",0)); cid=int(f.get("category_id")) if f.get("category_id") else None
+    try: price=float(f.get("price",0)); stock=int(f.get("stock",1)); cid=int(f.get("category_id")) if f.get("category_id") else None
     except: return RedirectResponse("/products",status_code=303)
     if name and price>0 and stock>=0:
         if mode == "automatic": stock = 0
@@ -2602,7 +2616,7 @@ async def product_edit_form(request:Request,pid:int):
 async def product_edit_save(request:Request,pid:int):
     if not get_session(request): return RedirectResponse("/login")
     f=await request.form(); mode=str(f.get("delivery_mode","manual")); mode=mode if mode in ("manual","automatic") else "manual"
-    try: price=float(f.get("price",0)); stock=int(f.get("stock",0)); cid=int(f.get("category_id")) if f.get("category_id") else None
+    try: price=float(f.get("price",0)); stock=int(f.get("stock",1)); cid=int(f.get("category_id")) if f.get("category_id") else None
     except: return RedirectResponse("/products",status_code=303)
     if price>0 and stock>=0:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -2628,28 +2642,24 @@ async def product_inventory_page(request:Request,pid:int):
         count=await (await db.execute("SELECT COUNT(*) FROM product_inventory WHERE product_id=? AND status='available'",(pid,))).fetchone()
     if not product:return RedirectResponse("/products")
     tr=''.join(f'<tr><td>#{r[0]}</td><td>{"آماده فروش" if r[1]=="available" else "فروخته‌شده"}</td><td>{r[2] or "-"}</td><td>{esc(r[3])}</td></tr>' for r in rows)
-    body=f'''<h1>موجودی اقلام دیجیتال آماده: {esc(product[0])}</h1><div class="card"><p>اقلام آماده برای تحویل: <b>{count[0]}</b> | روش تحویل: {"خودکار" if product[1]=="automatic" else "دستی (برای فعال‌سازی، محصول را ویرایش کنید)"}</p><p>هر خط یک قلم قابل تحویل باشد. برای اکانت از قالب <code>نام‌کاربری|رمزعبور|توضیحات</code> و برای کد یا لینک دانلود، مقدار را در یک خط وارد کنید. اطلاعات محرمانه‌اند و پس از فروش از موجودی خارج می‌شوند.</p><form method="post" action="/products/{pid}/inventory/add"><label>افزودن اکانت، کد یا لینک</label><textarea name="items" rows="10" required placeholder="user01|password01|اطلاعات تکمیلی"></textarea><button class="btn green">ذخیره اکانت‌ها</button></form></div><div class="card"><h3>آخرین موارد موجودی</h3><table><tr><th>شناسه</th><th>وضعیت</th><th>سفارش</th><th>زمان ثبت</th></tr>{tr}</table></div><p><a href="/products">بازگشت به فروشگاه</a></p>'''
+    body=f'''<h1>موجودی اقلام دیجیتال آماده: {esc(product[0])}</h1><div class="card"><p>اقلام آماده برای تحویل: <b>{count[0]}</b> | روش تحویل: {"خودکار" if product[1]=="automatic" else "دستی (برای فعال‌سازی، محصول را ویرایش کنید)"}</p><p>تمام متن داخل این کادر به‌عنوان مشخصات یک اکانت واحد ذخیره می‌شود؛ می‌توانید هر فرمتی که می‌خواهید وارد کنید. اطلاعات محرمانه‌اند و پس از فروش از موجودی خارج می‌شوند.</p><form method="post" action="/products/{pid}/inventory/add"><label>افزودن اکانت، کد یا لینک</label><textarea name="items" rows="10" required placeholder="هر نوع مشخصاتی که می‌خواهید؛ متن، نام کاربری، رمز، لینک و..."></textarea><button class="btn green">ذخیره اکانت‌ها</button></form></div><div class="card"><h3>آخرین موارد موجودی</h3><table><tr><th>شناسه</th><th>وضعیت</th><th>سفارش</th><th>زمان ثبت</th></tr>{tr}</table></div><p><a href="/products">بازگشت به فروشگاه</a></p>'''
     return page("موجودی اکانت‌ها",body,"/products")
 
 @app.post("/products/{pid}/inventory/add")
 async def product_inventory_add(request:Request,pid:int):
     if not get_session(request): return RedirectResponse("/login")
-    f=await request.form(); raw=str(f.get("items",""))
-    items=[]
-    for line in raw.splitlines():
-        line=line.strip()
-        if not line: continue
-        if len(line)>2000: continue
-        items.append(line)
+    f=await request.form(); payload=str(f.get("items", "")).strip()
+    if not payload or len(payload)>10000:
+        return RedirectResponse(f"/products/{pid}/inventory",status_code=303)
     async with aiosqlite.connect(DB_PATH) as db:
         exists=await (await db.execute("SELECT id FROM products WHERE id=?",(pid,))).fetchone()
         if exists:
             now=datetime.utcnow().isoformat()
-            for payload in items:
-                await db.execute("INSERT INTO product_inventory(product_id,payload,status,created_at) VALUES(?,?,'available',?)",(pid,payload,now))
-            await db.execute("UPDATE products SET stock=(SELECT COUNT(*) FROM product_inventory WHERE product_id=? AND status='available'),updated_at=? WHERE id=? AND delivery_mode='automatic'",(pid,now,pid))
+            await db.execute("INSERT INTO product_inventory(product_id,payload,status,created_at) VALUES(?,?,'available',?)",(pid,payload,now))
+            await db.execute("UPDATE products SET stock=(SELECT COUNT(*) FROM product_inventory WHERE product_id=? AND status='available'),delivery_mode='automatic',updated_at=? WHERE id=?",(pid,now,pid))
             await db.commit()
     return RedirectResponse(f"/products/{pid}/inventory",status_code=303)
+
 
 @app.get("/shop/delivery/{token}",response_class=HTMLResponse)
 async def shop_delivery(token:str):
@@ -2679,7 +2689,10 @@ async def product_order_update(request:Request,oid:int):
     f=await request.form(); status=str(f.get("status","paid")); note=str(f.get("delivery_note",""))[:2000]
     if status not in ("paid","delivered","cancelled","refunded"): status="paid"
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE product_orders SET status=?,delivery_note=? WHERE id=?",(status,note,oid)); await db.commit()
+        await db.execute("UPDATE product_orders SET status=?,delivery_note=? WHERE id=?",(status,note,oid))
+        if status == "delivered":
+            await db.execute("DELETE FROM products WHERE id=(SELECT product_id FROM product_orders WHERE id=?) AND stock<=0", (oid,))
+        await db.commit()
     return RedirectResponse("/product-orders",status_code=303)
 
 
