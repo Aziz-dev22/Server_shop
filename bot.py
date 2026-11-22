@@ -1568,6 +1568,83 @@ async def compute_price_usd(db, pricing: dict, type_name: str, location: str, ma
     return round(base_usd * (1 + (markup_percent or 0) / 100.0), 2)
 
 
+async def resolve_external_hetzner_renewal_price(db, server_db_id: int, hetzner_id: int,
+                                                provider_type: str = "hetzner"):
+    """Resolve and persist a renewal price for an imported Hetzner server.
+
+    Imported servers may not match a plan's exact location string (or may have been
+    imported before a plan was configured). Prefer an active plan for the exact
+    location, then a global plan, then the most recently configured plan for the
+    same server type. Pricing itself is read from Hetzner's live pricing endpoint.
+    """
+    if provider_type != "hetzner" or not hetzner_id:
+        return None
+    token = await get_token_for_server(db, server_db_id, provider_type)
+    if not token:
+        return None
+    try:
+        api = HetznerAPI(token)
+        live = await api.get_server(int(hetzner_id))
+        st = live.get("server_type") or {}
+        type_name = st.get("name") if isinstance(st, dict) else str(st or "")
+        live_loc = live.get("location") or {}
+        location = live_loc.get("name") if isinstance(live_loc, dict) else str(live_loc or "")
+        if not location:
+            dc = live.get("datacenter") or {}
+            location = ((dc.get("location") or {}).get("name") or dc.get("name") or "")
+        if not type_name:
+            return None
+        pricing = await api.pricing()
+    except Exception as exc:
+        logger.warning("Could not resolve live renewal price for external Hetzner server %s: %s", hetzner_id, exc)
+        return None
+
+    plans = await (await db.execute(
+        "SELECT id, title, markup_percent, location, active FROM plans "
+        "WHERE server_type=? AND (provider_type='hetzner' OR provider_type IS NULL OR provider_type='') "
+        "ORDER BY CASE WHEN active=1 THEN 0 ELSE 1 END, "
+        "CASE WHEN location=? THEN 0 WHEN location IS NULL OR location='' THEN 1 ELSE 2 END, id DESC",
+        (type_name, location),
+    )).fetchall()
+    if not plans:
+        return None
+
+    # Exact-location price is preferred. Hetzner may omit a location price in some
+    # account/API responses, so fall back to another published price for this type.
+    price_row = find_type_price(pricing, type_name, location)
+    if not price_row:
+        type_rows = [x for x in pricing.get("server_types", []) if x.get("name") == type_name]
+        for type_row in type_rows:
+            candidates = type_row.get("prices") or []
+            if candidates:
+                price_row = candidates[0]
+                break
+    if not price_row:
+        return None
+    try:
+        gross = (price_row.get("price_monthly") or {}).get("gross")
+        if gross is None:
+            return None
+        rate = await get_eur_usd_rate(db)
+        base_usd = to_usd(gross, pricing.get("currency", "EUR"), rate)
+        selected = plans[0]
+        renewal_price = round(base_usd * (1 + (float(selected[2] or 0) / 100.0)), 2)
+        if renewal_price <= 0:
+            return None
+        await db.execute(
+            "UPDATE servers SET monthly_price=?, plan_title=CASE "
+            "WHEN plan_title IS NULL OR plan_title='' OR plan_title IN ('ساخته‌شده خارج از ربات','پلن شناسایی‌نشده') "
+            "THEN ? ELSE plan_title END, server_type=?, location=CASE WHEN ?<>'' THEN ? ELSE location END "
+            "WHERE id=?",
+            (renewal_price, selected[1] or type_name, type_name, location, location, server_db_id),
+        )
+        await db.commit()
+        return renewal_price
+    except Exception as exc:
+        logger.warning("Could not calculate/persist renewal price for Hetzner server %s: %s", hetzner_id, exc)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # درگاه پرداخت ارز دیجیتال (OxaPay)
 # ---------------------------------------------------------------------------
@@ -3891,14 +3968,24 @@ async def server_ipchange_confirm(call: CallbackQuery):
 async def server_renew_start(call: CallbackQuery):
     server_db_id = int(call.data.replace("sv_renew_", ""))
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id, name, expires_at, monthly_price FROM servers WHERE id=?", (server_db_id,))
+        cur = await db.execute(
+            "SELECT user_id, name, expires_at, monthly_price, hetzner_id, provider_type "
+            "FROM servers WHERE id=?", (server_db_id,)
+        )
         row = await cur.fetchone()
-    if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
-        await call.answer("دسترسی غیرمجاز", show_alert=True)
+        if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
+            await call.answer("دسترسی غیرمجاز", show_alert=True)
+            return
+        owner_id, name, expires_at, monthly_price, remote_id, provider_type = row
+        if monthly_price is None or float(monthly_price) <= 0:
+            monthly_price = await resolve_external_hetzner_renewal_price(
+                db, server_db_id, remote_id, provider_type or "hetzner"
+            )
+    if not row:
+        await call.answer("سرور پیدا نشد.", show_alert=True)
         return
-    owner_id, name, expires_at, monthly_price = row
     if not expires_at or monthly_price is None or float(monthly_price) <= 0:
-        await call.answer("قیمت تمدید این سرور هنوز به پلن فعال متصل نشده است؛ لطفاً با پشتیبانی تماس بگیرید.", show_alert=True)
+        await call.answer("قیمت این سرور از پلن و قیمت‌گذاری هتزنر قابل تشخیص نیست. لطفاً نوع سرور و پلن فعال آن را در پنل مدیریت بررسی کنید.", show_alert=True)
         return
     exp_dt = datetime.fromisoformat(expires_at)
     kb = InlineKeyboardMarkup(
@@ -3929,8 +4016,12 @@ async def server_renew_confirm(call: CallbackQuery):
             return
         owner_id, hetzner_id, name, expires_at, monthly_price, expired_off_at, provider_type, provider_id, traffic_off, deletion_pending_reason = row
         provider_type = provider_type or "hetzner"
+        if monthly_price is None or float(monthly_price) <= 0:
+            monthly_price = await resolve_external_hetzner_renewal_price(
+                db, server_db_id, hetzner_id, provider_type
+            )
         if not expires_at or monthly_price is None or float(monthly_price) <= 0:
-            await call.answer("قیمت تمدید این سرور هنوز به پلن فعال متصل نشده است؛ تمدید انجام نشد.", show_alert=True)
+            await call.answer("قیمت تمدید این سرور از پلن و قیمت‌گذاری هتزنر قابل تشخیص نیست؛ لطفاً پلن سرور را در پنل مدیریت بررسی کنید.", show_alert=True)
             return
         cur2 = await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,)) if owner_id is not None else None
         bal_row = await cur2.fetchone() if cur2 else None
