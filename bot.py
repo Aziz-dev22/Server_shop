@@ -275,10 +275,15 @@ async def init_db():
         await _safe_add_column(db, "servers", "is_admin_owned INTEGER DEFAULT 0")
         await _safe_add_column(db, "servers", "is_protected INTEGER DEFAULT 0")
         await _safe_add_column(db, "servers", "source TEXT DEFAULT 'bot'")
+        # Imported Hetzner servers remain ownerless until an administrator assigns them.
+        if ADMIN_IDS:
+            marks = ",".join("?" for _ in ADMIN_IDS)
+            await db.execute(f"UPDATE servers SET user_id=NULL, is_admin_owned=0, is_protected=0 WHERE source='external' AND user_id IN ({marks})", ADMIN_IDS)
+        await db.execute("UPDATE servers SET source='external' WHERE source IS NULL AND user_id IS NULL")
         if ADMIN_IDS:
             marks = ",".join("?" for _ in ADMIN_IDS)
             await db.execute(f"UPDATE servers SET is_admin_owned=1, is_protected=1 WHERE user_id IN ({marks}) AND COALESCE(source,'bot') != 'external'", ADMIN_IDS)
-        await db.execute("UPDATE servers SET is_protected=1 WHERE user_id IS NULL")
+        await db.execute("UPDATE servers SET is_protected=1 WHERE user_id IS NULL AND COALESCE(source,'bot') != 'external'")
         await db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('timezone','Asia/Tehran')")
         await db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('zarinpal_merchant_id','')")
         await db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('zarinpal_sandbox','0')")
@@ -289,6 +294,23 @@ async def init_db():
         await db.execute("UPDATE provider SET type='hetzner' WHERE type IS NULL")
         await db.execute("UPDATE plans SET provider_type='hetzner' WHERE provider_type IS NULL")
         await db.execute("UPDATE servers SET provider_type='hetzner' WHERE provider_type IS NULL")
+        # Collapse duplicate local rows for the same provider resource, preserving order references.
+        dup_keys = await (await db.execute(
+            "SELECT provider_type, provider_id, hetzner_id FROM servers WHERE hetzner_id IS NOT NULL "
+            "GROUP BY provider_type, provider_id, hetzner_id HAVING COUNT(*)>1"
+        )).fetchall()
+        for _ptype, _pid, _remote_id in dup_keys:
+            dup_rows = await (await db.execute(
+                "SELECT id FROM servers WHERE provider_type IS ? AND provider_id IS ? AND hetzner_id=? "
+                "ORDER BY CASE WHEN user_id IS NOT NULL THEN 0 ELSE 1 END, id",
+                (_ptype, _pid, _remote_id),
+            )).fetchall()
+            if dup_rows:
+                keep_id = dup_rows[0][0]
+                for (duplicate_id,) in dup_rows[1:]:
+                    await db.execute("UPDATE orders SET server_id=? WHERE server_id=?", (keep_id, duplicate_id))
+                    await db.execute("UPDATE web_server_orders SET server_db_id=? WHERE server_db_id=?", (keep_id, duplicate_id))
+                    await db.execute("DELETE FROM servers WHERE id=?", (duplicate_id,))
         await _safe_add_column(db, "users", "is_banned INTEGER DEFAULT 0")
         # Persist configurable IP-change price/quota while preserving current defaults.
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('ip_change_free_count', ?)", (str(IP_CHANGE_FREE_COUNT),))
@@ -3325,7 +3347,10 @@ async def telegram_shop_orders(message: Message):
 async def my_servers(message: Message):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, name, ip, location, plan_title, status FROM servers WHERE user_id=? ORDER BY id DESC",
+             "SELECT s.id, s.name, s.ip, s.location, s.plan_title, s.status FROM servers s WHERE s.user_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM servers d WHERE d.provider_type IS s.provider_type "
+            "AND d.provider_id IS s.provider_id AND d.hetzner_id=s.hetzner_id AND d.user_id=s.user_id AND d.id<s.id) "
+            "ORDER BY s.id DESC",
             (message.from_user.id,),
         )
         servers = await cur.fetchall()
@@ -3342,7 +3367,12 @@ async def my_servers(message: Message):
 @router.callback_query(F.data == "my_servers_list")
 async def my_servers_list_callback(call: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id, name, ip FROM servers WHERE user_id=? ORDER BY id DESC", (call.from_user.id,))
+        cur = await db.execute(
+            "SELECT s.id, s.name, s.ip FROM servers s WHERE s.user_id=? AND NOT EXISTS ("
+            "SELECT 1 FROM servers d WHERE d.provider_type IS s.provider_type AND d.provider_id IS s.provider_id "
+            "AND d.hetzner_id=s.hetzner_id AND d.user_id=s.user_id AND d.id<s.id) ORDER BY s.id DESC",
+            (call.from_user.id,),
+        )
         servers = await cur.fetchall()
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🖥 {str(r[1] or 'سرور')} · {str(r[2] or '-')} · #{r[0]}", callback_data=f"svshow_{r[0]}")]
@@ -3802,8 +3832,8 @@ async def server_renew_start(call: CallbackQuery):
         await call.answer("دسترسی غیرمجاز", show_alert=True)
         return
     owner_id, name, expires_at, monthly_price = row
-    if not expires_at or monthly_price is None:
-        await call.answer("این سرویس تحت سیستم تمدید خودکار نیست.", show_alert=True)
+    if not expires_at or monthly_price is None or float(monthly_price) <= 0:
+        await call.answer("قیمت تمدید این سرور هنوز به پلن فعال متصل نشده است؛ لطفاً با پشتیبانی تماس بگیرید.", show_alert=True)
         return
     exp_dt = datetime.fromisoformat(expires_at)
     kb = InlineKeyboardMarkup(
@@ -3834,8 +3864,8 @@ async def server_renew_confirm(call: CallbackQuery):
             return
         owner_id, hetzner_id, name, expires_at, monthly_price, expired_off_at, provider_type, provider_id, traffic_off, deletion_pending_reason = row
         provider_type = provider_type or "hetzner"
-        if not expires_at or monthly_price is None:
-            await call.answer("این سرویس تحت سیستم تمدید خودکار نیست.", show_alert=True)
+        if not expires_at or monthly_price is None or float(monthly_price) <= 0:
+            await call.answer("قیمت تمدید این سرور هنوز به پلن فعال متصل نشده است؛ تمدید انجام نشد.", show_alert=True)
             return
         cur2 = await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,)) if owner_id is not None else None
         bal_row = await cur2.fetchone() if cur2 else None
@@ -4099,32 +4129,26 @@ async def adm_wallet_reqs(call: CallbackQuery):
 # پنل ادمین: همه سرورها (دسترسی کامل ادمین + همگام‌سازی با Hetzner)
 # ---------------------------------------------------------------------------
 async def sync_hetzner_servers(db, api: "HetznerAPI", provider_id=None):
-    """Sync only live servers from one connected API; preserve customer-owned rows."""
+    """Import live Hetzner servers once, without assigning external servers implicitly."""
     try:
         hz_servers = await api.all_servers()
     except Exception as exc:
         logger.warning("Could not sync Hetzner provider %s: %s", provider_id, exc)
         return 0
-    cur = await db.execute("SELECT id, hetzner_id FROM servers WHERE provider_type='hetzner' AND provider_id IS ? AND (user_id IS NULL OR source='external')", (provider_id,))
-    known_rows = await cur.fetchall()
-    known_ids = {r[1] for r in known_rows}
-    live_ids = {server["id"] for server in hz_servers}
+    try:
+        pricing = await api.pricing()
+    except Exception as exc:
+        logger.warning("Could not load pricing while syncing provider %s: %s", provider_id, exc)
+        pricing = {}
+
     added = 0
+    live_ids = {int(s["id"]) for s in hz_servers if s.get("id") is not None}
     for server in hz_servers:
-        sid = server["id"]
+        sid = int(server["id"])
         ip = (server.get("public_net") or {}).get("ipv4", {}).get("ip", "-")
-        loc = (server.get("datacenter") or {}).get("location", {}).get("name", "-")
+        dc = server.get("datacenter") or {}
+        loc = (dc.get("location") or {}).get("name") or dc.get("name") or "-"
         server_created = server.get("created") or datetime.utcnow().isoformat()
-        if sid in known_ids:
-            try:
-                created_dt = datetime.fromisoformat(str(server_created).replace("Z", "+00:00"))
-                if created_dt.tzinfo:
-                    created_dt = created_dt.astimezone(timezone.utc).replace(tzinfo=None)
-            except Exception:
-                created_dt = datetime.utcnow()
-            expiry = (created_dt + timedelta(days=RENEWAL_PERIOD_DAYS)).isoformat()
-            await db.execute("UPDATE servers SET name=?, ip=?, location=?, status=?, created_at=?, user_id=COALESCE(user_id,?), expires_at=COALESCE(expires_at,?), monthly_price=COALESCE(monthly_price,0), is_admin_owned=0, is_protected=0, source='external' WHERE provider_type='hetzner' AND provider_id IS ? AND hetzner_id=? AND (user_id IS NULL OR source='external')", (server.get("name"), ip, loc, server.get("status", "unknown"), server_created, ADMIN_IDS[0] if ADMIN_IDS else None, expiry, provider_id, sid))
-            continue
         try:
             created_dt = datetime.fromisoformat(str(server_created).replace("Z", "+00:00"))
             if created_dt.tzinfo:
@@ -4132,10 +4156,62 @@ async def sync_hetzner_servers(db, api: "HetznerAPI", provider_id=None):
         except Exception:
             created_dt = datetime.utcnow()
         expiry = (created_dt + timedelta(days=RENEWAL_PERIOD_DAYS)).isoformat()
-        await db.execute("INSERT INTO servers (user_id, hetzner_id, name, ip, location, plan_title, os_image, root_password, status, created_at, expires_at, monthly_price, provider_id, provider_type, is_admin_owned, is_protected, source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'hetzner',0,0,'external')", (ADMIN_IDS[0] if ADMIN_IDS else None, sid, server.get("name"), ip, loc, "ساخته‌شده خارج از ربات", (server.get("image") or {}).get("name", "-"), "-", server.get("status", "unknown"), server_created, expiry, 0, provider_id))
+
+        st_data = server.get("server_type") or {}
+        type_name = st_data.get("name") if isinstance(st_data, dict) else str(st_data or "")
+        plan = None
+        if type_name:
+            plan = await (await db.execute(
+                "SELECT title, markup_percent FROM plans WHERE provider_type='hetzner' AND server_type=? "
+                "AND active=1 AND (location IS NULL OR location='' OR location=?) "
+                "ORDER BY CASE WHEN location=? THEN 0 ELSE 1 END, id DESC LIMIT 1",
+                (type_name, loc, loc),
+            )).fetchone()
+        plan_title = (plan[0] or type_name) if plan else "پلن شناسایی‌نشده"
+        monthly_price = None
+        if plan:
+            try:
+                monthly_price = await compute_price_usd(db, pricing, type_name, loc, float(plan[1] or 0))
+            except Exception as exc:
+                logger.warning("Could not calculate renewal price for Hetzner server %s: %s", sid, exc)
+
+        existing = await (await db.execute(
+            "SELECT id, user_id FROM servers WHERE provider_type='hetzner' AND (provider_id IS ? OR provider_id IS NULL) AND hetzner_id=? "
+            "ORDER BY CASE WHEN user_id IS NOT NULL THEN 0 ELSE 1 END, id",
+            (provider_id, sid),
+        )).fetchall()
+        if existing:
+            local_id = existing[0][0]
+            for (duplicate_id, _) in existing[1:]:
+                await db.execute("UPDATE orders SET server_id=? WHERE server_id=?", (local_id, duplicate_id))
+                await db.execute("UPDATE web_server_orders SET server_db_id=? WHERE server_db_id=?", (local_id, duplicate_id))
+                await db.execute("DELETE FROM servers WHERE id=?", (duplicate_id,))
+            owner = existing[0][1]
+            source = "external_assigned" if owner is not None else "external"
+            await db.execute(
+                "UPDATE servers SET provider_id=?, name=?, ip=?, location=?, status=?, created_at=COALESCE(created_at,?), "
+                "expires_at=COALESCE(expires_at,?), monthly_price=CASE WHEN monthly_price IS NULL OR monthly_price<=0 THEN ? ELSE monthly_price END, "
+                "plan_title=CASE WHEN plan_title IS NULL OR plan_title='' OR plan_title IN ('ساخته‌شده خارج از ربات','پلن شناسایی‌نشده') THEN ? ELSE plan_title END, "
+                "source=? WHERE id=?",
+                (provider_id, server.get("name"), ip, loc, server.get("status", "unknown"), server_created,
+                 expiry, monthly_price, plan_title, source, local_id),
+            )
+            continue
+
+        await db.execute(
+            "INSERT INTO servers (user_id, hetzner_id, name, ip, location, plan_title, os_image, root_password, status, created_at, expires_at, monthly_price, provider_id, provider_type, is_admin_owned, is_protected, source) "
+            "VALUES (NULL,?,?,?,?,?,?,?,?,?,?,?,?, 'hetzner',0,0,'external')",
+            (sid, server.get("name"), ip, loc, plan_title, (server.get("image") or {}).get("name", "-"),
+             "-", server.get("status", "unknown"), server_created, expiry, monthly_price, provider_id),
+        )
         added += 1
-    for local_id, sid in known_rows:
-        if sid not in live_ids:
+
+    stale = await (await db.execute(
+        "SELECT id, hetzner_id FROM servers WHERE provider_type='hetzner' AND provider_id IS ? AND source='external'",
+        (provider_id,),
+    )).fetchall()
+    for local_id, remote_id in stale:
+        if remote_id not in live_ids:
             await db.execute("DELETE FROM servers WHERE id=? AND source='external'", (local_id,))
     await db.commit()
     return added
@@ -4231,7 +4307,10 @@ async def admin_server_owner_save(message: Message, state: FSMContext):
             await message.answer("این کاربر در ربات ثبت نشده است. از او بخواهید ابتدا ربات را Start کند، سپس شناسه را دوباره بفرستید.")
             return
         old_owner = server[2]
-        await db.execute("UPDATE servers SET user_id=? WHERE id=?", (target_id, sid))
+        await db.execute(
+            "UPDATE servers SET user_id=?, source=CASE WHEN source IN ('external','external_assigned') THEN 'external_assigned' ELSE source END WHERE id=?",
+            (target_id, sid),
+        )
         await db.commit()
     await state.clear()
     await message.answer(

@@ -613,7 +613,9 @@ async def customer_account(request: Request):
     async with aiosqlite.connect(DB_PATH) as db:
         u=await (await db.execute("SELECT telegram_id,full_name,balance,email,email_verified FROM users WHERE telegram_id=?",(sess["user_id"],))).fetchone()
         orders=await (await db.execute("SELECT id,product_name,quantity,amount_usd,status,delivery_token_hash FROM product_orders WHERE user_id=? ORDER BY id DESC LIMIT 30",(sess["user_id"],))).fetchall()
-        servers=await (await db.execute("SELECT id,name,ip,plan_title,status,expires_at,root_password FROM servers WHERE user_id=? ORDER BY id DESC LIMIT 30",(sess["user_id"],))).fetchall()
+        servers=await (await db.execute("SELECT s.id,s.name,s.ip,s.plan_title,s.status,s.expires_at,s.root_password FROM servers s WHERE s.user_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM servers d WHERE d.provider_type IS s.provider_type AND d.provider_id IS s.provider_id "
+            "AND d.hetzner_id=s.hetzner_id AND d.user_id=s.user_id AND d.id<s.id) ORDER BY s.id DESC LIMIT 30",(sess["user_id"],))).fetchall()
         server_orders=await (await db.execute("SELECT id,plan_title,location,price_usd,status,created_at,server_db_id FROM web_server_orders WHERE user_id=? ORDER BY id DESC LIMIT 30",(sess["user_id"],))).fetchall()
         rate=float(await core.get_setting(db,"wallet_usd_to_toman","100000") or 100000)
     if not u: return RedirectResponse("/customer/login",status_code=303)
@@ -745,7 +747,9 @@ async def user_detail(request: Request, tid: int):
         if not user:
             return page("کاربر یافت نشد", "<h1>کاربر یافت نشد</h1>", "/users")
         cur = await db.execute(
-            "SELECT id, name, ip, location, plan_title, status FROM servers WHERE user_id=? ORDER BY id DESC", (tid,)
+            "SELECT s.id, s.name, s.ip, s.location, s.plan_title, s.status FROM servers s WHERE s.user_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM servers d WHERE d.provider_type IS s.provider_type AND d.provider_id IS s.provider_id "
+            "AND d.hetzner_id=s.hetzner_id AND d.user_id=s.user_id AND d.id<s.id) ORDER BY s.id DESC", (tid,)
         )
         servers = await cur.fetchall()
     ok = request.query_params.get("ok")
@@ -1369,8 +1373,8 @@ async def server_renew_form(request: Request, server_id: int):
     if not row:
         return RedirectResponse("/servers")
     name, expires_at, monthly_price, owner_id, pending_reason = row
-    if not expires_at or monthly_price is None:
-        return page("تمدید سرویس", f"<h1><span class='page-icon icon-blue'>⏳</span> تمدید سرویس</h1><div class='card'>سرور «{esc(name)}» تحت سیستم تمدید خودکار نیست.</div>", "/servers")
+    if not expires_at or monthly_price is None or float(monthly_price) <= 0:
+        return page("تمدید سرویس", f"<h1><span class='page-icon icon-blue'>⏳</span> تمدید سرویس</h1><div class='card'>قیمت تمدید سرور «{esc(name)}» هنوز به پلن فعال متصل نشده است؛ ابتدا پلن و قیمت آن را در مدیریت بررسی کنید.</div>", "/servers")
     exp_dt = datetime.fromisoformat(expires_at)
     body = f"""
     <h1><span class="page-icon icon-blue">⏳</span> تمدید سرویس «{esc(name)}»</h1>
@@ -1400,8 +1404,8 @@ async def server_renew_do(request: Request, server_id: int):
         if not row:
             return RedirectResponse("/servers")
         owner_id, hetzner_id, expires_at, monthly_price, expired_off_at, provider_type, traffic_off, deletion_pending_reason = row
-        if not expires_at or monthly_price is None:
-            return RedirectResponse("/servers")
+        if not expires_at or monthly_price is None or float(monthly_price) <= 0:
+            return RedirectResponse("/servers?err=" + urllib.parse.quote("قیمت تمدید سرور به پلن فعال متصل نشده است"), status_code=303)
         cur2 = await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,)) if owner_id is not None else None
         bal_row = await cur2.fetchone() if cur2 else None
         if monthly_price > 0 and (not bal_row or bal_row[0] < monthly_price):
