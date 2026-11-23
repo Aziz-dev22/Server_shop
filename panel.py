@@ -1461,11 +1461,11 @@ async def server_renew_do(request: Request, server_id: int):
             try:
                 await bot_client.send_message(
                     owner_id,
-                    "📢 سرور شما توسط مدیریت تمدید شد.\\n"
-                    f"شناسه سرور: #{server_id}\\n"
-                    f"مدت تمدید: {core.RENEWAL_PERIOD_DAYS} روز\\n"
-                    f"مبلغ کسرشده از کیف پول: {core.fmt_price(monthly_price)}\\n"
-                    f"مانده جدید کیف پول: {core.fmt_price(balance_after)}\\n"
+                    "📢 سرور شما توسط مدیریت تمدید شد.\n"
+                    f"شناسه سرور: #{server_id}\n"
+                    f"مدت تمدید: {core.RENEWAL_PERIOD_DAYS} روز\n"
+                    f"مبلغ کسرشده از کیف پول: {core.fmt_price(monthly_price)}\n"
+                    f"مانده جدید کیف پول: {core.fmt_price(balance_after)}\n"
                     f"مهلت جدید: {core.iran_time(new_expiry).strftime('%Y-%m-%d %H:%M')} (به وقت ایران)",
                 )
             finally:
