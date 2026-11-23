@@ -4007,6 +4007,17 @@ async def server_renew_start(call: CallbackQuery):
     if not expires_at or monthly_price is None or float(monthly_price) <= 0:
         await call.answer("قیمت این سرور از پلن و قیمت‌گذاری هتزنر قابل تشخیص نیست. لطفاً نوع سرور و پلن فعال آن را در پنل مدیریت بررسی کنید.", show_alert=True)
         return
+    if is_admin(call.from_user.id):
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛠 ادامه تمدید مدیریتی", callback_data=f"admsvrenew_{server_db_id}")],
+            [InlineKeyboardButton(text="🔙 بازگشت", callback_data="adm_servers")],
+        ])
+        await call.message.answer(
+            f"این سرور متعلق به مشتری {owner_id} است. تمدید از طرف ادمین با ثبت تراکنش و امکان منفی‌شدن کیف پول مالک انجام می‌شود.",
+            reply_markup=admin_kb,
+        )
+        await call.answer()
+        return
     exp_dt = datetime.fromisoformat(expires_at)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
