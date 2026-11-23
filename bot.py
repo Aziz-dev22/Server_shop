@@ -1761,16 +1761,35 @@ async def oxapay_poller(bot: Bot):
                 except Exception:
                     continue
                 if is_paid:
+                    credited = False
                     async with aiosqlite.connect(DB_PATH) as db:
-                        await db.execute("UPDATE wallet_requests SET status='approved' WHERE id=?", (req_id,))
-                        await db.execute("UPDATE users SET balance = balance + ? WHERE telegram_id=?", (amount, user_id))
-                        await db.commit()
-                    try:
-                        await bot.send_message(
-                            user_id, f"✅ پرداخت ارزی شما تایید شد و مبلغ {fmt_price(amount)} به کیف پول اضافه شد."
+                        await db.execute("BEGIN IMMEDIATE")
+                        changed = await db.execute(
+                            "UPDATE wallet_requests SET status='approved' WHERE id=? AND status='pending'",
+                            (req_id,),
                         )
-                    except Exception:
-                        pass
+                        if changed.rowcount == 1:
+                            balance_change = await db.execute(
+                                "UPDATE users SET balance=balance+? WHERE telegram_id=?",
+                                (amount, user_id),
+                            )
+                            if balance_change.rowcount != 1:
+                                await db.rollback()
+                                raise RuntimeError(f"wallet user {user_id} missing for request {req_id}")
+                            await db.execute(
+                                "INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) "
+                                "VALUES(?,?,?,?,?)",
+                                (user_id, float(amount), "wallet_deposit", f"wallet-request-{req_id}-credit", datetime.utcnow().isoformat()),
+                            )
+                            credited = True
+                        await db.commit()
+                    if credited:
+                        try:
+                            await bot.send_message(
+                                user_id, f"✅ پرداخت ارزی شما تایید شد و مبلغ {fmt_price(amount)} به کیف پول اضافه شد."
+                            )
+                        except Exception:
+                            pass
             for order_id, user_id, track_id, method in product_rows:
                 try:
                     if method == "oxapay":
@@ -2563,16 +2582,37 @@ async def wallet_request_decision(call: CallbackQuery):
     approve = call.data.startswith("wr_ok_")
     req_id = int(call.data.split("_")[-1])
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id, amount, status FROM wallet_requests WHERE id=?", (req_id,))
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT user_id, amount FROM wallet_requests WHERE id=? AND status='pending'", (req_id,))
         row = await cur.fetchone()
-        if not row or row[2] != "pending":
+        if not row:
+            await db.rollback()
             await call.answer("این درخواست قبلاً بررسی شده است.", show_alert=True)
             return
-        user_id, amount, _ = row
+        user_id, amount = row
         new_status = "approved" if approve else "rejected"
-        await db.execute("UPDATE wallet_requests SET status=? WHERE id=?", (new_status, req_id))
+        changed = await db.execute(
+            "UPDATE wallet_requests SET status=? WHERE id=? AND status='pending'",
+            (new_status, req_id),
+        )
+        if changed.rowcount != 1:
+            await db.rollback()
+            await call.answer("این درخواست قبلاً بررسی شده است.", show_alert=True)
+            return
         if approve:
-            await db.execute("UPDATE users SET balance = balance + ? WHERE telegram_id=?", (amount, user_id))
+            balance_change = await db.execute(
+                "UPDATE users SET balance=balance+? WHERE telegram_id=?",
+                (amount, user_id),
+            )
+            if balance_change.rowcount != 1:
+                await db.rollback()
+                await call.answer("حساب کاربر پیدا نشد؛ شارژ انجام نشد.", show_alert=True)
+                return
+            await db.execute(
+                "INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (user_id, float(amount), "wallet_deposit_manual", f"wallet-request-{req_id}-credit", datetime.utcnow().isoformat()),
+            )
         await db.commit()
     await call.message.edit_caption(caption=call.message.caption + f"\n\nوضعیت: {'✅ تایید شد' if approve else '❌ رد شد'}")
     try:
