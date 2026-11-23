@@ -1404,6 +1404,7 @@ async def server_renew_do(request: Request, server_id: int):
     if not sess:
         return RedirectResponse("/login")
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
         cur = await db.execute(
             "SELECT user_id, hetzner_id, expires_at, monthly_price, expired_powered_off_at, provider_type, traffic_powered_off, deletion_pending_reason FROM servers WHERE id=?",
             (server_id,),
@@ -1450,11 +1451,13 @@ async def server_renew_do(request: Request, server_id: int):
             (new_expiry.isoformat(), deletion_pending_reason or "", deletion_pending_reason or "", datetime.utcnow().isoformat(), server_id),
         )
         await db.commit()
+    power_on_error = ""
     if (was_expired_off or traffic_off or deletion_pending_reason) and token:
         try:
             await core.make_provider_api(provider_type or "hetzner", token).power_action(hetzner_id, "poweron")
-        except Exception:
-            pass
+        except Exception as exc:
+            power_on_error = str(exc)[:250]
+            core.logger.exception("Admin renewal succeeded but powering server %s on failed", server_id)
     if owner_id is not None and monthly_price > 0 and core.BOT_TOKEN:
         try:
             bot_client = Bot(token=core.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -1466,7 +1469,8 @@ async def server_renew_do(request: Request, server_id: int):
                     f"مدت تمدید: {core.RENEWAL_PERIOD_DAYS} روز\n"
                     f"مبلغ کسرشده از کیف پول: {core.fmt_price(monthly_price)}\n"
                     f"مانده جدید کیف پول: {core.fmt_price(balance_after)}\n"
-                    f"مهلت جدید: {core.iran_time(new_expiry).strftime('%Y-%m-%d %H:%M')} (به وقت ایران)",
+                    f"مهلت جدید: {core.iran_time(new_expiry).strftime('%Y-%m-%d %H:%M')} (به وقت ایران)\\n"
+                    + (f"⚠️ روشن‌کردن خودکار سرور ناموفق بود: {power_on_error}" if power_on_error else ""),
                 )
             finally:
                 await bot_client.session.close()
