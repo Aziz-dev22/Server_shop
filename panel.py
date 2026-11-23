@@ -520,7 +520,7 @@ async def login_submit(request: Request):
     if username == PANEL_USERNAME and password == PANEL_PASSWORD:
         token = secrets.token_hex(24)
         SESSIONS[token] = {"user": username, "expires": datetime.utcnow() + timedelta(hours=SESSION_TTL_HOURS)}
-        resp = RedirectResponse("/", status_code=303)
+        resp = RedirectResponse("/admin", status_code=303)
         resp.set_cookie("panel_session", token, httponly=True, max_age=SESSION_TTL_HOURS * 3600)
         return resp
     return RedirectResponse("/login?err=1", status_code=303)
@@ -725,7 +725,7 @@ async def dashboard(request: Request):
     stopped_count = max(0, servers_c-running_count)
     bars = ''.join(f"<span class='server-bar' style='height:{height}%'></span>" for height in (35,51,43,67,56,78,62,88,73,82))
     body = f"""
-    <div class="topbar-mini"><div class="topbar-date"><span class="live-dot"></span> مرکز کنترل مدیریت <span class="topbar-sep">/</span> وضعیت زنده پنل</div><a class="btn small" href="/">⟳ بروزرسانی</a></div>
+    <div class="topbar-mini"><div class="topbar-date"><span class="live-dot"></span> مرکز کنترل مدیریت <span class="topbar-sep">/</span> وضعیت زنده پنل</div><a class="btn small" href="/admin">⟳ بروزرسانی</a></div>
     <h1><span class="page-icon icon-purple">⌂</span> داشبورد</h1>
     <section class="dashboard-hero"><div class="hero-copy"><span class="hero-kicker">HETZNER SHOP · CONTROL CENTER</span><h2>به پنل مدیریت Hetzner خوش آمدید 👑</h2><p>مدیریت سرورها، کاربران و همه سرویس‌ها؛ همه‌چیز در یک نگاه.</p></div></section>
     <div class="stat-grid">
