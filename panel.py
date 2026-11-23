@@ -2794,8 +2794,8 @@ async def admin_wallet_purchase_do(request: Request):
                 try:
                     await bot_client.send_message(
                         user_id,
-                        f"✅ خرید شما توسط مدیریت ثبت و تحویل شد. سفارش #{order_id} · {esc(product[0])} × {quantity}\\n"
-                        f"مبلغ ثبت‌شده: ${total:.2f}\\n"
+                        f"✅ خرید شما توسط مدیریت ثبت و تحویل شد. سفارش #{order_id} · {esc(product[0])} × {quantity}\n"
+                        f"مبلغ ثبت‌شده: ${total:.2f}\n"
                         f'<a href="{base}/shop/delivery/{token}">دریافت مشخصات اکانت</a>',
                     )
                     delivery_notice = "<p>لینک تحویل برای مشتری در تلگرام ارسال شد.</p>"
