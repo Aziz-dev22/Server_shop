@@ -2611,7 +2611,7 @@ async def products_admin(request:Request):
     if not get_session(request): return RedirectResponse("/login")
     async with aiosqlite.connect(DB_PATH) as db:
         cats=await (await db.execute("SELECT id,name,active FROM product_categories ORDER BY name")).fetchall()
-        prods=await (await db.execute("SELECT p.id,p.name,c.name,p.price_usd,p.stock,p.active,p.delivery_mode FROM products p LEFT JOIN product_categories c ON c.id=p.category_id ORDER BY p.id DESC")).fetchall()
+        prods=await (await db.execute("SELECT p.id,p.name,c.name,p.price_usd,p.stock,p.active,p.delivery_mode FROM products p LEFT JOIN product_categories c ON c.id=p.category_id WHERE p.active=1 ORDER BY p.id DESC")).fetchall()
     opts=''.join(f'<option value="{c[0]}">{esc(c[1])}</option>' for c in cats)
     catrows=''.join(f'<tr><td>{esc(c[1])}</td><td>{"فعال" if c[2] else "غیرفعال"}</td><td><form method="post" action="/product-categories/{c[0]}/toggle"><button class="btn small gray">تغییر وضعیت</button></form></td></tr>' for c in cats)
     rows=''.join(f'<tr><td>#{r[0]}</td><td>{esc(r[1])}</td><td>{esc(r[2] or "-")}</td><td>${float(r[3]):.2f}</td><td>{r[4]}</td><td>{"تحویل خودکار" if r[6]=="automatic" else "دستی"}</td><td>{"فعال" if r[5] else "غیرفعال"}</td><td><a class="btn small" href="/products/{r[0]}/inventory">مدیریت اکانت‌ها</a> <a class="btn small" href="/products/{r[0]}/edit">ویرایش</a> <form style="display:inline" method="post" action="/products/{r[0]}/toggle"><button class="btn small gray">تغییر وضعیت</button></form></td></tr>' for r in prods)
@@ -3020,7 +3020,7 @@ async def product_order_update(request:Request,oid:int):
                 await db.rollback()
                 return RedirectResponse("/product-orders?notice=invalid",status_code=303)
             await db.execute("UPDATE product_orders SET status='delivered',delivery_note=? WHERE id=?",(note,oid))
-            await db.execute("DELETE FROM products WHERE id=(SELECT product_id FROM product_orders WHERE id=?) AND stock<=0",(oid,))
+            await db.execute("UPDATE products SET active=0 WHERE id=(SELECT product_id FROM product_orders WHERE id=?) AND stock<=0",(oid,))
             await db.execute("INSERT OR IGNORE INTO admin_wallet_actions(admin_actor,target_user_id,action,amount_usd,reference,details,created_at) VALUES(?,?,?,?,?,?,?)",
                 (str(sess.get("username") or PANEL_USERNAME), int(user_id or 0), "manual_product_delivery", 0.0, f"admin-product-order:{oid}:delivery", f"order_id={oid};note={note[:500]}", datetime.utcnow().isoformat()))
         elif status=="refunded":
