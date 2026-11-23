@@ -4020,55 +4020,111 @@ async def server_renew_start(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("rncf_"))
 async def server_renew_confirm(call: CallbackQuery):
-    server_db_id = int(call.data.replace("rncf_", ""))
+    try:
+        server_db_id = int(call.data.replace("rncf_", ""))
+    except (TypeError, ValueError):
+        await call.answer("شناسه سرور نامعتبر است.", show_alert=True)
+        return
+
+    # تمدید عادی فقط برای مالک است؛ تمدید اضطراری ادمین باید مسیر مستقل و ثبت مالی جداگانه داشته باشد.
+    if is_admin(call.from_user.id):
+        await call.answer("تمدید ادمینی باید از گزینه تمدید مدیریتی انجام شود.", show_alert=True)
+        return
+
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
         cur = await db.execute(
-            "SELECT user_id, hetzner_id, name, expires_at, monthly_price, expired_powered_off_at, provider_type, provider_id, traffic_powered_off, deletion_pending_reason FROM servers WHERE id=?",
+            "SELECT user_id, hetzner_id, name, expires_at, monthly_price, expired_powered_off_at, provider_type, provider_id, traffic_powered_off, deletion_pending_reason "
+            "FROM servers WHERE id=?",
             (server_db_id,),
         )
         row = await cur.fetchone()
-        if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
+        if not row or row[0] != call.from_user.id:
+            await db.rollback()
             await call.answer("دسترسی غیرمجاز", show_alert=True)
             return
+
         owner_id, hetzner_id, name, expires_at, monthly_price, expired_off_at, provider_type, provider_id, traffic_off, deletion_pending_reason = row
         provider_type = provider_type or "hetzner"
         if monthly_price is None or float(monthly_price) <= 0:
-            monthly_price = await resolve_external_hetzner_renewal_price(
-                db, server_db_id, hetzner_id, provider_type
-            )
-        if not expires_at or monthly_price is None or float(monthly_price) <= 0:
-            await call.answer("قیمت تمدید این سرور از پلن و قیمت‌گذاری هتزنر قابل تشخیص نیست؛ لطفاً پلن سرور را در پنل مدیریت بررسی کنید.", show_alert=True)
+            await db.rollback()
+            await call.answer("قیمت تمدید این سرور مشخص نیست؛ لطفاً با پشتیبانی تماس بگیرید.", show_alert=True)
             return
-        cur2 = await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,)) if owner_id is not None else None
-        bal_row = await cur2.fetchone() if cur2 else None
-        if monthly_price > 0 and (not bal_row or bal_row[0] < monthly_price) and not is_admin(call.from_user.id):
+        if not expires_at:
+            await db.rollback()
+            await call.answer("تاریخ انقضای سرور مشخص نیست؛ لطفاً با پشتیبانی تماس بگیرید.", show_alert=True)
+            return
+
+        token = await get_token_for_server(db, server_db_id, provider_type)
+        if not token:
+            await db.rollback()
+            await call.answer("اتصال API این سرور در دسترس نیست.", show_alert=True)
+            return
+
+        bal = await (await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,))).fetchone()
+        if not bal or float(bal[0] or 0) < float(monthly_price):
+            await db.rollback()
             await call.message.edit_text(
-                f"❌ موجودی کافی نیست. موجودی فعلی: {fmt_price(bal_row[0] if bal_row else 0)}\nلطفاً ابتدا کیف پول خود را شارژ کنید."
+                f"❌ موجودی کافی نیست. موجودی فعلی: {fmt_price(bal[0] if bal else 0)}\\nلطفاً ابتدا کیف پول خود را شارژ کنید."
             )
             await call.answer()
             return
-        token = await get_token_for_server(db, server_db_id, provider_type)
-        base = datetime.fromisoformat(expires_at)
+
+        try:
+            base = datetime.fromisoformat(expires_at)
+        except Exception:
+            await db.rollback()
+            await call.answer("تاریخ انقضای سرور نامعتبر است؛ با پشتیبانی تماس بگیرید.", show_alert=True)
+            return
         now = datetime.utcnow()
         if base < now:
             base = now
         new_expiry = base + timedelta(days=RENEWAL_PERIOD_DAYS)
-        was_expired_off = bool(expired_off_at)
-        if monthly_price > 0 and owner_id is not None and bal_row and bal_row[0] >= monthly_price:
-            await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=?", (monthly_price, owner_id))
+        renewal_ref = f"server-renew:{server_db_id}:{expires_at}"
+
+        debit = await db.execute(
+            "UPDATE users SET balance=balance-? WHERE telegram_id=? AND balance>=?",
+            (float(monthly_price), owner_id, float(monthly_price)),
+        )
+        if debit.rowcount != 1:
+            await db.rollback()
+            await call.answer("موجودی کیف پول تغییر کرده است؛ دوباره تلاش کنید.", show_alert=True)
+            return
+        try:
+            await db.execute(
+                "INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",
+                (owner_id, -float(monthly_price), "server_renewal", renewal_ref, datetime.utcnow().isoformat()),
+            )
+        except Exception:
+            await db.rollback()
+            await call.answer("این تمدید قبلاً ثبت شده یا تراکنش تکراری است.", show_alert=True)
+            return
+
         await db.execute(
-            "UPDATE servers SET expires_at=?, expired_powered_off_at=NULL, traffic_powered_off=0, deletion_pending_reason=NULL, deletion_requested_at=NULL, deletion_notified=0, expiry_reminder_sent=0, traffic_warning_sent=0, admin_reactivated=0, traffic_limit_reviewed_at=CASE WHEN ? LIKE '%ترافیک%' OR ? LIKE '%حجم%' THEN ? ELSE traffic_limit_reviewed_at END WHERE id=?",
-            (new_expiry.isoformat(), deletion_pending_reason or "", deletion_pending_reason or "", datetime.utcnow().isoformat(), server_db_id),
+            "UPDATE servers SET expires_at=?, expired_powered_off_at=NULL, traffic_powered_off=0, "
+            "deletion_pending_reason=NULL, deletion_requested_at=NULL, deletion_notified=0, "
+            "expiry_reminder_sent=0, traffic_warning_sent=0, admin_reactivated=0, "
+            "traffic_limit_reviewed_at=CASE WHEN ? LIKE '%ترافیک%' OR ? LIKE '%حجم%' THEN ? ELSE traffic_limit_reviewed_at END "
+            "WHERE id=? AND user_id=?",
+            (new_expiry.isoformat(), deletion_pending_reason or "", deletion_pending_reason or "",
+             datetime.utcnow().isoformat(), server_db_id, owner_id),
         )
         await db.commit()
-    if (was_expired_off or traffic_off or deletion_pending_reason) and token:
+
+    if (expired_off_at or traffic_off or deletion_pending_reason):
         try:
             await make_provider_api(provider_type, token).power_action(hetzner_id, "poweron")
         except Exception:
-            pass
-    poweron_note = "\n▶️ سرور مجدداً روشن شد." if was_expired_off else ""
+            logger.exception("Renewal succeeded but power-on failed for server %s", server_db_id)
+
+    balance_after = float(bal[0] or 0) - float(monthly_price)
+    poweron_note = "\\n▶️ درخواست روشن‌کردن مجدد سرور ارسال شد." if (expired_off_at or traffic_off or deletion_pending_reason) else ""
     await call.message.edit_text(
-        f"✅ سرویس «{html.escape(name)}» با موفقیت تمدید شد.\nمهلت جدید: {iran_time(new_expiry).strftime('%Y-%m-%d %H:%M')} (به وقت ایران){poweron_note}"
+        f"✅ سرویس «{html.escape(name)}» با موفقیت تمدید شد.\\n"
+        f"مدت تمدید: {RENEWAL_PERIOD_DAYS} روز\\n"
+        f"مبلغ کسرشده: {fmt_price(monthly_price)}\\n"
+        f"مانده کیف پول: {fmt_price(balance_after)}\\n"
+        f"مهلت جدید: {iran_time(new_expiry).strftime('%Y-%m-%d %H:%M')} (به وقت ایران){poweron_note}"
     )
     await call.answer()
 
