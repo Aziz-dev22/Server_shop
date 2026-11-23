@@ -2753,6 +2753,14 @@ async def admin_wallet_purchase_do(request: Request):
         if not user or not product or int(product[2] or 0) < quantity:
             await db.rollback()
             return page("خطا", '<div class="card">مشتری یا محصول معتبر نیست، یا موجودی محصول کافی نیست.</div>', "/admin-wallet-purchase")
+        if product[3] == "automatic":
+            available_items = await (await db.execute(
+                "SELECT COUNT(*) FROM product_inventory WHERE product_id=? AND status='available'",
+                (product_id,),
+            )).fetchone()
+            if not available_items or int(available_items[0] or 0) < quantity:
+                await db.rollback()
+                return page("خطا", '<div class="card">تعداد اکانت‌های آماده تحویل کافی نیست؛ خرید ثبت نشد و کیف پول تغییری نکرد.</div>', "/admin-wallet-purchase")
         total = round(float(product[1]) * quantity, 6)
         if total <= 0:
             await db.rollback()
