@@ -2982,7 +2982,41 @@ async def admin_server_purchase_do(request: Request):
             return page("خرید سرور ثبت شد", f'<div class="card">سرور #{server_db_id} ساخته و در حساب مشتری ثبت شده است. خطای جانبی: {esc(str(exc)[:300])}</div>', "/admin-server-purchase")
         if server is not None:
             core.logger.critical("Admin server purchase remote server created but DB save failed: user=%s remote_id=%s provider=%s error=%s", user_id, server.get("id"), provider, str(exc)[:500])
-            return page("نیازمند بررسی فوری", f'<div class="card">سرور در سرویس‌دهنده ساخته شده اما ثبت دیتابیس ناموفق بوده است؛ مبلغ برگشت داده نشد تا سرور بدون مالک نماند. مشتری: {user_id} · شناسه سرویس‌دهنده: {esc(server.get("id"))} · خطا: {esc(str(exc)[:300])}</div>', "/admin-server-purchase")
+            try:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE admin_wallet_actions SET action='server_purchase_db_failure',details=? WHERE reference=?",
+                        (f"user_id={user_id};remote_id={server.get('id')};server_name={server_name};provider={provider};plan_id={plan_id};location={location};error={str(exc)[:500]}", reference),
+                    )
+                    await db.commit()
+            except Exception:
+                core.logger.exception("Could not persist DB-failure audit for admin server purchase %s", reference)
+            return page("نیازمند بررسی فوری", f'<div class="card">سرور در سرویس‌دهنده ساخته شده اما ثبت دیتابیس ناموفق بوده است؛ مبلغ برگشت داده نشد تا سرور بدون مالک نماند. مشتری: {user_id} · شناسه سرویس‌دهنده: {esc(server.get("id"))} · کد پیگیری: {esc(reference)} · خطا: {esc(str(exc)[:300])}</div>', "/admin-server-purchase")
+
+        # Timeout/قطع ارتباط یا پاسخ 5xx ممکن است پس از ایجاد سرور رخ داده باشد.
+        # در نتیجه مبهم، وجه را نگه می‌داریم تا ادمین وجود سرور را در Provider بررسی کند.
+        uncertain = bool(getattr(exc, "uncertain", False))
+        if provider != "hetzner":
+            error_text = str(exc)
+            if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)) or re.search(r"\\((?:500|502|503|504)\\)", error_text):
+                uncertain = True
+        if uncertain:
+            review_details = f"user_id={user_id};provider={provider};plan_id={plan_id};location={location};server_name={server_name};error={str(exc)[:700]};manual_provider_check_required=1"
+            try:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE admin_wallet_actions SET action='server_purchase_review',details=? WHERE reference=?",
+                        (review_details, reference),
+                    )
+                    await db.commit()
+            except Exception:
+                core.logger.exception("Could not persist uncertain server-purchase audit %s", reference)
+            core.logger.critical(
+                "Admin server purchase outcome uncertain; wallet debit retained for manual reconciliation: user=%s provider=%s reference=%s error=%s",
+                user_id, provider, reference, str(exc)[:500],
+            )
+            return page("نیازمند بررسی پرداخت و سرور", f'<div class="card">نتیجه درخواست ساخت سرور قطعی نیست؛ ممکن است سرور در سرویس‌دهنده ساخته شده باشد. برای جلوگیری از ساخت تکراری، مبلغ {price:.2f} USD فعلاً به کیف پول برنگشت و درخواست برای بررسی ادمین ثبت شد. مشتری: {user_id} · سرویس‌دهنده: {esc(provider)} · نام سرور: {esc(server_name)} · کد پیگیری: {esc(reference)} · خطا: {esc(str(exc)[:300])}</div>', "/admin-server-purchase")
+
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("BEGIN IMMEDIATE")
             await db.execute("UPDATE users SET balance=balance+? WHERE telegram_id=?", (price, user_id))
