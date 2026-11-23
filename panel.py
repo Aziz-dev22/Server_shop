@@ -1416,7 +1416,10 @@ async def server_renew_do(request: Request, server_id: int):
             return RedirectResponse("/servers?err=" + urllib.parse.quote("قیمت تمدید سرور به پلن فعال متصل نشده است"), status_code=303)
         cur2 = await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,)) if owner_id is not None else None
         bal_row = await cur2.fetchone() if cur2 else None
-        # پنل مدیریت اجازه تمدید اضطراری حتی با موجودی ناکافی را دارد؛ در صورت کفایت، مبلغ کسر می‌شود.
+        # تمدید از پنل توسط ادمین انجام می‌شود و باید همیشه در دفتر مالی ثبت شود.
+        if owner_id is not None and float(monthly_price) > 0 and not bal_row:
+            await db.rollback()
+            return RedirectResponse("/servers?err=" + urllib.parse.quote("حساب کیف پول مالک پیدا نشد؛ تمدید انجام نشد"), status_code=303)
         token = await core.get_token_for_server(db, server_id, provider_type or "hetzner")
         base = datetime.fromisoformat(expires_at)
         now = datetime.utcnow()
