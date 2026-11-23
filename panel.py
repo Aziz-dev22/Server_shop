@@ -1455,6 +1455,23 @@ async def server_renew_do(request: Request, server_id: int):
             await core.make_provider_api(provider_type or "hetzner", token).power_action(hetzner_id, "poweron")
         except Exception:
             pass
+    if owner_id is not None and monthly_price > 0 and core.BOT_TOKEN:
+        try:
+            bot_client = Bot(token=core.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+            try:
+                await bot_client.send_message(
+                    owner_id,
+                    "📢 سرور شما توسط مدیریت تمدید شد.\\n"
+                    f"شناسه سرور: #{server_id}\\n"
+                    f"مدت تمدید: {core.RENEWAL_PERIOD_DAYS} روز\\n"
+                    f"مبلغ کسرشده از کیف پول: {core.fmt_price(monthly_price)}\\n"
+                    f"مانده جدید کیف پول: {core.fmt_price(balance_after)}\\n"
+                    f"مهلت جدید: {core.iran_time(new_expiry).strftime('%Y-%m-%d %H:%M')} (به وقت ایران)",
+                )
+            finally:
+                await bot_client.session.close()
+        except Exception:
+            core.logger.exception("Could not notify owner %s after panel renewal", owner_id)
     return RedirectResponse("/servers", status_code=303)
 
 
