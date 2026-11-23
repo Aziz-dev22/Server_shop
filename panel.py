@@ -2974,7 +2974,8 @@ async def admin_server_purchase_do(request: Request):
                 core.logger.exception("Admin server purchase notification failed for user %s", user_id)
             finally:
                 await bot_client.session.close()
-        return page("خرید سرور موفق", f'<div class="card"><h2>سرور برای مشتری ساخته شد</h2><p>مشتری: {user_id}</p><p>سرور: #{server_db_id} · {esc(server_name)}</p><p>IP: {esc(ip)}</p><p>مبلغ: {price:.2f} USD · مانده: {balance_after:.2f} USD</p><p>پسورد root: <code>{esc(root_password)}</code></p>{('<p>⚠️ ارسال پیام به مشتری ناموفق بود: '+esc(notification_error)+'</p>') if notification_error else ''}</div>', "/admin-server-purchase")
+        notification_html = f'<p>⚠️ ارسال پیام به مشتری ناموفق بود: {esc(notification_error)}</p>' if notification_error else ""
+        return page("خرید سرور موفق", f'<div class="card"><h2>سرور برای مشتری ساخته شد</h2><p>مشتری: {user_id}</p><p>سرور: #{server_db_id} · {esc(server_name)}</p><p>IP: {esc(ip)}</p><p>مبلغ: {price:.2f} USD · مانده: {balance_after:.2f} USD</p><p>پسورد root: <code>{esc(root_password)}</code></p>{notification_html}</div>', "/admin-server-purchase")
     except Exception as exc:
         if server_db_id is not None:
             core.logger.exception("Admin server purchase created and saved, but a post-save action failed: server_db_id=%s", server_db_id)
