@@ -56,7 +56,7 @@ do_install() {
 
   echo "[1/5] بروزرسانی و نصب پیش‌نیازها..."
   apt-get update -y
-  apt-get install -y python3 python3-venv python3-pip git curl
+  apt-get install -y python3 python3-venv python3-pip git curl nginx
 
   echo
   echo "[2/5] دریافت کد از گیت‌هاب..."
@@ -105,6 +105,7 @@ EOF
   systemctl enable ${PANEL_SERVICE_NAME}
   systemctl restart ${SERVICE_NAME}
   systemctl restart ${PANEL_SERVICE_NAME}
+  configure_public_web
 
   SERVER_IP="$(curl -s -4 ifconfig.me 2>/dev/null || echo YOUR_SERVER_IP)"
 
@@ -112,7 +113,8 @@ EOF
   echo "================================================"
   echo "✅ نصب با موفقیت انجام شد!"
   echo
-  echo "🌐 پنل مدیریت تحت وب:  http://${SERVER_IP}:${PANEL_PORT}"
+  echo "🌐 فروشگاه عمومی:       http://${SERVER_IP}/
+  🔐 پنل مدیریت:          http://${SERVER_IP}/admin"
   echo "   نام کاربری: ${PANEL_USERNAME}"
   echo "   رمز عبور: (همانی که وارد کردید)"
   echo
@@ -124,7 +126,7 @@ EOF
   echo "  5) اگر پرداخت خودکار ارز دیجیتال می‌خواهید، در «تنظیمات» کلید OxaPay را وارد کنید."
   echo "  6) در «تنظیمات» آدرس واریز دستی (کارت/ولت) را وارد کنید."
   echo "================================================"
-  echo "⚠️ پورت ${PANEL_PORT} باید در فایروال سرور باز باشد (مثلاً: ufw allow ${PANEL_PORT})."
+  echo "ℹ️ فروشگاه از طریق پورت 80 در دسترس است؛ پورت داخلی ${PANEL_PORT} را عمومی باز نکنید."
   echo "   برای امنیت بیشتر توصیه می‌شود پنل را پشت یک دامنه + HTTPS (nginx/certbot) قرار دهید."
   echo "================================================"
 }
@@ -182,6 +184,7 @@ do_update() {
   systemctl enable ${PANEL_SERVICE_NAME} 2>/dev/null || true
   systemctl restart ${SERVICE_NAME}
   systemctl restart ${PANEL_SERVICE_NAME}
+  configure_public_web
 
   echo
   echo "✅ آپدیت انجام شد. فایل .env و دیتابیس شما دست‌نخورده باقی ماندند."
@@ -286,6 +289,42 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
+}
+
+# ---------------------------------------------------------------------------
+# وب‌سرور عمومی: نمایش فروشگاه روی IP بدون درج پورت
+# ---------------------------------------------------------------------------
+configure_public_web() {
+  echo "[وب] نصب و تنظیم Nginx برای دسترسی عمومی روی پورت 80..."
+  apt-get install -y nginx
+  mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+  cat > /etc/nginx/sites-available/cloud-center <<EOF
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    client_max_body_size 20m;
+    location / {
+        proxy_pass http://127.0.0.1:${PANEL_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 180s;
+    }
+}
+EOF
+  if [ -L /etc/nginx/sites-enabled/default ]; then
+    mv /etc/nginx/sites-enabled/default /etc/nginx/sites-enabled/default.disabled
+  fi
+  ln -sfn /etc/nginx/sites-available/cloud-center /etc/nginx/sites-enabled/cloud-center
+  nginx -t
+  systemctl enable nginx
+  systemctl reload nginx || systemctl restart nginx
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow 80/tcp
+  fi
 }
 
 # ---------------------------------------------------------------------------
