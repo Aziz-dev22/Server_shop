@@ -3655,15 +3655,20 @@ async def show_server_details(call: CallbackQuery):
 
 
 async def _server_is_expired(db, server_db_id):
-    row = await (await db.execute("SELECT expires_at, deletion_pending_reason FROM servers WHERE id=?", (server_db_id,))).fetchone()
+    row = await (await db.execute("SELECT expires_at, deletion_pending_reason, COALESCE(traffic_powered_off,0) FROM servers WHERE id=?", (server_db_id,))).fetchone()
     if not row:
         return True
-    if row[1]:
+    if row[1] or row[2]:
         return True
     try:
         return bool(row[0] and datetime.fromisoformat(row[0]) <= datetime.utcnow())
     except Exception:
         return False
+
+
+async def _customer_server_operation_blocked(db, server_db_id):
+    """Fail closed for customer operations on expired, traffic-stopped or deletion-pending servers."""
+    return await _server_is_expired(db, server_db_id)
 
 
 @router.callback_query(
@@ -3829,6 +3834,9 @@ async def server_rebuild_confirm(call: CallbackQuery):
         if row[5]:
             await call.answer("این سرور در انتظار تأیید حذف است؛ نصب مجدد تا تعیین تکلیف ادمین غیرفعال است.", show_alert=True)
             return
+        if not is_admin(call.from_user.id) and await _customer_server_operation_blocked(db, server_db_id):
+            await call.answer("این سرور به علت پایان مهلت یا حجم محدود شده است؛ فقط تمدید یا درخواست حذف مجاز است.", show_alert=True)
+            return
         token = await get_token_for_server(db, server_db_id, provider_type)
     if not token:
         await call.answer("اتصال این سرویس‌دهنده در حال حاضر فعال نیست.", show_alert=True)
@@ -3869,8 +3877,12 @@ async def server_ipchange_start(call: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT user_id, hetzner_id, name, ip_change_count, provider_type, provider_id FROM servers WHERE id=?", (server_db_id,))
         row = await cur.fetchone()
+        blocked = bool(row and not is_admin(call.from_user.id) and await _customer_server_operation_blocked(db, server_db_id))
     if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
         await call.message.answer("❌ دسترسی غیرمجاز")
+        return
+    if blocked:
+        await call.message.answer("❌ این سرور به علت پایان مهلت یا حجم محدود شده است؛ ابتدا آن را تمدید کنید.")
         return
     if (row[4] or "hetzner") != "hetzner":
         await call.message.answer("❌ این قابلیت فقط برای سرورهای Hetzner در دسترس است.")
@@ -3907,8 +3919,12 @@ async def server_ipchange_confirm(call: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT user_id, hetzner_id, name, ip_change_count, provider_type, provider_id FROM servers WHERE id=?", (server_db_id,))
         row = await cur.fetchone()
+        blocked = bool(row and not is_admin(call.from_user.id) and await _customer_server_operation_blocked(db, server_db_id))
         if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
             await call.message.edit_text("❌ دسترسی غیرمجاز")
+            return
+        if blocked:
+            await call.message.edit_text("❌ این سرور به علت پایان مهلت یا حجم محدود شده است؛ ابتدا آن را تمدید کنید.")
             return
         if (row[4] or "hetzner") != "hetzner":
             await call.message.edit_text("❌ این قابلیت فقط برای سرورهای Hetzner در دسترس است.")
