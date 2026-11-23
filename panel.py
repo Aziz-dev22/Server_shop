@@ -66,6 +66,7 @@ NAV_ITEMS = [
     ("/orders", "📦 سفارش‌ها"),
     ("/products", "🛍 فروشگاه محصولات"),
     ("/product-orders", "🧾 سفارش‌های فروشگاه"),
+    ("/admin-wallet-purchase", "🛒 خرید مدیریتی از کیف پول"),
     ("/web-server-orders", "🖥 سفارش‌های سرور وب"),
     ("/settings", "⚙️ تنظیمات درگاه"),
     ("/settings/zarinpal", "💳 زرین‌پال"),
@@ -1423,8 +1424,24 @@ async def server_renew_do(request: Request, server_id: int):
             base = now
         new_expiry = base + timedelta(days=core.RENEWAL_PERIOD_DAYS)
         was_expired_off = bool(expired_off_at)
-        if monthly_price > 0 and owner_id is not None and bal_row and bal_row[0] >= monthly_price:
-            await db.execute("UPDATE users SET balance = balance - ? WHERE telegram_id=?", (monthly_price, owner_id))
+        if owner_id is not None and monthly_price > 0:
+            if not bal_row:
+                await db.rollback()
+                return RedirectResponse("/servers?err=" + urllib.parse.quote("حساب کیف پول مالک پیدا نشد"), status_code=303)
+            # تمدید از پنل توسط ادمین انجام می‌شود؛ موجودی می‌تواند منفی شود.
+            await db.execute("UPDATE users SET balance=balance-? WHERE telegram_id=?", (float(monthly_price), owner_id))
+            balance_after = float(bal_row[0] or 0) - float(monthly_price)
+            admin_ref = f"panel-admin-server-renew:{server_id}:{expires_at}"
+            await db.execute(
+                "INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",
+                (owner_id, -float(monthly_price), "admin_server_renewal", admin_ref, datetime.utcnow().isoformat()),
+            )
+            await db.execute(
+                "INSERT INTO admin_wallet_actions(admin_actor,target_user_id,action,amount_usd,reference,details,created_at) VALUES(?,?,?,?,?,?,?)",
+                (str(sess.get("username") or PANEL_USERNAME), owner_id, "server_renewal", float(monthly_price), admin_ref,
+                 f"server_id={server_id};days={core.RENEWAL_PERIOD_DAYS};balance_after={balance_after:.6f}",
+                 datetime.utcnow().isoformat()),
+            )
         await db.execute(
             "UPDATE servers SET expires_at=?, expired_powered_off_at=NULL, traffic_powered_off=0, deletion_pending_reason=NULL, deletion_requested_at=NULL, deletion_notified=0, expiry_reminder_sent=0, traffic_warning_sent=0, admin_reactivated=0, traffic_limit_reviewed_at=CASE WHEN ? LIKE '%ترافیک%' OR ? LIKE '%حجم%' THEN ? ELSE traffic_limit_reviewed_at END WHERE id=?",
             (new_expiry.isoformat(), deletion_pending_reason or "", deletion_pending_reason or "", datetime.utcnow().isoformat(), server_id),
@@ -2675,6 +2692,106 @@ async def shop_delivery(token:str):
     response.headers["Referrer-Policy"]="no-referrer"
     response.headers["X-Robots-Tag"]="noindex, nofollow, noarchive"
     return response
+
+
+@app.get("/admin-wallet-purchase", response_class=HTMLResponse)
+async def admin_wallet_purchase_page(request: Request):
+    sess = get_session(request)
+    if not sess:
+        return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        users = await (await db.execute("SELECT telegram_id,full_name,username,balance FROM users ORDER BY telegram_id DESC LIMIT 500")).fetchall()
+        products = await (await db.execute("SELECT id,name,price_usd,stock,delivery_mode FROM products WHERE active=1 ORDER BY id DESC")).fetchall()
+    user_opts = "".join(
+        f'<option value="{u[0]}">{u[0]} · {esc(u[1] or u[2] or "-")} · موجودی ${float(u[3] or 0):.2f}</option>'
+        for u in users
+    )
+    product_opts = "".join(
+        f'<option value="{p[0]}">#{p[0]} · {esc(p[1])} · ${float(p[2]):.2f} · موجودی {p[3]} · {("خودکار" if p[4]=="automatic" else "دستی")}</option>'
+        for p in products
+    )
+    body = f"""
+    <h1>خرید مدیریتی از کیف پول مشتری</h1>
+    <div class="card">
+      <p>این فرم فقط برای ادمین است. مبلغ از کیف پول مشتری کسر می‌شود و حتی اگر موجودی کافی نباشد، مانده منفی خواهد شد. مشتری به این قابلیت دسترسی ندارد.</p>
+      <form method="post" action="/admin-wallet-purchase">
+        <label>شناسه تلگرام / شناسه حساب مشتری</label>
+        <input name="user_id" type="number" required placeholder="Telegram ID یا شناسه حساب ایمیلی">
+        <label>محصول</label><select name="product_id" required>{product_opts}</select>
+        <label>تعداد</label><input name="quantity" type="number" min="1" max="50" value="1" required>
+        <button class="btn green">تأیید خرید و کسر از کیف پول مشتری</button>
+      </form>
+    </div>
+    <div class="card"><h3>مشتریان ثبت‌شده</h3><select onchange="document.querySelector('[name=user_id]').value=this.value"><option value="">انتخاب سریع مشتری</option>{user_opts}</select></div>
+    """
+    return page("خرید مدیریتی", body, "/admin-wallet-purchase")
+
+
+@app.post("/admin-wallet-purchase")
+async def admin_wallet_purchase_do(request: Request):
+    sess = get_session(request)
+    if not sess:
+        return RedirectResponse("/login")
+    form = await request.form()
+    try:
+        user_id = int(form.get("user_id", 0))
+        product_id = int(form.get("product_id", 0))
+        quantity = int(form.get("quantity", 1))
+    except (TypeError, ValueError):
+        return RedirectResponse("/admin-wallet-purchase", status_code=303)
+    if user_id == 0 or product_id <= 0 or quantity < 1 or quantity > 50:
+        return RedirectResponse("/admin-wallet-purchase", status_code=303)
+    order_id = None
+    total = 0.0
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        user = await (await db.execute("SELECT balance,full_name,email FROM users WHERE telegram_id=?", (user_id,))).fetchone()
+        product = await (await db.execute("SELECT name,price_usd,stock,delivery_mode FROM products WHERE id=? AND active=1", (product_id,))).fetchone()
+        if not user or not product or int(product[2] or 0) < quantity:
+            await db.rollback()
+            return page("خطا", '<div class="card">مشتری یا محصول معتبر نیست، یا موجودی محصول کافی نیست.</div>', "/admin-wallet-purchase")
+        total = round(float(product[1]) * quantity, 6)
+        if total <= 0:
+            await db.rollback()
+            return page("خطا", '<div class="card">قیمت محصول معتبر نیست.</div>', "/admin-wallet-purchase")
+        rate = float(await core.get_setting(db, "wallet_usd_to_toman", "100000") or 100000)
+        now = datetime.utcnow().isoformat()
+        cur = await db.execute(
+            "INSERT INTO product_orders(product_id,product_name,quantity,customer_name,mobile,email,amount_usd,amount_toman,status,created_at,user_id,wallet_used_usd,gateway_method,gateway_due_toman,currency_rate) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (product_id, product[0], quantity, user[1] or str(user_id), "", user[2] or "", total,
+             int(round(total * rate)), "pending_payment", now, user_id, total, "wallet", 0, rate),
+        )
+        order_id = cur.lastrowid
+        reference = f"admin-product-order-{order_id}-debit"
+        balance_after = float(user[0] or 0) - total
+        await db.execute("UPDATE users SET balance=balance-? WHERE telegram_id=?", (total, user_id))
+        await db.execute(
+            "INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",
+            (user_id, -total, "admin_product_purchase", reference, now),
+        )
+        await db.execute(
+            "INSERT INTO admin_wallet_actions(admin_actor,target_user_id,action,amount_usd,reference,details,created_at) VALUES(?,?,?,?,?,?,?)",
+            (str(sess.get("username") or PANEL_USERNAME), user_id, "product_purchase", total, reference,
+             f"product_id={product_id};product={product[0]};quantity={quantity};order_id={order_id};balance_after={balance_after:.6f}", now),
+        )
+        await db.commit()
+    token = await core.complete_product_order(order_id, "ADMIN_WALLET")
+    async with aiosqlite.connect(DB_PATH) as db:
+        order = await (await db.execute("SELECT status FROM product_orders WHERE id=?", (order_id,))).fetchone()
+        items = await (await db.execute("SELECT payload FROM product_inventory WHERE order_id=? ORDER BY id", (order_id,))).fetchall()
+    delivered = "\n\n".join(x[0] for x in items)
+    status = order[0] if order else "unknown"
+    delivery_html = f'<div class="card"><h3>اطلاعات تحویل</h3><pre style="white-space:pre-wrap;direction:ltr;text-align:left">{esc(delivered)}</pre></div>' if delivered else ""
+    message = (
+        f'<div class="card"><h2>سفارش مدیریتی #{order_id} ثبت شد</h2>'
+        f'<p>مشتری: {user_id} | محصول: {esc(product[0])} × {quantity}</p>'
+        f'<p>مبلغ کسرشده: ${total:.2f} | مانده جدید: ${balance_after:.2f}</p>'
+        f'<p>وضعیت سفارش: {esc(status)}</p>'
+        f'<p>ثبت مالی و نام ادمین در گزارش تراکنش‌ها ذخیره شد.</p></div>{delivery_html}'
+    )
+    return page("خرید مدیریتی ثبت شد", message, "/admin-wallet-purchase")
+
 
 @app.get("/product-orders",response_class=HTMLResponse)
 async def product_orders(request:Request):
