@@ -203,7 +203,7 @@ CREATE TABLE IF NOT EXISTS product_orders (id INTEGER PRIMARY KEY AUTOINCREMENT,
 CREATE TABLE IF NOT EXISTS product_inventory (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL, payload TEXT NOT NULL, status TEXT DEFAULT 'available', order_id INTEGER, created_at TEXT, delivered_at TEXT);
 CREATE TABLE IF NOT EXISTS customer_login_codes (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, code_hash TEXT NOT NULL, expires_at TEXT NOT NULL, attempts INTEGER DEFAULT 0, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS customer_web_tokens (id INTEGER PRIMARY KEY AUTOINCREMENT, token_hash TEXT NOT NULL UNIQUE, telegram_id INTEGER NOT NULL, redirect_path TEXT DEFAULT '/shop', expires_at TEXT NOT NULL, used_at TEXT);
-CREATE TABLE IF NOT EXISTS wallet_transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, amount_usd REAL NOT NULL, kind TEXT NOT NULL, reference TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS wallet_transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, amount_usd REAL NOT NULL, kind TEXT NOT NULL, reference TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);\nCREATE TABLE IF NOT EXISTS admin_server_renewals (id INTEGER PRIMARY KEY AUTOINCREMENT, server_id INTEGER NOT NULL, owner_id INTEGER NOT NULL, admin_id INTEGER NOT NULL, days INTEGER NOT NULL, amount_usd REAL NOT NULL, balance_after REAL NOT NULL, created_at TEXT NOT NULL, reference TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS web_server_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, provider_type TEXT NOT NULL, location TEXT NOT NULL, plan_id INTEGER NOT NULL, plan_title TEXT NOT NULL, server_type TEXT NOT NULL, image TEXT NOT NULL, price_usd REAL NOT NULL, wallet_used_usd REAL DEFAULT 0, wallet_refunded INTEGER DEFAULT 0, gateway_method TEXT DEFAULT 'wallet', gateway_track_id TEXT, authority TEXT UNIQUE, gateway_due_usd REAL DEFAULT 0, gateway_due_toman INTEGER DEFAULT 0, status TEXT DEFAULT 'pending_payment', server_db_id INTEGER, created_at TEXT NOT NULL, paid_at TEXT);
 
 """
@@ -3301,7 +3301,7 @@ def server_actions_kb(server_id: int, back_callback: str = "my_servers_list", re
          InlineKeyboardButton(text="🛠 نصب مجدد", callback_data=f"sv_rebuild_{server_id}")],
         [InlineKeyboardButton(text="🌐 تغییر IP", callback_data=f"sv_ipchange_{server_id}"),
          InlineKeyboardButton(text="⏳ تمدید", callback_data=f"sv_renew_{server_id}")],
-        [InlineKeyboardButton(text="📊 نمایش زمان و حجم", callback_data=f"svstats_{server_id}")],
+        *([[InlineKeyboardButton(text="🛠 تمدید مدیریتی (۱/۳/۷/۳۰ روز)", callback_data=f"admsvrenew_{server_id}")]] if back_callback == "adm_servers" else []),\n        [InlineKeyboardButton(text="📊 نمایش زمان و حجم", callback_data=f"svstats_{server_id}")],
         [InlineKeyboardButton(text="🗑 درخواست حذف", callback_data=f"sv_del_{server_id}")],
         *([[InlineKeyboardButton(text="👤 تعیین / انتقال مالکیت", callback_data=f"admsvowner_{server_id}")]] if back_callback == "adm_servers" else []),
         [InlineKeyboardButton(text="🔙 بازگشت به فهرست", callback_data=back_callback)],
@@ -4579,6 +4579,168 @@ async def admin_show_server_details(call: CallbackQuery):
         text += f"\\n⚠️ حذف در انتظار ادمین: {row[10]}"
     await call.message.edit_text(text, reply_markup=server_actions_kb(sid, "adm_servers"))
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("admsvrenew_"))
+async def admin_server_renew_menu(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("دسترسی غیرمجاز", show_alert=True)
+        return
+    try:
+        sid = int(call.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        await call.answer("شناسه سرور نامعتبر است.", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute(
+            "SELECT user_id,name,expires_at,monthly_price,hetzner_id,provider_type FROM servers WHERE id=?",
+            (sid,),
+        )).fetchone()
+        if not row:
+            await call.answer("سرور پیدا نشد.", show_alert=True)
+            return
+        if row[0] is None:
+            await call.answer("ابتدا برای این سرور مالک تعیین کنید؛ تمدید مالی بدون مالک مجاز نیست.", show_alert=True)
+            return
+        price = float(row[3] or 0)
+        if price <= 0:
+            price = await resolve_external_hetzner_renewal_price(db, sid, row[4], row[5] or "hetzner")
+    if price <= 0:
+        await call.answer("قیمت ماهانه این سرور مشخص نیست؛ ابتدا پلن و قیمت آن را در پنل بررسی کنید.", show_alert=True)
+        return
+    buttons = [
+        [InlineKeyboardButton(text=f"۱ روز · {fmt_price(price/30)}", callback_data=f"admsvrenewdo_{sid}_1"),
+         InlineKeyboardButton(text=f"۳ روز · {fmt_price(price*3/30)}", callback_data=f"admsvrenewdo_{sid}_3")],
+        [InlineKeyboardButton(text=f"۷ روز · {fmt_price(price*7/30)}", callback_data=f"admsvrenewdo_{sid}_7"),
+         InlineKeyboardButton(text=f"۳۰ روز · {fmt_price(price)}", callback_data=f"admsvrenewdo_{sid}_30")],
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"admsvshow_{sid}")],
+    ]
+    await call.message.edit_text(
+        f"🛠 تمدید مدیریتی سرور «{html.escape(row[1] or str(sid))}»\n"
+        f"مالک: {row[0]}\nقیمت ماهانه: {fmt_price(price)}\n\n"
+        "تمدید مدیریتی از کیف پول مالک کسر می‌شود؛ در صورت ناکافی‌بودن موجودی، مانده می‌تواند منفی شود. "
+        "این استثنا فقط برای ادمین است.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admsvrenewdo_"))
+async def admin_server_renew_apply(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("دسترسی غیرمجاز", show_alert=True)
+        return
+    try:
+        _, _, sid_s, days_s = call.data.split("_")
+        sid, days = int(sid_s), int(days_s)
+    except (TypeError, ValueError):
+        await call.answer("درخواست تمدید نامعتبر است.", show_alert=True)
+        return
+    if days not in (1, 3, 7, 30):
+        await call.answer("مدت تمدید مجاز نیست.", show_alert=True)
+        return
+
+    # Resolve missing imported-server price before opening the financial transaction:
+    # the resolver may persist plan metadata and commit its own DB work.
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute(
+            "SELECT user_id,hetzner_id,name,expires_at,monthly_price,expired_powered_off_at,"
+            "provider_type,traffic_powered_off,deletion_pending_reason FROM servers WHERE id=?",
+            (sid,),
+        )).fetchone()
+        if not row:
+            await call.answer("سرور پیدا نشد.", show_alert=True)
+            return
+        owner_id, provider_server_id, name, expires_at, monthly_price, expired_off, provider_type, traffic_off, deletion_reason = row
+        if owner_id is None:
+            await call.answer("سرور هنوز مالک ندارد؛ ابتدا مالک را تعیین کنید.", show_alert=True)
+            return
+        if monthly_price is None or float(monthly_price) <= 0:
+            monthly_price = await resolve_external_hetzner_renewal_price(db, sid, provider_server_id, provider_type or "hetzner")
+        if monthly_price is None or float(monthly_price) <= 0:
+            await call.answer("قیمت تمدید مشخص نیست؛ تمدید انجام نشد.", show_alert=True)
+            return
+        token = await get_token_for_server(db, sid, provider_type or "hetzner")
+    if not token:
+        await call.answer("API سرور در دسترس نیست؛ تمدید انجام نشد.", show_alert=True)
+        return
+
+    amount = round(float(monthly_price) * days / 30.0, 2)
+    now = datetime.utcnow()
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            current = await (await db.execute(
+                "SELECT user_id,expires_at,monthly_price,COALESCE(traffic_powered_off,0),deletion_pending_reason "
+                "FROM servers WHERE id=?",
+                (sid,),
+            )).fetchone()
+            if not current or current[0] != owner_id:
+                await db.rollback()
+                await call.answer("مالک سرور تغییر کرده است؛ صفحه را تازه کنید.", show_alert=True)
+                return
+            base = now
+            try:
+                if current[1]:
+                    previous = datetime.fromisoformat(current[1])
+                    if previous > now:
+                        base = previous
+            except Exception:
+                pass
+            new_expiry = base + timedelta(days=days)
+            ref = f"admin-server-renew:{sid}:{owner_id}:{call.from_user.id}:{days}:{new_expiry.isoformat()}"
+            balrow = await (await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,))).fetchone()
+            if not balrow:
+                await db.rollback()
+                await call.answer("حساب کیف پول مالک پیدا نشد.", show_alert=True)
+                return
+            balance_after = float(balrow[0] or 0) - amount
+            await db.execute("UPDATE users SET balance=? WHERE telegram_id=?", (balance_after, owner_id))
+            await db.execute(
+                "INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",
+                (owner_id, -amount, "admin_server_renewal", ref, now.isoformat()),
+            )
+            await db.execute(
+                "INSERT INTO admin_server_renewals(server_id,owner_id,admin_id,days,amount_usd,balance_after,created_at,reference) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (sid, owner_id, call.from_user.id, days, amount, balance_after, now.isoformat(), ref),
+            )
+            await db.execute(
+                "UPDATE servers SET expires_at=?,expired_powered_off_at=NULL,traffic_powered_off=0,"
+                "deletion_pending_reason=NULL,deletion_requested_at=NULL,deletion_notified=0,"
+                "expiry_reminder_sent=0,traffic_warning_sent=0,admin_reactivated=0,"
+                "traffic_limit_reviewed_at=CASE WHEN ? LIKE '%ترافیک%' OR ? LIKE '%حجم%' THEN ? ELSE traffic_limit_reviewed_at END "
+                "WHERE id=? AND user_id=?",
+                (new_expiry.isoformat(), deletion_reason or "", deletion_reason or "", now.isoformat(), sid, owner_id),
+            )
+            await db.commit()
+    except Exception as exc:
+        logger.exception("Admin renewal failed for server %s", sid)
+        await call.answer("تمدید ثبت نشد؛ تراکنش مالی برگشت داده شد.", show_alert=True)
+        return
+
+    power_note = ""
+    if expired_off or traffic_off or deletion_reason:
+        try:
+            await make_provider_api(provider_type or "hetzner", token).power_action(provider_server_id, "poweron")
+            power_note = "\\nدرخواست روشن‌کردن مجدد سرور ارسال شد."
+        except Exception:
+            logger.exception("Admin renewal succeeded but power-on failed for server %s", sid)
+            power_note = "\\n⚠️ تمدید ثبت شد اما روشن‌کردن خودکار ناموفق بود؛ ادمین وضعیت سرور را بررسی کند."
+
+    report = (
+        f"🛠 تمدید مدیریتی سرور «{html.escape(name or str(sid))}» انجام شد.\\n"
+        f"مدت: {days} روز\\nمبلغ کسرشده: {fmt_price(amount)}\\n"
+        f"مانده کیف پول: {fmt_price(balance_after)}\\n"
+        f"مهلت جدید: {iran_time(new_expiry).strftime('%Y-%m-%d %H:%M')} (به وقت ایران)"
+        f"{power_note}"
+    )
+    await call.message.edit_text("✅ تمدید مدیریتی ثبت شد.\n" + report)
+    try:
+        await call.bot.send_message(owner_id, "📢 گزارش تمدید توسط مدیریت:\\n" + report)
+    except Exception:
+        logger.warning("Could not notify owner %s about admin renewal of server %s", owner_id, sid)
+    await call.answer("تمدید با موفقیت ثبت شد.")
 
 
 # ---------------------------------------------------------------------------
