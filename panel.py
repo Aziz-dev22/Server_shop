@@ -2346,7 +2346,7 @@ async def shop_checkout(request: Request,pid:int):
             wallet_used=needed
         elif method.startswith("mixed_"):
             needed=math.ceil(total*1_000_000)/1_000_000
-            wallet_used=min(wallet_balance,needed)
+            wallet_used=min(max(wallet_balance,0.0),needed)
         due_usd=max(0.0,round(total-wallet_used,6))
         gateway_method=method.split("_",1)[1] if method.startswith("mixed_") else method
         due_toman=int(round(due_usd*rate)) if gateway_method=="zarinpal" else 0
@@ -2523,7 +2523,7 @@ async def web_server_checkout(request:Request):
         if method=="wallet":
             if wallet_balance+0.000001<price:return storefront_page("کیف پول",f'<div class="card">موجودی کافی نیست؛ مبلغ لازم ${price:.2f} است. روش پرداخت ترکیبی را انتخاب کنید.</div>',customer)
             wallet_used=round(price,2)
-        elif method.startswith("mixed_"):wallet_used=min(wallet_balance,round(price,2))
+        elif method.startswith("mixed_"):wallet_used=min(max(wallet_balance,0.0),round(price,2))
         else:wallet_used=0.0
         gateway_method=method.split("_",1)[1] if method.startswith("mixed_") else method
         due=max(0,round(float(price)-wallet_used,2))
