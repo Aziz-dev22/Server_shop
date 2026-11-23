@@ -4610,11 +4610,12 @@ async def admin_server_renew_menu(call: CallbackQuery):
     if price <= 0:
         await call.answer("قیمت ماهانه این سرور مشخص نیست؛ ابتدا پلن و قیمت آن را در پنل بررسی کنید.", show_alert=True)
         return
+    nonce = secrets.token_hex(5)
     buttons = [
-        [InlineKeyboardButton(text=f"۱ روز · {fmt_price(price/30)}", callback_data=f"admsvrenewdo_{sid}_1"),
-         InlineKeyboardButton(text=f"۳ روز · {fmt_price(price*3/30)}", callback_data=f"admsvrenewdo_{sid}_3")],
-        [InlineKeyboardButton(text=f"۷ روز · {fmt_price(price*7/30)}", callback_data=f"admsvrenewdo_{sid}_7"),
-         InlineKeyboardButton(text=f"۳۰ روز · {fmt_price(price)}", callback_data=f"admsvrenewdo_{sid}_30")],
+        [InlineKeyboardButton(text=f"۱ روز · {fmt_price(price/30)}", callback_data=f"admsvrenewdo_{sid}_1_{nonce}"),
+         InlineKeyboardButton(text=f"۳ روز · {fmt_price(price*3/30)}", callback_data=f"admsvrenewdo_{sid}_3_{nonce}")],
+        [InlineKeyboardButton(text=f"۷ روز · {fmt_price(price*7/30)}", callback_data=f"admsvrenewdo_{sid}_7_{nonce}"),
+         InlineKeyboardButton(text=f"۳۰ روز · {fmt_price(price)}", callback_data=f"admsvrenewdo_{sid}_30_{nonce}")],
         [InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"admsvshow_{sid}")],
     ]
     await call.message.edit_text(
@@ -4633,9 +4634,9 @@ async def admin_server_renew_apply(call: CallbackQuery):
         await call.answer("دسترسی غیرمجاز", show_alert=True)
         return
     try:
-        prefix, sid_s, days_s = call.data.split("_")
-        if prefix != "admsvrenewdo":
-            raise ValueError("invalid callback prefix")
+        prefix, sid_s, days_s, nonce = call.data.split("_")
+        if prefix != "admsvrenewdo" or not nonce or len(nonce) != 10:
+            raise ValueError("invalid callback token")
         sid, days = int(sid_s), int(days_s)
     except (TypeError, ValueError):
         await call.answer("درخواست تمدید نامعتبر است.", show_alert=True)
@@ -4692,7 +4693,7 @@ async def admin_server_renew_apply(call: CallbackQuery):
             except Exception:
                 pass
             new_expiry = base + timedelta(days=days)
-            ref = f"admin-server-renew:{sid}:{owner_id}:{call.from_user.id}:{days}:{new_expiry.isoformat()}"
+            ref = f"admin-server-renew:{nonce}"
             balrow = await (await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,))).fetchone()
             if not balrow:
                 await db.rollback()
