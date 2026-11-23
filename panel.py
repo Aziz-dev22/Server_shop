@@ -3010,11 +3010,11 @@ async def product_order_update(request:Request,oid:int):
     note=str(f.get("delivery_note",""))[:2000].strip()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
-        row=await (await db.execute("SELECT user_id,wallet_used_usd,wallet_refunded,status,gateway_method,amount_usd FROM product_orders WHERE id=?",(oid,))).fetchone()
+        row=await (await db.execute("SELECT user_id,wallet_used_usd,wallet_refunded,status,gateway_method,amount_usd,product_id,quantity FROM product_orders WHERE id=?",(oid,))).fetchone()
         if not row:
             await db.rollback()
             return RedirectResponse("/product-orders?notice=invalid",status_code=303)
-        user_id,wallet_used,wallet_refunded,current_status,gateway_method,total=row
+        user_id,wallet_used,wallet_refunded,current_status,gateway_method,total,product_id,quantity=row
         if status=="delivered":
             if current_status not in ("paid","paid_stock_issue") or not note:
                 await db.rollback()
@@ -3031,6 +3031,10 @@ async def product_order_update(request:Request,oid:int):
                 # سفارش تحویل‌شده، بدون ثبت برگشت فیزیکی/لغو دسترسی، قابل بازپرداخت خودکار نیست.
                 await db.rollback()
                 return RedirectResponse("/product-orders?notice=invalid",status_code=303)
+            if current_status=="paid":
+                product_row=await (await db.execute("SELECT delivery_mode FROM products WHERE id=?",(product_id,))).fetchone()
+                if product_row and product_row[0]=="manual":
+                    await db.execute("UPDATE products SET stock=stock+?,active=1,updated_at=? WHERE id=?",(int(quantity or 0),datetime.utcnow().isoformat(),product_id))
             if gateway_method=="wallet":
                 if not wallet_refunded and user_id and float(wallet_used or 0)>0:
                     await db.execute("UPDATE users SET balance=balance+? WHERE telegram_id=?",(float(wallet_used),user_id))
