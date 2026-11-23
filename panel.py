@@ -2843,6 +2843,143 @@ async def admin_wallet_purchase_do(request: Request):
     return page("خرید مدیریتی ثبت شد", message, "/admin-wallet-purchase")
 
 
+
+@app.get("/admin-server-purchase", response_class=HTMLResponse)
+async def admin_server_purchase_page(request: Request):
+    sess = get_session(request)
+    if not sess:
+        return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        users = await (await db.execute("SELECT telegram_id,full_name,email,balance FROM users ORDER BY telegram_id DESC LIMIT 500")).fetchall()
+        providers = await core.get_enabled_provider_types(db)
+        plans = await (await db.execute("SELECT id,title,provider_type,location,server_type,cpu,ram,disk FROM plans WHERE active=1 ORDER BY provider_type,title")).fetchall()
+    user_opts = "".join(f'<option value="{u[0]}">{u[0]} · {esc(u[1] or u[2] or "-")} · موجودی USD {float(u[3] or 0):.2f}</option>' for u in users)
+    provider_opts = "".join(f'<option value="{esc(x)}">{esc(core.PROVIDER_LABELS.get(x,x))}</option>' for x in providers)
+    plan_opts = "".join(f'<option value="{pl[0]}">{esc(pl[2])} · #{pl[0]} · {esc(pl[1])} · {esc(pl[5] or "-")} CPU / {esc(pl[6] or "-")} RAM · {esc(pl[3] or "همه لوکیشن‌ها")}</option>' for pl in plans)
+    body = f"""
+    <h1>خرید سرور برای مشتری توسط ادمین</h1>
+    <div class="card"><p>این عملیات فقط برای ادمین است. مبلغ از کیف پول مشتری کسر می‌شود و مانده می‌تواند منفی شود. اگر ساخت سرور ناموفق باشد، مبلغ کیف پول برمی‌گردد.</p>
+    <form method="post" action="/admin-server-purchase">
+    <label>شناسه حساب مشتری (تلگرام یا شناسه داخلی حساب ایمیلی)</label><input name="user_id" type="number" required>
+    <label>سرویس‌دهنده</label><select name="provider" required>{provider_opts}</select>
+    <label>پلن فعال</label><select name="plan_id" required>{plan_opts}</select>
+    <label>لوکیشن مطابق پلن</label><input name="location" required placeholder="مثلاً nbg1">
+    <label>شناسه سیستم‌عامل / Image ID</label><input name="image" required>
+    <button class="btn green">ثبت خرید و ساخت سرور</button></form></div>
+    <div class="card"><h3>انتخاب سریع مشتری</h3><select onchange="document.querySelector('[name=user_id]').value=this.value"><option value="">انتخاب مشتری</option>{user_opts}</select></div>
+    """
+    return page("خرید سرور مدیریتی", body, "/admin-server-purchase")
+
+
+@app.post("/admin-server-purchase")
+async def admin_server_purchase_do(request: Request):
+    sess = get_session(request)
+    if not sess:
+        return RedirectResponse("/login")
+    form = await request.form()
+    try:
+        user_id = int(form.get("user_id", 0))
+        plan_id = int(form.get("plan_id", 0))
+    except (TypeError, ValueError):
+        return RedirectResponse("/admin-server-purchase", status_code=303)
+    provider = str(form.get("provider", "")).strip()
+    location = str(form.get("location", "")).strip()
+    image_id = str(form.get("image", "")).strip()
+    if not user_id or plan_id <= 0 or not provider or not location or not image_id:
+        return RedirectResponse("/admin-server-purchase", status_code=303)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        if provider not in await core.get_enabled_provider_types(db):
+            return page("خطا", '<div class="card">سرویس‌دهنده فعال نیست.</div>', "/admin-server-purchase")
+        plan = await (await db.execute("SELECT id,title,server_type,markup_percent FROM plans WHERE id=? AND active=1 AND provider_type=? AND (location IS NULL OR location='' OR location=?)", (plan_id, provider, location))).fetchone()
+        user = await (await db.execute("SELECT balance FROM users WHERE telegram_id=?", (user_id,))).fetchone()
+        providers = await core.get_active_providers(db, provider)
+        token = await core.get_active_token_for(db, provider)
+        api = core.make_provider_api(provider, token) if token else None
+        if not plan or not user or not api:
+            return page("خطا", '<div class="card">مشتری، پلن یا API معتبر نیست.</div>', "/admin-server-purchase")
+        if provider == "hetzner":
+            pricing = await core.make_provider_api(provider, providers[0][1]).pricing() if providers else None
+            price = await core.compute_price_usd(db, pricing, plan[2], location, plan[3]) if pricing else None
+        else:
+            types = await api.server_types()
+            price = core.compute_price_generic(types, plan[2], plan[3])
+        if price is None or float(price) <= 0:
+            return page("قیمت نامعتبر", '<div class="card">قیمت پلن از API قابل محاسبه نیست.</div>', "/admin-server-purchase")
+        try:
+            images = await core.deduplicate_images(await core.images_for_plan(provider, api, plan[2]))
+            if image_id not in {str(x.get("id")) for x in images}:
+                raise ValueError("invalid image")
+        except Exception:
+            return page("سیستم‌عامل نامعتبر", '<div class="card">Image ID انتخاب‌شده معتبر نیست.</div>', "/admin-server-purchase")
+        if provider == "hetzner":
+            available_sets = []
+            for _, provider_token in providers:
+                try:
+                    available_sets.append(await core.available_types_for_location(core.HetznerAPI(provider_token), location))
+                except Exception:
+                    pass
+            known_sets = [x for x in available_sets if x is not None]
+            if known_sets and not any(plan[2] in x for x in known_sets):
+                return page("موجودی ناموجود", '<div class="card">این پلن در لوکیشن انتخابی موجود نیست.</div>', "/admin-server-purchase")
+            if not providers:
+                return page("API نامعتبر", '<div class="card">API فعال برای Hetzner وجود ندارد.</div>', "/admin-server-purchase")
+
+    price = round(float(price), 6)
+    reference = "admin-server-purchase:" + secrets.token_hex(12)
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        current = await (await db.execute("SELECT balance FROM users WHERE telegram_id=?", (user_id,))).fetchone()
+        if not current:
+            await db.rollback()
+            return page("خطا", '<div class="card">حساب مشتری پیدا نشد.</div>', "/admin-server-purchase")
+        balance_after = float(current[0] or 0) - price
+        await db.execute("UPDATE users SET balance=balance-? WHERE telegram_id=?", (price, user_id))
+        await db.execute("INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)", (user_id, -price, "admin_server_purchase", reference + ":debit", now))
+        await db.execute("INSERT INTO admin_wallet_actions(admin_actor,target_user_id,action,amount_usd,reference,details,created_at) VALUES(?,?,?,?,?,?,?)", (str(sess.get("username") or PANEL_USERNAME), user_id, "server_purchase_pending", price, reference, f"plan_id={plan_id};provider={provider};location={location};balance_after={balance_after:.6f}", now))
+        await db.commit()
+
+    server = None
+    server_name = "admin-" + str(user_id) + "-" + secrets.token_hex(3)
+    try:
+        if provider == "hetzner":
+            created = await core.create_hetzner_server_with_failover(providers, server_name=server_name, server_type=plan[2], image=image_id, location=location, order_ref=secrets.token_hex(8))
+            server, root_password = created["server"], created["root_password"]
+            provider_id = created["provider_id"]
+            image_id = created.get("image") or image_id
+            server_name = server.get("name") or server_name
+        else:
+            server, root_password = await api.create_server(name=server_name, server_type=plan[2], image=image_id, location=location)
+            provider_id = providers[0][0] if providers else None
+        if not root_password:
+            root_password = "از طریق پنل مدیریت امکان تغییر رمز وجود دارد"
+        ip = core.extract_server_ip(provider, server)
+        expires_at = (datetime.utcnow() + timedelta(days=30)).isoformat()
+        server_db_id = await core._save_purchase(user_id, server, server_name, ip, root_password, image_id, {"location": location, "plan_title": plan[1]}, price, expires_at, provider, provider_id, charge_wallet=False)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE admin_wallet_actions SET action='server_purchase',details=? WHERE reference=?", (f"server_db_id={server_db_id};remote_id={server.get('id')};plan_id={plan_id};provider={provider};location={location};balance_after={balance_after:.6f}", reference))
+            await db.commit()
+        if user_id > 0 and core.BOT_TOKEN:
+            bot_client = Bot(token=core.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+            try:
+                await bot_client.send_message(user_id, f"سرور شما توسط مدیریت خریداری شد. شناسه: #{server_db_id} · IP: {esc(ip)} · مبلغ کسرشده: {price:.2f} USD · مانده: {balance_after:.2f} USD")
+            finally:
+                await bot_client.session.close()
+        return page("خرید سرور موفق", f'<div class="card"><h2>سرور برای مشتری ساخته شد</h2><p>مشتری: {user_id}</p><p>سرور: #{server_db_id} · {esc(server_name)}</p><p>IP: {esc(ip)}</p><p>مبلغ: {price:.2f} USD · مانده: {balance_after:.2f} USD</p><p>پسورد root: <code>{esc(root_password)}</code></p></div>', "/admin-server-purchase")
+    except Exception as exc:
+        if server is not None:
+            core.logger.critical("Admin server purchase remote server created but DB save failed: user=%s remote_id=%s provider=%s error=%s", user_id, server.get("id"), provider, str(exc)[:500])
+            return page("نیازمند بررسی فوری", f'<div class="card">سرور در سرویس‌دهنده ساخته شده اما ثبت دیتابیس ناموفق بوده است؛ مبلغ برگشت داده نشد تا سرور بدون مالک نماند. مشتری: {user_id} · شناسه سرویس‌دهنده: {esc(server.get("id"))} · خطا: {esc(str(exc)[:300])}</div>', "/admin-server-purchase")
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute("UPDATE users SET balance=balance+? WHERE telegram_id=?", (price, user_id))
+            await db.execute("INSERT OR IGNORE INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)", (user_id, price, "refund", reference + ":refund", datetime.utcnow().isoformat()))
+            await db.execute("INSERT OR IGNORE INTO admin_wallet_actions(admin_actor,target_user_id,action,amount_usd,reference,details,created_at) VALUES(?,?,?,?,?,?,?)", (str(sess.get("username") or PANEL_USERNAME), user_id, "server_purchase_refund", price, reference + ":refund", f"reason={str(exc)[:300]};debit_reference={reference}", datetime.utcnow().isoformat()))
+            await db.commit()
+        return page("ساخت سرور ناموفق", f'<div class="card">ساخت سرور ناموفق بود؛ مبلغ {price:.2f} USD به کیف پول مشتری برگشت داده شد. خطا: {esc(str(exc)[:300])}</div>', "/admin-server-purchase")
+
+
 @app.get("/product-orders",response_class=HTMLResponse)
 async def product_orders(request:Request):
     if not get_session(request): return RedirectResponse("/login")
