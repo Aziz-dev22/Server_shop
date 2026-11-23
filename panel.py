@@ -2851,7 +2851,8 @@ async def product_orders(request:Request):
 
 @app.post("/product-orders/{oid}/update")
 async def product_order_update(request:Request,oid:int):
-    if not get_session(request): return RedirectResponse("/login")
+    sess=get_session(request)
+    if not sess: return RedirectResponse("/login")
     f=await request.form()
     status=str(f.get("status",""))
     note=str(f.get("delivery_note",""))[:2000].strip()
@@ -2868,6 +2869,8 @@ async def product_order_update(request:Request,oid:int):
                 return RedirectResponse("/product-orders?notice=invalid",status_code=303)
             await db.execute("UPDATE product_orders SET status='delivered',delivery_note=? WHERE id=?",(note,oid))
             await db.execute("DELETE FROM products WHERE id=(SELECT product_id FROM product_orders WHERE id=?) AND stock<=0",(oid,))
+            await db.execute("INSERT OR IGNORE INTO admin_wallet_actions(admin_actor,target_user_id,action,amount_usd,reference,details,created_at) VALUES(?,?,?,?,?,?,?)",
+                (str(sess.get("username") or PANEL_USERNAME), int(user_id or 0), "manual_product_delivery", 0.0, f"admin-product-order:{oid}:delivery", f"order_id={oid};note={note[:500]}", datetime.utcnow().isoformat()))
         elif status=="refunded":
             if current_status not in ("paid","delivered","paid_stock_issue","refund_review"):
                 await db.rollback()
@@ -2881,12 +2884,16 @@ async def product_order_update(request:Request,oid:int):
                     await db.execute("UPDATE users SET balance=balance+? WHERE telegram_id=?",(float(wallet_used),user_id))
                     await db.execute("INSERT OR IGNORE INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",(user_id,float(wallet_used),"refund",f"admin-product-order-{oid}-refund",datetime.utcnow().isoformat()))
                 await db.execute("UPDATE product_orders SET wallet_refunded=1,status='refunded',delivery_note=? WHERE id=?",(note,oid))
+                await db.execute("INSERT OR IGNORE INTO admin_wallet_actions(admin_actor,target_user_id,action,amount_usd,reference,details,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (str(sess.get("username") or PANEL_USERNAME), int(user_id or 0), "product_refund", float(wallet_used or 0), f"admin-product-order:{oid}:refund", f"order_id={oid};gateway=wallet;balance_refund={float(wallet_used or 0):.6f};note={note[:500]}", datetime.utcnow().isoformat()))
             else:
                 # پرداخت خارجی را از API درگاه نمی‌توان بدون تأیید ادمین برگشت زد.
                 if not wallet_refunded and user_id and float(wallet_used or 0)>0:
                     await db.execute("UPDATE users SET balance=balance+? WHERE telegram_id=?",(float(wallet_used),user_id))
                     await db.execute("INSERT OR IGNORE INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",(user_id,float(wallet_used),"refund",f"admin-product-order-{oid}-refund",datetime.utcnow().isoformat()))
                 await db.execute("UPDATE product_orders SET wallet_refunded=1,status='refund_review',delivery_note=? WHERE id=?",(note,oid))
+                await db.execute("INSERT OR IGNORE INTO admin_wallet_actions(admin_actor,target_user_id,action,amount_usd,reference,details,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (str(sess.get("username") or PANEL_USERNAME), int(user_id or 0), "product_refund_review", float(wallet_used or 0), f"admin-product-order:{oid}:refund-review", f"order_id={oid};gateway={gateway_method};wallet_refund={float(wallet_used or 0):.6f};external_refund_required=1;note={note[:500]}", datetime.utcnow().isoformat()))
                 await db.commit()
                 return RedirectResponse("/product-orders?notice=gateway",status_code=303)
         else:
