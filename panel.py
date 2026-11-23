@@ -2785,13 +2785,31 @@ async def admin_wallet_purchase_do(request: Request):
         items = await (await db.execute("SELECT payload FROM product_inventory WHERE order_id=? ORDER BY id", (order_id,))).fetchall()
     delivered = "\n\n".join(x[0] for x in items)
     status = order[0] if order else "unknown"
+    delivery_notice = ""
+    if token and user_id > 0 and core.BOT_TOKEN:
+        try:
+            base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+            if base:
+                bot_client = Bot(token=core.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+                try:
+                    await bot_client.send_message(
+                        user_id,
+                        f"✅ خرید شما توسط مدیریت ثبت و تحویل شد. سفارش #{order_id} · {esc(product[0])} × {quantity}\\n"
+                        f"مبلغ ثبت‌شده: ${total:.2f}\\n"
+                        f'<a href="{base}/shop/delivery/{token}">دریافت مشخصات اکانت</a>',
+                    )
+                    delivery_notice = "<p>لینک تحویل برای مشتری در تلگرام ارسال شد.</p>"
+                finally:
+                    await bot_client.session.close()
+        except Exception:
+            delivery_notice = "<p>⚠️ ارسال پیام تلگرام ناموفق بود؛ لینک تحویل را از پنل به مشتری بدهید.</p>"
     delivery_html = f'<div class="card"><h3>اطلاعات تحویل</h3><pre style="white-space:pre-wrap;direction:ltr;text-align:left">{esc(delivered)}</pre></div>' if delivered else ""
     message = (
         f'<div class="card"><h2>سفارش مدیریتی #{order_id} ثبت شد</h2>'
         f'<p>مشتری: {user_id} | محصول: {esc(product[0])} × {quantity}</p>'
         f'<p>مبلغ کسرشده: ${total:.2f} | مانده جدید: ${balance_after:.2f}</p>'
         f'<p>وضعیت سفارش: {esc(status)}</p>'
-        f'<p>ثبت مالی و نام ادمین در گزارش تراکنش‌ها ذخیره شد.</p></div>{delivery_html}'
+        f'<p>ثبت مالی و نام ادمین در گزارش تراکنش‌ها ذخیره شد.</p>{delivery_notice}</div>{delivery_html}'
     )
     return page("خرید مدیریتی ثبت شد", message, "/admin-wallet-purchase")
 
