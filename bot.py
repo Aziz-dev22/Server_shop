@@ -1725,6 +1725,7 @@ async def complete_product_order(order_id: int, reference: str = ""):
             if cur.rowcount != 1:
                 await db.execute("UPDATE product_orders SET status='paid_stock_issue',ref_id=?,paid_at=? WHERE id=?", (reference, datetime.utcnow().isoformat(), order_id))
             else:
+                await db.execute("DELETE FROM products WHERE id=? AND stock<=0", (pid,))
                 await db.execute("UPDATE product_orders SET status='paid',ref_id=?,paid_at=? WHERE id=?", (reference, datetime.utcnow().isoformat(), order_id))
         await db.commit()
         return token
