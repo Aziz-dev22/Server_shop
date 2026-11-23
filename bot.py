@@ -203,7 +203,8 @@ CREATE TABLE IF NOT EXISTS product_orders (id INTEGER PRIMARY KEY AUTOINCREMENT,
 CREATE TABLE IF NOT EXISTS product_inventory (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL, payload TEXT NOT NULL, status TEXT DEFAULT 'available', order_id INTEGER, created_at TEXT, delivered_at TEXT);
 CREATE TABLE IF NOT EXISTS customer_login_codes (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, code_hash TEXT NOT NULL, expires_at TEXT NOT NULL, attempts INTEGER DEFAULT 0, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS customer_web_tokens (id INTEGER PRIMARY KEY AUTOINCREMENT, token_hash TEXT NOT NULL UNIQUE, telegram_id INTEGER NOT NULL, redirect_path TEXT DEFAULT '/shop', expires_at TEXT NOT NULL, used_at TEXT);
-CREATE TABLE IF NOT EXISTS wallet_transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, amount_usd REAL NOT NULL, kind TEXT NOT NULL, reference TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);\nCREATE TABLE IF NOT EXISTS admin_server_renewals (id INTEGER PRIMARY KEY AUTOINCREMENT, server_id INTEGER NOT NULL, owner_id INTEGER NOT NULL, admin_id INTEGER NOT NULL, days INTEGER NOT NULL, amount_usd REAL NOT NULL, balance_after REAL NOT NULL, created_at TEXT NOT NULL, reference TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS wallet_transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, amount_usd REAL NOT NULL, kind TEXT NOT NULL, reference TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS admin_server_renewals (id INTEGER PRIMARY KEY AUTOINCREMENT, server_id INTEGER NOT NULL, owner_id INTEGER NOT NULL, admin_id INTEGER NOT NULL, days INTEGER NOT NULL, amount_usd REAL NOT NULL, balance_after REAL NOT NULL, created_at TEXT NOT NULL, reference TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS web_server_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, provider_type TEXT NOT NULL, location TEXT NOT NULL, plan_id INTEGER NOT NULL, plan_title TEXT NOT NULL, server_type TEXT NOT NULL, image TEXT NOT NULL, price_usd REAL NOT NULL, wallet_used_usd REAL DEFAULT 0, wallet_refunded INTEGER DEFAULT 0, gateway_method TEXT DEFAULT 'wallet', gateway_track_id TEXT, authority TEXT UNIQUE, gateway_due_usd REAL DEFAULT 0, gateway_due_toman INTEGER DEFAULT 0, status TEXT DEFAULT 'pending_payment', server_db_id INTEGER, created_at TEXT NOT NULL, paid_at TEXT);
 
 """
@@ -3301,7 +3302,8 @@ def server_actions_kb(server_id: int, back_callback: str = "my_servers_list", re
          InlineKeyboardButton(text="🛠 نصب مجدد", callback_data=f"sv_rebuild_{server_id}")],
         [InlineKeyboardButton(text="🌐 تغییر IP", callback_data=f"sv_ipchange_{server_id}"),
          InlineKeyboardButton(text="⏳ تمدید", callback_data=f"sv_renew_{server_id}")],
-        *([[InlineKeyboardButton(text="🛠 تمدید مدیریتی (۱/۳/۷/۳۰ روز)", callback_data=f"admsvrenew_{server_id}")]] if back_callback == "adm_servers" else []),\n        [InlineKeyboardButton(text="📊 نمایش زمان و حجم", callback_data=f"svstats_{server_id}")],
+        *([[InlineKeyboardButton(text="🛠 تمدید مدیریتی (۱/۳/۷/۳۰ روز)", callback_data=f"admsvrenew_{server_id}")]] if back_callback == "adm_servers" else []),
+        [InlineKeyboardButton(text="📊 نمایش زمان و حجم", callback_data=f"svstats_{server_id}")],
         [InlineKeyboardButton(text="🗑 درخواست حذف", callback_data=f"sv_del_{server_id}")],
         *([[InlineKeyboardButton(text="👤 تعیین / انتقال مالکیت", callback_data=f"admsvowner_{server_id}")]] if back_callback == "adm_servers" else []),
         [InlineKeyboardButton(text="🔙 بازگشت به فهرست", callback_data=back_callback)],
@@ -4631,7 +4633,9 @@ async def admin_server_renew_apply(call: CallbackQuery):
         await call.answer("دسترسی غیرمجاز", show_alert=True)
         return
     try:
-        _, _, sid_s, days_s = call.data.split("_")
+        prefix, sid_s, days_s = call.data.split("_")
+        if prefix != "admsvrenewdo":
+            raise ValueError("invalid callback prefix")
         sid, days = int(sid_s), int(days_s)
     except (TypeError, ValueError):
         await call.answer("درخواست تمدید نامعتبر است.", show_alert=True)
