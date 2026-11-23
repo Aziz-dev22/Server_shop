@@ -3683,7 +3683,7 @@ async def server_action(call: CallbackQuery):
     _, action, server_db_id = call.data.split("_")
     server_db_id = int(server_db_id)
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id, hetzner_id, name, provider_type, provider_id, deletion_pending_reason, COALESCE(is_protected,0), expires_at FROM servers WHERE id=?", (server_db_id,))
+        cur = await db.execute("SELECT user_id, hetzner_id, name, provider_type, provider_id, deletion_pending_reason, COALESCE(is_protected,0), expires_at, COALESCE(traffic_powered_off,0) FROM servers WHERE id=?", (server_db_id,))
         row = await cur.fetchone()
         if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
             await call.answer("دسترسی غیرمجاز", show_alert=True)
@@ -3692,7 +3692,7 @@ async def server_action(call: CallbackQuery):
         expired_now = False
         try: expired_now = bool(row[7] and datetime.fromisoformat(row[7]) <= datetime.utcnow())
         except Exception: pass
-        restricted_now = bool(row[5]) or expired_now
+        restricted_now = bool(row[5]) or expired_now or bool(row[8])
         if row[6] and action in ("off", "del"):
             await call.answer("این سرور متعلق به ادمین و محافظت‌شده است.", show_alert=True)
             return
