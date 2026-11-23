@@ -4932,6 +4932,25 @@ async def complete_web_server_order(order_id: int, reference: str = ""):
         return server_db_id
     except Exception as exc:
         logger.exception("Paid web server order %s failed during creation",order_id)
+        uncertain = bool(getattr(exc, "uncertain", False))
+        if ptype != "hetzner":
+            error_text = str(exc)
+            if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)) or re.search(r"\\((?:500|502|503|504)\\)", error_text):
+                uncertain = True
+        if uncertain:
+            # ممکن است Provider سرور را ساخته باشد ولی پاسخ به ما نرسیده باشد.
+            # سفارش را برای تطبیق دستی نگه می‌داریم و سهم کیف پول را خودکار برنمی‌گردانیم.
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE web_server_orders SET status='creation_review' WHERE id=? AND status='creating'",
+                    (order_id,),
+                )
+                await db.commit()
+            logger.critical(
+                "Paid web server order %s has uncertain provider outcome; wallet refund withheld for manual review: user=%s provider=%s server_name=%s error=%s",
+                order_id, user_id, ptype, server_name, str(exc)[:700],
+            )
+            return None
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE web_server_orders SET status='creation_failed' WHERE id=?",(order_id,)); await db.commit()
         await refund_web_server_wallet(order_id, failure_status="creation_failed")
