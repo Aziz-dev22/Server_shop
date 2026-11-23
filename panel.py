@@ -2941,6 +2941,7 @@ async def admin_server_purchase_do(request: Request):
         await db.commit()
 
     server = None
+    server_db_id = None
     server_name = "admin-" + str(user_id) + "-" + secrets.token_hex(3)
     try:
         if provider == "hetzner":
@@ -2957,17 +2958,27 @@ async def admin_server_purchase_do(request: Request):
         ip = core.extract_server_ip(provider, server)
         expires_at = (datetime.utcnow() + timedelta(days=30)).isoformat()
         server_db_id = await core._save_purchase(user_id, server, server_name, ip, root_password, image_id, {"location": location, "plan_title": plan[1]}, price, expires_at, provider, provider_id, charge_wallet=False)
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE admin_wallet_actions SET action='server_purchase',details=? WHERE reference=?", (f"server_db_id={server_db_id};remote_id={server.get('id')};plan_id={plan_id};provider={provider};location={location};balance_after={balance_after:.6f}", reference))
-            await db.commit()
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE admin_wallet_actions SET action='server_purchase',details=? WHERE reference=?", (f"server_db_id={server_db_id};remote_id={server.get('id')};plan_id={plan_id};provider={provider};location={location};balance_after={balance_after:.6f}", reference))
+                await db.commit()
+        except Exception:
+            core.logger.exception("Could not update admin server purchase audit row %s", reference)
+        notification_error = ""
         if user_id > 0 and core.BOT_TOKEN:
             bot_client = Bot(token=core.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
             try:
                 await bot_client.send_message(user_id, f"سرور شما توسط مدیریت خریداری شد. شناسه: #{server_db_id} · IP: {esc(ip)} · مبلغ کسرشده: {price:.2f} USD · مانده: {balance_after:.2f} USD")
+            except Exception as notify_exc:
+                notification_error = str(notify_exc)[:200]
+                core.logger.exception("Admin server purchase notification failed for user %s", user_id)
             finally:
                 await bot_client.session.close()
-        return page("خرید سرور موفق", f'<div class="card"><h2>سرور برای مشتری ساخته شد</h2><p>مشتری: {user_id}</p><p>سرور: #{server_db_id} · {esc(server_name)}</p><p>IP: {esc(ip)}</p><p>مبلغ: {price:.2f} USD · مانده: {balance_after:.2f} USD</p><p>پسورد root: <code>{esc(root_password)}</code></p></div>', "/admin-server-purchase")
+        return page("خرید سرور موفق", f'<div class="card"><h2>سرور برای مشتری ساخته شد</h2><p>مشتری: {user_id}</p><p>سرور: #{server_db_id} · {esc(server_name)}</p><p>IP: {esc(ip)}</p><p>مبلغ: {price:.2f} USD · مانده: {balance_after:.2f} USD</p><p>پسورد root: <code>{esc(root_password)}</code></p>{('<p>⚠️ ارسال پیام به مشتری ناموفق بود: '+esc(notification_error)+'</p>') if notification_error else ''}</div>', "/admin-server-purchase")
     except Exception as exc:
+        if server_db_id is not None:
+            core.logger.exception("Admin server purchase created and saved, but a post-save action failed: server_db_id=%s", server_db_id)
+            return page("خرید سرور ثبت شد", f'<div class="card">سرور #{server_db_id} ساخته و در حساب مشتری ثبت شده است. خطای جانبی: {esc(str(exc)[:300])}</div>', "/admin-server-purchase")
         if server is not None:
             core.logger.critical("Admin server purchase remote server created but DB save failed: user=%s remote_id=%s provider=%s error=%s", user_id, server.get("id"), provider, str(exc)[:500])
             return page("نیازمند بررسی فوری", f'<div class="card">سرور در سرویس‌دهنده ساخته شده اما ثبت دیتابیس ناموفق بوده است؛ مبلغ برگشت داده نشد تا سرور بدون مالک نماند. مشتری: {user_id} · شناسه سرویس‌دهنده: {esc(server.get("id"))} · خطا: {esc(str(exc)[:300])}</div>', "/admin-server-purchase")
