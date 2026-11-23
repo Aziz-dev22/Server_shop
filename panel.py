@@ -452,7 +452,7 @@ async def send_customer_email_code(email: str, code: str):
 async def create_customer_session(response, user_id: int):
     token = secrets.token_urlsafe(32)
     CUSTOMER_SESSIONS[token] = {"user_id": int(user_id), "expires": datetime.utcnow() + timedelta(hours=CUSTOMER_SESSION_TTL_HOURS)}
-    response.set_cookie("customer_session", token, httponly=True, secure=os.getenv("COOKIE_SECURE", "1") == "1", samesite="lax", max_age=CUSTOMER_SESSION_TTL_HOURS * 3600)
+    response.set_cookie("customer_session", token, httponly=True, secure=os.getenv("COOKIE_SECURE", "0") == "1", samesite="lax", max_age=CUSTOMER_SESSION_TTL_HOURS * 3600)
     return response
 
 
