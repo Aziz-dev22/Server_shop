@@ -2842,21 +2842,58 @@ async def admin_wallet_purchase_do(request: Request):
 @app.get("/product-orders",response_class=HTMLResponse)
 async def product_orders(request:Request):
     if not get_session(request): return RedirectResponse("/login")
-    async with aiosqlite.connect(DB_PATH) as db: rows=await (await db.execute("SELECT id,product_name,quantity,customer_name,mobile,amount_usd,status,ref_id,created_at FROM product_orders ORDER BY id DESC LIMIT 300")).fetchall()
-    tr=''.join(f'<tr><td>#{r[0]}</td><td>{esc(r[1])}</td><td>{r[2]}</td><td>{esc(r[3])}</td><td>{esc(r[4])}</td><td>{int(r[5]):,}</td><td>{esc(r[6])}</td><td>{esc(r[7] or "-")}</td><td>{esc((core.iran_time(r[8]).strftime("%Y-%m-%d %H:%M") if core.iran_time(r[8]) else r[8]))}</td><td><form method="post" action="/product-orders/{r[0]}/update"><select name="status"><option value="paid">پرداخت‌شده</option><option value="delivered">تحویل‌شده</option><option value="cancelled">لغو</option><option value="refunded">بازپرداخت</option></select><input name="delivery_note" placeholder="یادداشت تحویل"><button class="btn small">ثبت</button></form></td></tr>' for r in rows)
-    return page("سفارش فروشگاه",'<h1>سفارش‌های فروشگاه</h1><div class="card"><table><tr><th>شناسه</th><th>محصول</th><th>تعداد</th><th>خریدار</th><th>موبایل</th><th>مبلغ</th><th>وضعیت</th><th>کد پیگیری</th><th>زمان ایران</th><th>مدیریت</th></tr>'+tr+'</table></div>',"/product-orders")
+    async with aiosqlite.connect(DB_PATH) as db:
+        rows=await (await db.execute("SELECT id,product_name,quantity,customer_name,mobile,amount_usd,status,ref_id,created_at,gateway_method,wallet_used_usd FROM product_orders ORDER BY id DESC LIMIT 300")).fetchall()
+    notice=request.query_params.get("notice","")
+    flash = '<div class="msg ok">عملیات سفارش ثبت شد.</div>' if notice=="ok" else ('<div class="msg err">بازپرداخت درگاه خارجی باید جداگانه در پنل همان درگاه انجام شود؛ وضعیت سفارش برای پیگیری علامت‌گذاری شد.</div>' if notice=="gateway" else ('<div class="msg err">تغییر وضعیت مجاز نبود یا سفارش قبلاً نهایی شده است.</div>' if notice=="invalid" else ""))
+    tr=''.join(f'<tr><td>#{r[0]}</td><td>{esc(r[1])}</td><td>{r[2]}</td><td>{esc(r[3])}</td><td>{esc(r[4])}</td><td>${float(r[5] or 0):.2f}</td><td>{esc(r[6])}</td><td>{esc(r[7] or "-")}</td><td>{esc((core.iran_time(r[8]).strftime("%Y-%m-%d %H:%M") if core.iran_time(r[8]) else r[8]))}</td><td><small>درگاه: {esc(r[9] or "-")} | کیف پول: ${float(r[10] or 0):.2f}</small><form method="post" action="/product-orders/{r[0]}/update"><select name="status"><option value="delivered">تحویل‌شده (دستی)</option><option value="refunded">بازپرداخت / بررسی بازپرداخت</option></select><input name="delivery_note" value="" placeholder="یادداشت تحویل یا علت بازپرداخت"><button class="btn small">ثبت</button></form></td></tr>' for r in rows)
+    return page("سفارش فروشگاه",flash+'<h1>سفارش‌های فروشگاه</h1><div class="card"><p>سفارش‌های پرداخت‌نشده را از این بخش به‌عنوان پرداخت‌شده علامت نزنید. تحویل دستی فقط برای سفارش پرداخت‌شده مجاز است. بازپرداخت درگاه‌های خارجی نیازمند اقدام جداگانه در پنل درگاه است.</p><table><tr><th>شناسه</th><th>محصول</th><th>تعداد</th><th>خریدار</th><th>موبایل</th><th>مبلغ USD</th><th>وضعیت</th><th>کد پیگیری</th><th>زمان ایران</th><th>مدیریت</th></tr>'+tr+'</table></div>',"/product-orders")
 
 @app.post("/product-orders/{oid}/update")
 async def product_order_update(request:Request,oid:int):
     if not get_session(request): return RedirectResponse("/login")
-    f=await request.form(); status=str(f.get("status","paid")); note=str(f.get("delivery_note",""))[:2000]
-    if status not in ("paid","delivered","cancelled","refunded"): status="paid"
+    f=await request.form()
+    status=str(f.get("status",""))
+    note=str(f.get("delivery_note",""))[:2000].strip()
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE product_orders SET status=?,delivery_note=? WHERE id=?",(status,note,oid))
-        if status == "delivered":
-            await db.execute("DELETE FROM products WHERE id=(SELECT product_id FROM product_orders WHERE id=?) AND stock<=0", (oid,))
+        await db.execute("BEGIN IMMEDIATE")
+        row=await (await db.execute("SELECT user_id,wallet_used_usd,wallet_refunded,status,gateway_method,amount_usd FROM product_orders WHERE id=?",(oid,))).fetchone()
+        if not row:
+            await db.rollback()
+            return RedirectResponse("/product-orders?notice=invalid",status_code=303)
+        user_id,wallet_used,wallet_refunded,current_status,gateway_method,total=row
+        if status=="delivered":
+            if current_status not in ("paid","paid_stock_issue") or not note:
+                await db.rollback()
+                return RedirectResponse("/product-orders?notice=invalid",status_code=303)
+            await db.execute("UPDATE product_orders SET status='delivered',delivery_note=? WHERE id=?",(note,oid))
+            await db.execute("DELETE FROM products WHERE id=(SELECT product_id FROM product_orders WHERE id=?) AND stock<=0",(oid,))
+        elif status=="refunded":
+            if current_status not in ("paid","delivered","paid_stock_issue","refund_review"):
+                await db.rollback()
+                return RedirectResponse("/product-orders?notice=invalid",status_code=303)
+            if current_status=="delivered":
+                # سفارش تحویل‌شده، بدون ثبت برگشت فیزیکی/لغو دسترسی، قابل بازپرداخت خودکار نیست.
+                await db.rollback()
+                return RedirectResponse("/product-orders?notice=invalid",status_code=303)
+            if gateway_method=="wallet":
+                if not wallet_refunded and user_id and float(wallet_used or 0)>0:
+                    await db.execute("UPDATE users SET balance=balance+? WHERE telegram_id=?",(float(wallet_used),user_id))
+                    await db.execute("INSERT OR IGNORE INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",(user_id,float(wallet_used),"refund",f"admin-product-order-{oid}-refund",datetime.utcnow().isoformat()))
+                await db.execute("UPDATE product_orders SET wallet_refunded=1,status='refunded',delivery_note=? WHERE id=?",(note,oid))
+            else:
+                # پرداخت خارجی را از API درگاه نمی‌توان بدون تأیید ادمین برگشت زد.
+                if not wallet_refunded and user_id and float(wallet_used or 0)>0:
+                    await db.execute("UPDATE users SET balance=balance+? WHERE telegram_id=?",(float(wallet_used),user_id))
+                    await db.execute("INSERT OR IGNORE INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",(user_id,float(wallet_used),"refund",f"admin-product-order-{oid}-refund",datetime.utcnow().isoformat()))
+                await db.execute("UPDATE product_orders SET wallet_refunded=1,status='refund_review',delivery_note=? WHERE id=?",(note,oid))
+                await db.commit()
+                return RedirectResponse("/product-orders?notice=gateway",status_code=303)
+        else:
+            await db.rollback()
+            return RedirectResponse("/product-orders?notice=invalid",status_code=303)
         await db.commit()
-    return RedirectResponse("/product-orders",status_code=303)
+    return RedirectResponse("/product-orders?notice=ok",status_code=303)
 
 
 @app.get("/web-server-orders",response_class=HTMLResponse)
