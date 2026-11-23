@@ -620,7 +620,7 @@ async def customer_account(request: Request):
         server_orders=await (await db.execute("SELECT id,plan_title,location,price_usd,status,created_at,server_db_id FROM web_server_orders WHERE user_id=? ORDER BY id DESC LIMIT 30",(sess["user_id"],))).fetchall()
         rate=float(await core.get_setting(db,"wallet_usd_to_toman","100000") or 100000)
     if not u: return RedirectResponse("/customer/login",status_code=303)
-    tr=''.join('<tr><td>#'+str(o[0])+'</td><td>'+esc(o[1])+' ×'+str(o[2])+'</td><td>'+f'{int(o[3]):,} تومان'+'</td><td>'+esc(o[4])+'</td><td>'+('<a href="/account/order/'+str(o[0])+'">جزئیات / تحویل</a>' if o[5] else '-')+'</td></tr>' for o in orders)
+    tr=''.join('<tr><td>#'+str(o[0])+'</td><td>'+esc(o[1])+' ×'+str(o[2])+'</td><td>'+f'${float(o[3] or 0):.2f} USD'+'</td><td>'+esc(o[4])+'</td><td>'+('<a href="/account/order/'+str(o[0])+'">جزئیات / تحویل</a>' if o[5] else '-')+'</td></tr>' for o in orders)
     body='<h1>حساب کاربری</h1><div class="card"><p>ایمیل: '+esc(u[3] or '-')+' | وضعیت: '+('تأییدشده' if u[4] else 'تأیید نشده')+'</p><h2>موجودی کیف پول: $'+f'{float(u[2] or 0):.2f}'+'</h2><p>نرخ فعلی: هر ۱ دلار = '+f'{rate:,.0f}'+' تومان</p><p><a class="btn" href="/shop">فروشگاه</a> <a class="btn gray" href="/servers/buy">خرید سرور</a> <a href="/customer/login?link=telegram">اتصال تلگرام</a> <a href="/customer/logout">خروج</a></p></div><div class="card"><h2>سفارش‌های من</h2><table><tr><th>سفارش</th><th>محصول</th><th>مبلغ</th><th>وضعیت</th><th>تحویل</th></tr>'+ (tr or '<tr><td colspan="5">هنوز سفارشی ندارید.</td></tr>') + '</table></div>'
     svtr=''.join('<tr><td>#'+str(v[0])+'</td><td>'+esc(v[1])+'</td><td>'+esc(v[2])+'</td><td>'+esc(v[3])+'</td><td>'+esc(v[4])+'</td><td>'+esc(core.iran_time(v[5]).strftime("%Y-%m-%d %H:%M") if core.iran_time(v[5]) else v[5])+'</td><td><code>'+esc(v[6] or "از طریق پنل/ربات تغییر رمز دهید")+'</code></td></tr>' for v in servers)
     body += '<div class="card"><h2>سرورهای من</h2><table><tr><th>شناسه</th><th>نام</th><th>IP</th><th>پلن</th><th>وضعیت</th><th>انقضا</th><th>رمز root</th></tr>'+ (svtr or '<tr><td colspan="7">سروری ثبت نشده است.</td></tr>') + '</table></div>'
@@ -2317,7 +2317,7 @@ async def shop_product(request: Request, pid:int):
     async with aiosqlite.connect(DB_PATH) as db:
         r=await (await db.execute("SELECT id,name,description,image_url,price_usd,stock FROM products WHERE id=? AND active=1",(pid,))).fetchone()
         rate=float(await core.get_setting(db,"wallet_usd_to_toman","100000") or 100000)
-        user=await (await db.execute("SELECT balance,email FROM users WHERE telegram_id=?",(customer["user_id"],))).fetchone() if customer else None
+        user=await (await db.execute("SELECT balance,email,full_name FROM users WHERE telegram_id=?",(customer["user_id"],))).fetchone() if customer else None
         zarin=bool(await core.get_setting(db,"zarinpal_merchant_id","")); oxapay=bool(await core.get_setting(db,"oxapay_api_key","")); nowp=bool(await core.get_setting(db,"nowpayments_api_key",""))
     if not r: return storefront_page("محصول",'<div class="card">محصول پیدا نشد.</div>',customer)
     if not customer:
@@ -2328,7 +2328,7 @@ async def shop_product(request: Request, pid:int):
     if oxapay: methods+='<option value="oxapay">OxaPay (ارزی)</option><option value="mixed_oxapay">کیف پول + مابه‌التفاوت OxaPay</option>'
     if nowp: methods+='<option value="nowpayments">NOWPayments (ارزی)</option><option value="mixed_nowpayments">کیف پول + مابه‌التفاوت NOWPayments</option>'
     balance=float(user[0] or 0) if user else 0
-    body=f'''<h1>{esc(r[1])}</h1><div class="card">{img}<p>{esc(r[2])}</p><h2>${float(r[4]):.2f}</h2><p>موجودی: {r[5]}</p><p>کیف پول شما: ${balance:.2f} | نرخ تبدیل: هر ۱ دلار = {rate:,.0f} تومان</p><form method="post" action="/shop/{pid}/checkout"><label>نام خریدار</label><input name="customer_name" value="{esc((user[1] or '') if user else '')}" required><label>موبایل</label><input name="mobile" required pattern="09[0-9]{{9}}" placeholder="09123456789"><label>ایمیل</label><input name="email" type="email" value="{esc((user[1] or '') if user else '')}"><label>تعداد</label><input name="quantity" type="number" min="1" max="{r[5]}" value="1"><label>روش پرداخت</label><select name="payment_method">{methods}</select><button class="btn green">ثبت سفارش و ادامه پرداخت</button></form></div>'''
+    body=f'''<h1>{esc(r[1])}</h1><div class="card">{img}<p>{esc(r[2])}</p><h2>${float(r[4]):.2f}</h2><p>موجودی: {r[5]}</p><p>کیف پول شما: ${balance:.2f} | نرخ تبدیل: هر ۱ دلار = {rate:,.0f} تومان</p><form method="post" action="/shop/{pid}/checkout"><label>نام خریدار</label><input name="customer_name" value="{esc((user[2] or '') if user else '')}" required><label>موبایل</label><input name="mobile" required pattern="09[0-9]{{9}}" placeholder="09123456789"><label>ایمیل</label><input name="email" type="email" value="{esc((user[1] or '') if user else '')}"><label>تعداد</label><input name="quantity" type="number" min="1" max="{r[5]}" value="1"><label>روش پرداخت</label><select name="payment_method">{methods}</select><button class="btn green">ثبت سفارش و ادامه پرداخت</button></form></div>'''
     return storefront_page(r[1],body,customer)
 
 
