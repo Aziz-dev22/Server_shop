@@ -236,6 +236,7 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_product_orders_status_gateway ON product_orders(status,gateway_method)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_web_server_orders_status_gateway ON web_server_orders(status,gateway_method)")
         await db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('wallet_usd_to_toman','100000')")
+        await db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('wallet_rate_mode','auto')")
         # Legacy prices were stored in Toman; convert them once using the configured rate.
         _rate_row = await (await db.execute("SELECT value FROM settings WHERE key='wallet_usd_to_toman'")).fetchone()
         _rate = float((_rate_row[0] if _rate_row else 100000) or 100000)
@@ -552,6 +553,68 @@ async def set_setting(db, key, value):
         (key, value),
     )
     await db.commit()
+
+
+async def get_usdt_toman_rate(db, require_fresh=False):
+    """نرخ مرجع USDT به تومان از NerkhAra؛ مقدار ذخیره‌شده برحسب تومان است."""
+    mode = (await get_setting(db, "wallet_rate_mode", "auto") or "auto").lower()
+    cached_raw = await get_setting(db, "wallet_usd_to_toman", "100000")
+    try:
+        cached = float(cached_raw)
+    except (TypeError, ValueError):
+        cached = 0.0
+    cached_at_raw = await get_setting(db, "wallet_rate_fetched_at", "")
+    cached_at = None
+    try:
+        cached_at = datetime.fromisoformat(str(cached_at_raw).replace("Z", "+00:00"))
+        if cached_at.tzinfo is None:
+            cached_at = cached_at.replace(tzinfo=timezone.utc)
+        cached_age = (datetime.now(timezone.utc) - cached_at.astimezone(timezone.utc)).total_seconds()
+    except Exception:
+        cached_age = float("inf")
+
+    if mode == "manual":
+        if cached > 0:
+            return cached
+        raise RuntimeError("نرخ دستی تبدیل تنظیم نشده است.")
+
+    if cached > 0 and cached_age < 10 * 60:
+        return cached
+
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            response = await client.get("https://nerkhara.com/api/v1/latest/usdt.json")
+            response.raise_for_status()
+            payload = response.json()
+        item = payload.get("item") or {}
+        price = float(item.get("price") or 0)
+        unit = str(item.get("unit") or "").upper()
+        if unit != "IRT" or price <= 0 or item.get("stale") is True:
+            raise ValueError("داده نرخ‌آرا نامعتبر یا قدیمی است.")
+        updated_raw = item.get("updated_utc")
+        updated = datetime.fromisoformat(str(updated_raw).replace("Z", "+00:00"))
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - updated.astimezone(timezone.utc)).total_seconds()
+        if age < -300 or age > 30 * 60:
+            raise ValueError("زمان به‌روزرسانی نرخ تتر معتبر نیست.")
+
+        await set_setting(db, "wallet_usd_to_toman", str(int(round(price))))
+        await set_setting(db, "wallet_rate_fetched_at", datetime.now(timezone.utc).isoformat())
+        await set_setting(db, "wallet_rate_source_updated_at", updated.astimezone(timezone.utc).isoformat())
+        await set_setting(db, "wallet_rate_source", "NerkhAra")
+        sources = item.get("sources") or []
+        await set_setting(db, "wallet_rate_sources_count", str(len(sources)))
+        return float(price)
+    except Exception as exc:
+        logger.warning("USDT/Toman live rate fetch failed: %s", exc)
+        if cached > 0 and cached_age <= 20 * 60:
+            return cached
+        if require_fresh:
+            raise RuntimeError("دریافت نرخ معتبر و به‌روز تتر ناموفق بود؛ پرداخت ریالی موقتاً متوقف شد.") from exc
+        if cached > 0:
+            return cached
+        raise RuntimeError("نرخ تتر در دسترس نیست.") from exc
 
 
 async def get_ip_change_config(db):
@@ -3398,7 +3461,7 @@ async def telegram_product_detail(call: CallbackQuery):
     except: await call.answer("محصول نامعتبر",show_alert=True); return
     async with aiosqlite.connect(DB_PATH) as db:
         row=await (await db.execute("SELECT name,description,price_usd,stock,delivery_mode FROM products WHERE id=? AND active=1",(pid,))).fetchone()
-        rate=float(await get_setting(db,"wallet_usd_to_toman","100000") or 100000)
+        rate=float(await get_usdt_toman_rate(db, require_fresh=True))
         user=await ensure_user(db,call.from_user.id,call.from_user.username,call.from_user.full_name)
     if not row or row[3]<1:
         await call.answer("موجودی این محصول تمام شده است.",show_alert=True); return
