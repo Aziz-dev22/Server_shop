@@ -99,7 +99,7 @@ def page(title: str, body: str, path: str = "") -> HTMLResponse:
     <a class="logout" href="/logout">🚪 <span>خروج از حساب</span></a>
   </div>
   <div class="content">
-    <div class="page-back"><a href="/admin" onclick="if(history.length>1){history.back();return false}">🔙 بازگشت به صفحه قبل</a></div>
+    <div class="page-back"><a href="/admin" onclick="if(history.length>1){{history.back();return false}}">🔙 بازگشت به صفحه قبل</a></div>
     {body}
     {os.getenv("ENAMAD_WIDGET_HTML", "")}
   </div>
@@ -2255,7 +2255,7 @@ async def admin_wallet_purchase_do(request: Request):
         if total <= 0:
             await db.rollback()
             return page("خطا", '<div class="card">قیمت محصول معتبر نیست.</div>', "/admin-wallet-purchase")
-        rate = float(await core.get_setting(db, "wallet_usd_to_toman", "100000") or 100000)
+        rate = float(await core.get_usdt_toman_rate(db, require_fresh=True))
         now = datetime.utcnow().isoformat()
         cur = await db.execute(
             "INSERT INTO product_orders(product_id,product_name,quantity,customer_name,mobile,email,amount_usd,amount_toman,status,created_at,user_id,wallet_used_usd,gateway_method,gateway_due_toman,currency_rate) "
@@ -2590,18 +2590,31 @@ async def zarinpal_settings_save(request:Request):
 @app.get("/settings/wallet-rate",response_class=HTMLResponse)
 async def wallet_rate_settings(request:Request):
     if not get_session(request): return RedirectResponse("/login")
-    async with aiosqlite.connect(DB_PATH) as db: rate=await core.get_setting(db,"wallet_usd_to_toman","100000")
-    return page("نرخ تبدیل کیف پول",f'<h1>نرخ تبدیل کیف پول</h1><div class="card"><p>قیمت محصولات و موجودی کیف پول برحسب دلار است؛ فقط پرداخت زرین‌پال هنگام پرداخت به تومان تبدیل می‌شود. این نرخ برای محاسبه سهم کیف پول در خرید محصولات و سرورها استفاده می‌شود.</p><form method="post"><label>معادل هر ۱ دلار به تومان</label><input name="rate" type="number" min="1" step="1" value="{esc(rate)}" required><button class="btn green">ذخیره نرخ</button></form></div>',"/settings/wallet-rate")
+    async with aiosqlite.connect(DB_PATH) as db:
+        try: rate=await core.get_usdt_toman_rate(db)
+        except Exception: rate=await core.get_setting(db,"wallet_usd_to_toman","100000")
+        mode=await core.get_setting(db,"wallet_rate_mode","auto")
+        updated=await core.get_setting(db,"wallet_rate_source_updated_at","")
+        source=await core.get_setting(db,"wallet_rate_source","NerkhAra")
+        count=await core.get_setting(db,"wallet_rate_sources_count","")
+    status=("خودکار · "+esc(source)+" · "+(esc(updated) if updated else "هنوز دریافت نشده")+((" · "+esc(count)+" منبع") if count else "")) if mode!="manual" else "دستی توسط مدیر"
+    return page("نرخ تبدیل کیف پول",f'<h1>نرخ تبدیل کیف پول</h1><div class="card"><p>قیمت‌ها و کیف پول برحسب دلار هستند. برای پرداخت ریالی، هر دلار معادل نرخ لحظه‌ای USDT بازار ایران محاسبه می‌شود. منبع خودکار: NerkhAra؛ واحد API تومان است و نرخ تقریباً هر ۱۰ دقیقه تازه‌سازی می‌شود.</p><p><b>وضعیت:</b> {status}</p><p><b>نرخ فعلی:</b> {float(rate):,.0f} تومان برای هر ۱ دلار/تتر</p><form method="post"><label>نرخ دستی (تومان برای هر دلار)</label><input name="rate" type="number" min="1" step="1" value="{esc(rate)}"><button class="btn" name="mode" value="manual">ذخیره و فعال‌کردن نرخ دستی</button><button class="btn green" name="mode" value="auto">فعال‌کردن نرخ خودکار تتر</button></form><p><small>اگر نرخ زنده دریافت نشود و داده معتبر کافی قدیمی باشد، پرداخت ریالی جدید متوقف می‌شود؛ سفارش‌های ثبت‌شده با نرخ زمان ثبت خودشان تسویه می‌شوند.</small></p><p><a href="https://nerkhara.com" target="_blank" rel="noopener">منبع نرخ: NerkhAra</a></p></div>',"/settings/wallet-rate")
 
 
 @app.post("/settings/wallet-rate")
 async def wallet_rate_settings_save(request:Request):
     if not get_session(request): return RedirectResponse("/login")
     form=await request.form()
-    try: rate=int(form.get("rate",0))
-    except: rate=0
-    if rate<1: return RedirectResponse("/settings/wallet-rate",status_code=303)
-    async with aiosqlite.connect(DB_PATH) as db: await core.set_setting(db,"wallet_usd_to_toman",str(rate))
+    mode=str(form.get("mode","manual"))
+    async with aiosqlite.connect(DB_PATH) as db:
+        if mode=="auto":
+            await core.set_setting(db,"wallet_rate_mode","auto")
+        else:
+            try: rate=int(form.get("rate",0))
+            except: rate=0
+            if rate<1: return RedirectResponse("/settings/wallet-rate",status_code=303)
+            await core.set_setting(db,"wallet_usd_to_toman",str(rate))
+            await core.set_setting(db,"wallet_rate_mode","manual")
     return RedirectResponse("/settings/wallet-rate",status_code=303)
 
 
