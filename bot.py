@@ -1831,6 +1831,7 @@ async def refund_product_wallet(order_id: int):
                 await db.execute("UPDATE users SET balance=balance+? WHERE telegram_id=?", (float(row[1]), row[0]))
                 await db.execute("INSERT OR IGNORE INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)", (row[0], float(row[1]), "refund", f"product-order-{order_id}-refund", datetime.utcnow().isoformat()))
             await db.execute("UPDATE product_orders SET wallet_refunded=1,status='payment_failed' WHERE id=?", (order_id,))
+            await finalize_coupon_redemption(db, "product", order_id, False)
         await db.commit()
 
 
@@ -1843,6 +1844,7 @@ async def complete_product_order(order_id: int, reference: str = ""):
             await db.commit()
             return None
         pid, qty, _ = row
+        await finalize_coupon_redemption(db, "product", order_id, True)
         product = await (await db.execute("SELECT delivery_mode FROM products WHERE id=?", (pid,))).fetchone()
         if not product:
             await db.execute("UPDATE product_orders SET status='paid_stock_issue',ref_id=?,paid_at=? WHERE id=?", (reference, datetime.utcnow().isoformat(), order_id))
@@ -5115,6 +5117,7 @@ async def refund_web_server_wallet(order_id: int, failure_status: str = "payment
                 await db.execute("INSERT OR IGNORE INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",(row[0],float(row[1]),"refund",f"web-server-{order_id}-refund",datetime.utcnow().isoformat()))
             status = failure_status if failure_status in ("payment_failed", "creation_failed") else "payment_failed"
             await db.execute("UPDATE web_server_orders SET wallet_refunded=1,status=? WHERE id=?",(status,order_id))
+            await finalize_coupon_redemption(db, "server", order_id, False)
         await db.commit()
 
 
@@ -5126,6 +5129,7 @@ async def complete_web_server_order(order_id: int, reference: str = ""):
         if not row or row[8] != "pending_payment":
             await db.commit(); return None
         await db.execute("UPDATE web_server_orders SET status='creating',paid_at=? WHERE id=?",(datetime.utcnow().isoformat(),order_id))
+        await finalize_coupon_redemption(db, "server", order_id, True)
         await db.commit()
     user_id,ptype,location,plan_id,plan_title,server_type,image,price,_=row
     server_name=f"srv-{user_id}-{secrets.token_hex(3)}"; order_ref=secrets.token_hex(8); provider_id=None
