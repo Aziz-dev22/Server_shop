@@ -11,7 +11,9 @@ REPO_URL="https://github.com/Aziz-dev22/server_shop.git"
 APP_DIR="/opt/hetzner-shop-bot"
 SERVICE_NAME="hetzner-shop-bot"
 PANEL_SERVICE_NAME="hetzner-shop-panel"
+WEBSITE_SERVICE_NAME="hetzner-shop-website"
 PANEL_PORT="8088"
+WEBSITE_PORT="8080"
 BACKUP_DIR="/root/hetzner-shop-bot-backups"
 
 if [ "$EUID" -ne 0 ]; then
@@ -98,13 +100,18 @@ EOF
 
   echo
   echo "[5/5] ساخت و اجرای سرویس‌های systemd (ربات + پنل تحت وب)..."
+  echo "[بررسی] اعتبارسنجی کدهای پایتون..."
+  ./venv/bin/python -m py_compile bot.py panel.py website.py
   write_service_file
   write_panel_service_file
+  write_website_service_file
   systemctl daemon-reload
   systemctl enable ${SERVICE_NAME}
   systemctl enable ${PANEL_SERVICE_NAME}
+  systemctl enable ${WEBSITE_SERVICE_NAME}
   systemctl restart ${SERVICE_NAME}
   systemctl restart ${PANEL_SERVICE_NAME}
+  systemctl restart ${WEBSITE_SERVICE_NAME}
   configure_public_web
 
   SERVER_IP="$(curl -s -4 ifconfig.me 2>/dev/null || echo YOUR_SERVER_IP)"
@@ -113,8 +120,8 @@ EOF
   echo "================================================"
   echo "✅ نصب با موفقیت انجام شد!"
   echo
-  echo "🌐 فروشگاه عمومی:       http://${SERVER_IP}/
-  🔐 پنل مدیریت:          http://${SERVER_IP}/admin"
+  echo "🌐 فروشگاه عمومی:       http://${SERVER_IP}/"
+  echo "🔐 پنل مدیریت:          http://${SERVER_IP}:${PANEL_PORT}/"
   echo "   نام کاربری: ${PANEL_USERNAME}"
   echo "   رمز عبور: (همانی که وارد کردید)"
   echo
@@ -126,8 +133,9 @@ EOF
   echo "  5) اگر پرداخت خودکار ارز دیجیتال می‌خواهید، در «تنظیمات» کلید OxaPay را وارد کنید."
   echo "  6) در «تنظیمات» آدرس واریز دستی (کارت/ولت) را وارد کنید."
   echo "================================================"
-  echo "ℹ️ فروشگاه از طریق پورت 80 در دسترس است؛ پورت داخلی ${PANEL_PORT} را عمومی باز نکنید."
-  echo "   برای امنیت بیشتر توصیه می‌شود پنل را پشت یک دامنه + HTTPS (nginx/certbot) قرار دهید."
+  echo "ℹ️ فروشگاه از طریق پورت 80 و پنل مدیریت از طریق پورت ${PANEL_PORT} در دسترس است."
+  echo "   سرویس فروشگاه روی پورت داخلی ${WEBSITE_PORT} فقط از localhost قابل دسترسی است."
+  echo "   برای ورود و پرداخت واقعی، دامنه و HTTPS را فعال کنید."
   echo "================================================"
 }
 
@@ -145,6 +153,7 @@ do_update() {
   echo "[1/4] توقف موقت سرویس‌ها..."
   systemctl stop ${SERVICE_NAME} 2>/dev/null || true
   systemctl stop ${PANEL_SERVICE_NAME} 2>/dev/null || true
+  systemctl stop ${WEBSITE_SERVICE_NAME} 2>/dev/null || true
 
   echo "[2/4] دریافت آخرین نسخه کد..."
   git -C "$APP_DIR" pull --ff-only
@@ -177,18 +186,23 @@ do_update() {
     echo "PANEL_PASSWORD=${NEW_PANEL_PASSWORD}" >> .env
   fi
 
+  echo "[بررسی] اعتبارسنجی کدهای پایتون..."
+  ./venv/bin/python -m py_compile bot.py panel.py website.py
   echo "[4/4] بازسازی سرویس‌ها و ری‌استارت..."
   write_service_file
   write_panel_service_file
+  write_website_service_file
   systemctl daemon-reload
   systemctl enable ${PANEL_SERVICE_NAME} 2>/dev/null || true
+  systemctl enable ${WEBSITE_SERVICE_NAME} 2>/dev/null || true
   systemctl restart ${SERVICE_NAME}
   systemctl restart ${PANEL_SERVICE_NAME}
+  systemctl restart ${WEBSITE_SERVICE_NAME}
   configure_public_web
 
   echo
   echo "✅ آپدیت انجام شد. فایل .env و دیتابیس شما دست‌نخورده باقی ماندند."
-  echo "🌐 پنل تحت وب روی پورت ${PANEL_PORT} در دسترس است."
+  echo "🌐 فروشگاه عمومی روی پورت 80 و پنل مدیریت روی پورت ${PANEL_PORT} در دسترس هستند."
 }
 
 # ---------------------------------------------------------------------------
@@ -243,6 +257,9 @@ do_uninstall() {
   systemctl stop ${PANEL_SERVICE_NAME} 2>/dev/null || true
   systemctl disable ${PANEL_SERVICE_NAME} 2>/dev/null || true
   rm -f /etc/systemd/system/${PANEL_SERVICE_NAME}.service
+  systemctl stop ${WEBSITE_SERVICE_NAME} 2>/dev/null || true
+  systemctl disable ${WEBSITE_SERVICE_NAME} 2>/dev/null || true
+  rm -f /etc/systemd/system/${WEBSITE_SERVICE_NAME}.service
   systemctl daemon-reload
 
   echo "در حال حذف فایل‌های پروژه..."
@@ -291,6 +308,24 @@ WantedBy=multi-user.target
 EOF
 }
 
+write_website_service_file() {
+  cat > /etc/systemd/system/${WEBSITE_SERVICE_NAME}.service <<EOF
+[Unit]
+Description=CLOUD_CENTER Public Storefront
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${APP_DIR}
+ExecStart=${APP_DIR}/venv/bin/python3 -m uvicorn website:app --host 127.0.0.1 --port ${WEBSITE_PORT}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 # ---------------------------------------------------------------------------
 # وب‌سرور عمومی: نمایش فروشگاه روی IP بدون درج پورت
 # ---------------------------------------------------------------------------
@@ -305,7 +340,7 @@ server {
     server_name _;
     client_max_body_size 20m;
     location / {
-        proxy_pass http://127.0.0.1:${PANEL_PORT};
+        proxy_pass http://127.0.0.1:${WEBSITE_PORT};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -324,6 +359,7 @@ EOF
   systemctl reload nginx || systemctl restart nginx
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow 80/tcp
+    ufw allow ${PANEL_PORT}/tcp
   fi
 }
 
