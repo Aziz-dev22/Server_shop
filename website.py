@@ -358,7 +358,9 @@ async def shop_payment_callback(request:Request):
         if due<=0:return storefront_page("پرداخت",'<div class="card">مبلغ ریالی این سفارش در زمان ثبت ذخیره نشده است؛ برای جلوگیری از دریافت مبلغ اشتباه، پرداخت خودکار متوقف شد. با پشتیبانی تماس بگیرید.</div>')
     else:
         oid,due,st,total_toman=order
-        due=int(due or total_toman)
+        due=int(due or 0)
+        if due<=0:
+            return storefront_page("پرداخت",'<div class="card">مبلغ ریالی این سفارش در زمان ثبت ذخیره نشده است؛ برای جلوگیری از دریافت مبلغ اشتباه، پرداخت خودکار متوقف شد. با پشتیبانی تماس بگیرید.</div>')
         if st == "pending":
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("UPDATE product_orders SET status='pending_payment',gateway_due_toman=? WHERE id=?",(due,oid)); await db.commit()
