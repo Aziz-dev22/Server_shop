@@ -242,7 +242,8 @@ async def reserve_discount_coupon(db, code, applies_to, user_id, subtotal_usd, o
     if not row or not row[10]:
         return 0, None, "کد تخفیف معتبر یا فعال نیست."
     cid, saved_code, scope, kind, value, minimum, max_uses, per_user, starts, expires, active = row
-    if scope != applies_to:
+    allowed_scopes = {part.strip() for part in str(scope or "").split(",") if part.strip()}
+    if applies_to not in allowed_scopes:
         return 0, None, "این کد تخفیف برای این نوع خرید قابل استفاده نیست."
     if starts and now < starts:
         return 0, None, "زمان شروع اعتبار این کد هنوز نرسیده است."
@@ -292,6 +293,11 @@ async def init_db():
         await db.executescript(SCHEMA)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_coupon_redemptions_coupon ON coupon_redemptions(coupon_id,status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_coupon_redemptions_user ON coupon_redemptions(coupon_id,user_id,status)")
+        # کد کمپین CLOUD7 واحد است و برای خرید و تمدید سرور معتبر می‌ماند.
+        await db.execute("""INSERT INTO discount_coupons(code,applies_to,discount_type,discount_value,min_order_usd,active,created_at)
+            VALUES('CLOUD7','server_purchase,server_renewal','percent',7,0,1,?)
+            ON CONFLICT(code) DO UPDATE SET applies_to='server_purchase,server_renewal',discount_type='percent',discount_value=7,active=1""",
+            (datetime.utcnow().isoformat(),))
         # سازگاری با نصب‌های قبلی (اضافه کردن ستون‌های جدید در صورت نبود)
         await _safe_add_column(db, "provider", "label TEXT")
         await _safe_add_column(db, "provider", "active INTEGER DEFAULT 0")
@@ -2125,6 +2131,10 @@ class AdminManualAddress(StatesGroup):
 
 
 class AdminBroadcast(StatesGroup):
+    waiting = State()
+
+
+class RenewCoupon(StatesGroup):
     waiting = State()
 
 
@@ -5798,7 +5808,7 @@ async def adm_broadcast_send(message: Message, state: FSMContext):
     status_msg = await message.answer("⏳ در حال ارسال...")
     for (uid,) in users:
         try:
-            await message.bot.send_message(uid, message.text)
+            await message.bot.send_message(uid, message.text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛒 خرید سرور", url="https://t.me/Cloud_center_bot")]]))
             sent += 1
         except Exception:
             failed += 1
