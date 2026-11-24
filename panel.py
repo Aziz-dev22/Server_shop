@@ -1173,7 +1173,7 @@ async def servers_list(request: Request):
     note = f'<div class="msg ok">{added} سرور جدید از پنل هتزنر همگام‌سازی شد.</div>' if added else ""
     rows = "".join(
         f"<tr><td>{esc(s[1])}</td><td>{esc(s[2])}</td><td>{s[3] or 'بدون مالک'}</td><td>{esc(s[4])}</td>"
-        f"<td>{esc(s[5])}</td><td>{server_action_buttons(s[0], str(s[12] or ""))}</td></tr>"
+        f"<td>{esc(s[5])}</td><td>{server_action_buttons(s[0], str(s[12] or ''))}</td></tr>"
         for s in servers
     )
     body = f"""
