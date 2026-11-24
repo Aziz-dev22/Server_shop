@@ -3470,7 +3470,6 @@ async def telegram_product_detail(call: CallbackQuery):
     except: await call.answer("محصول نامعتبر",show_alert=True); return
     async with aiosqlite.connect(DB_PATH) as db:
         row=await (await db.execute("SELECT name,description,price_usd,stock,delivery_mode FROM products WHERE id=? AND active=1",(pid,))).fetchone()
-        rate=float(await get_usdt_toman_rate(db))
         user=await ensure_user(db,call.from_user.id,call.from_user.username,call.from_user.full_name)
     if not row or row[3]<1:
         await call.answer("موجودی این محصول تمام شده است.",show_alert=True); return
