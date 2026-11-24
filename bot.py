@@ -599,12 +599,21 @@ async def get_usdt_toman_rate(db, require_fresh=False):
         if age < -300 or age > 30 * 60:
             raise ValueError("زمان به‌روزرسانی نرخ تتر معتبر نیست.")
 
-        await set_setting(db, "wallet_usd_to_toman", str(int(round(price))))
-        await set_setting(db, "wallet_rate_fetched_at", datetime.now(timezone.utc).isoformat())
-        await set_setting(db, "wallet_rate_source_updated_at", updated.astimezone(timezone.utc).isoformat())
-        await set_setting(db, "wallet_rate_source", "NerkhAra")
-        sources = item.get("sources") or []
-        await set_setting(db, "wallet_rate_sources_count", str(len(sources)))
+        was_in_transaction = db.in_transaction
+        rate_values = {
+            "wallet_usd_to_toman": str(int(round(price))),
+            "wallet_rate_fetched_at": datetime.now(timezone.utc).isoformat(),
+            "wallet_rate_source_updated_at": updated.astimezone(timezone.utc).isoformat(),
+            "wallet_rate_source": "NerkhAra",
+            "wallet_rate_sources_count": str(len(item.get("sources") or [])),
+        }
+        for key, value in rate_values.items():
+            await db.execute(
+                "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+        if not was_in_transaction:
+            await db.commit()
         return float(price)
     except Exception as exc:
         logger.warning("USDT/Toman live rate fetch failed: %s", exc)
