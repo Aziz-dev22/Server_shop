@@ -271,7 +271,7 @@ async def shop_product(request: Request, pid:int):
     if oxapay: methods+='<option value="oxapay">OxaPay (ارزی)</option><option value="mixed_oxapay">کیف پول + مابه‌التفاوت OxaPay</option>'
     if nowp: methods+='<option value="nowpayments">NOWPayments (ارزی)</option><option value="mixed_nowpayments">کیف پول + مابه‌التفاوت NOWPayments</option>'
     balance=float(user[0] or 0) if user else 0
-    body=f'''<h1>{esc(r[1])}</h1><div class="card">{img}<p>{esc(r[2])}</p><h2>${float(r[4]):.2f}</h2><p>موجودی: {r[5]}</p><p>کیف پول شما: ${balance:.2f} | نرخ تبدیل: هر ۱ دلار = {rate:,.0f} تومان</p><form method="post" action="/shop/{pid}/checkout"><label>نام خریدار</label><input name="customer_name" value="{esc((user[2] or '') if user and user[2] != user[1] else '')}" required><label>موبایل</label><input name="mobile" required pattern="09[0-9]{{9}}" placeholder="09123456789"><label>ایمیل</label><input name="email" type="email" value="{esc((user[1] or '') if user else '')}"><label>تعداد</label><input name="quantity" type="number" min="1" max="{r[5]}" value="1"><label>روش پرداخت</label><select name="payment_method">{methods}</select><button class="btn green">ثبت سفارش و ادامه پرداخت</button></form></div>'''
+    body=f'''<h1>{esc(r[1])}</h1><div class="card">{img}<p>{esc(r[2])}</p><h2>${float(r[4]):.2f}</h2><p>موجودی: {r[5]}</p><p>کیف پول شما: ${balance:.2f} | نرخ تبدیل: هر ۱ دلار = {rate:,.0f} تومان</p><form method="post" action="/shop/{pid}/checkout"><label>نام خریدار</label><input name="customer_name" value="{esc((user[2] or '') if user and user[2] != user[1] else '')}" required><label>موبایل</label><input name="mobile" required pattern="09[0-9]{{9}}" placeholder="09123456789"><label>ایمیل</label><input name="email" type="email" value="{esc((user[1] or '') if user else '')}"><label>تعداد</label><input name="quantity" type="number" min="1" max="{r[5]}" value="1"><label>کد تخفیف (اختیاری)</label><input name="coupon_code" maxlength="32" placeholder="مثلاً CLOUD20"><label>روش پرداخت</label><select name="payment_method">{methods}</select><button class="btn green">ثبت سفارش و ادامه پرداخت</button></form></div>'''
     return storefront_page(r[1],body,customer)
 
 
@@ -321,7 +321,13 @@ async def shop_checkout(request: Request,pid:int):
         rate=float(await core.get_usdt_toman_rate(db, require_fresh=True))
         if not prod or not user or prod[2]<qty or rate<=0:
             await db.rollback();return storefront_page("موجودی",'<div class="card">محصول یا موجودی کافی نیست.</div>',customer)
-        total=round(float(prod[1])*qty, 6); wallet_balance=float(user[0] or 0); wallet_used=0.0
+        total=round(float(prod[1])*qty, 6)
+        coupon_temp=-int(datetime.utcnow().timestamp()*1000000)
+        coupon_discount,coupon_id,coupon_error=await core.reserve_discount_coupon(db,form.get("coupon_code",""),"product_purchase",customer["user_id"],total,"product",coupon_temp)
+        if coupon_error:
+            await db.rollback();return storefront_page("کد تخفیف",'<div class="card">'+esc(coupon_error)+'</div>',customer)
+        total=round(total-coupon_discount,6)
+        wallet_balance=float(user[0] or 0); wallet_used=0.0
         if method=="wallet":
             needed=math.ceil(total*1_000_000)/1_000_000
             if wallet_balance+0.0000001<needed:
@@ -339,6 +345,8 @@ async def shop_checkout(request: Request,pid:int):
             await db.rollback();return storefront_page("خطا",'<div class="card">درگاه پرداخت انتخاب نشده است.</div>',customer)
         cur=await db.execute("INSERT INTO product_orders(product_id,product_name,quantity,customer_name,mobile,email,amount_usd,amount_toman,status,created_at,user_id,wallet_used_usd,gateway_method,gateway_due_toman,currency_rate) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(pid,prod[0],qty,name,mobile,email or user[1] or "",total,int(round(total*rate)),"pending_payment",datetime.utcnow().isoformat(),customer["user_id"],wallet_used,gateway_method if due_usd else "wallet",due_toman,rate))
         order_id=cur.lastrowid
+        if coupon_id:
+            await db.execute("UPDATE coupon_redemptions SET order_id=? WHERE order_type='product' AND order_id=?",(order_id,coupon_temp))
         if wallet_used>0:
             balcur=await db.execute("UPDATE users SET balance=balance-? WHERE telegram_id=? AND balance>=?",(wallet_used,customer["user_id"],wallet_used))
             if balcur.rowcount!=1:
@@ -464,14 +472,14 @@ async def web_server_buy(request: Request):
     if zarin:methods+='<option value="zarinpal">زرین‌پال</option><option value="mixed_zarinpal">کیف پول + مابه‌التفاوت زرین‌پال</option>'
     if oxa:methods+='<option value="oxapay">OxaPay</option><option value="mixed_oxapay">کیف پول + مابه‌التفاوت OxaPay</option>'
     if nowp:methods+='<option value="nowpayments">NOWPayments</option><option value="mixed_nowpayments">کیف پول + مابه‌التفاوت NOWPayments</option>'
-    body=f'<div class="card"><h1>تأیید سفارش سرور</h1><p>{esc(pl[1])} | {esc(location)} | ${price:.2f} در ماه</p><p>موجودی کیف پول: ${float(user[0] or 0):.2f}</p><form method="post" action="/servers/buy/checkout"><input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="location" value="{esc(location)}"><input type="hidden" name="plan_id" value="{plan_id}"><label>سیستم‌عامل</label><select name="image">{img_opts}</select><label>روش پرداخت</label><select name="payment_method">{methods}</select><button class="btn green">ثبت سفارش و پرداخت</button></form></div>'
+    body=f'<div class="card"><h1>تأیید سفارش سرور</h1><p>{esc(pl[1])} | {esc(location)} | ${price:.2f} در ماه</p><p>موجودی کیف پول: ${float(user[0] or 0):.2f}</p><form method="post" action="/servers/buy/checkout"><input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="location" value="{esc(location)}"><input type="hidden" name="plan_id" value="{plan_id}"><label>سیستم‌عامل</label><select name="image">{img_opts}</select><label>کد تخفیف (اختیاری)</label><input name="coupon_code" maxlength="32" placeholder="مثلاً CLOUD20"><label>روش پرداخت</label><select name="payment_method">{methods}</select><button class="btn green">ثبت سفارش و پرداخت</button></form></div>'
     return storefront_page("تأیید سرور",body,customer)
 
 @app.post("/servers/buy/checkout")
 async def web_server_checkout(request:Request):
     customer=get_customer_session(request)
     if not customer:return RedirectResponse("/customer/login",status_code=303)
-    form=await request.form();provider=str(form.get("provider",""));location=str(form.get("location",""));image=str(form.get("image",""));method=str(form.get("payment_method","wallet"))
+    form=await request.form();provider=str(form.get("provider",""));location=str(form.get("location",""));image=str(form.get("image",""));method=str(form.get("payment_method","wallet"));coupon_code=str(form.get("coupon_code",""))
     try:plan_id=int(form.get("plan_id",0))
     except:plan_id=0
     if method not in ("wallet","zarinpal","oxapay","nowpayments","mixed_zarinpal","mixed_oxapay","mixed_nowpayments"):method="wallet"
@@ -502,18 +510,24 @@ async def web_server_checkout(request:Request):
             images=await core.deduplicate_images(await core.images_for_plan(provider,api,plan[2]))
             if str(image) not in {str(x.get("id")) for x in images}:raise ValueError("OS image invalid")
         except Exception:return storefront_page("سیستم‌عامل",'<div class="card">سیستم‌عامل انتخاب‌شده معتبر نیست.</div>',customer)
+        coupon_temp=-int(datetime.utcnow().timestamp()*1000000)
+        coupon_discount,coupon_id,coupon_error=await core.reserve_discount_coupon(db,coupon_code,"server_purchase",customer["user_id"],float(price),"server",coupon_temp)
+        if coupon_error:return storefront_page("کد تخفیف",'<div class="card">'+esc(coupon_error)+'</div>',customer)
+        payable=max(0.0,round(float(price)-coupon_discount,2))
         wallet_balance=float(user[0] or 0) if user else 0
         if method=="wallet":
-            if wallet_balance+0.000001<price:return storefront_page("کیف پول",f'<div class="card">موجودی کافی نیست؛ مبلغ لازم ${price:.2f} است. روش پرداخت ترکیبی را انتخاب کنید.</div>',customer)
-            wallet_used=round(price,2)
-        elif method.startswith("mixed_"):wallet_used=min(max(wallet_balance,0.0),round(price,2))
+            if wallet_balance+0.000001<payable:return storefront_page("کیف پول",f'<div class="card">موجودی کافی نیست؛ مبلغ پس از تخفیف ${payable:.2f} است. روش پرداخت ترکیبی را انتخاب کنید.</div>',customer)
+            wallet_used=round(payable,2)
+        elif method.startswith("mixed_"):wallet_used=min(max(wallet_balance,0.0),round(payable,2))
         else:wallet_used=0.0
         gateway_method=method.split("_",1)[1] if method.startswith("mixed_") else method
-        due=max(0,round(float(price)-wallet_used,2))
+        due=max(0,round(payable-wallet_used,2))
         await db.execute("BEGIN IMMEDIATE")
         due_toman=int(round(due*rate)) if gateway_method=="zarinpal" else 0
         cur=await db.execute("INSERT INTO web_server_orders(user_id,provider_type,location,plan_id,plan_title,server_type,image,price_usd,wallet_used_usd,gateway_method,gateway_due_usd,gateway_due_toman,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(customer["user_id"],provider,location,plan_id,plan[1],plan[2],image,float(price),wallet_used,gateway_method,due,due_toman,"pending_payment",datetime.utcnow().isoformat()))
         oid=cur.lastrowid
+        if coupon_id:
+            await db.execute("UPDATE coupon_redemptions SET order_id=? WHERE order_type='server' AND order_id=?",(oid,coupon_temp))
         if wallet_used>0:
             changed=await db.execute("UPDATE users SET balance=balance-? WHERE telegram_id=? AND balance>=?",(wallet_used,customer["user_id"],wallet_used))
             if changed.rowcount!=1:await db.rollback();return storefront_page("کیف پول",'<div class="card">موجودی کیف پول تغییر کرده؛ دوباره تلاش کنید.</div>',customer)
