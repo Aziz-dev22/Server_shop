@@ -4214,7 +4214,8 @@ async def server_ipchange_confirm(call: CallbackQuery):
 # تمدید سرویس (دوره ۳۰ روزه)
 # ---------------------------------------------------------------------------
 @router.callback_query(F.data.startswith("sv_renew_"))
-async def server_renew_start(call: CallbackQuery):
+async def server_renew_start(call: CallbackQuery, state: FSMContext):
+    await state.clear()
     server_db_id = int(call.data.replace("sv_renew_", ""))
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -4250,6 +4251,7 @@ async def server_renew_start(call: CallbackQuery):
     exp_dt = datetime.fromisoformat(expires_at)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="🎟 وارد کردن کد تخفیف", callback_data=f"rncoupon_{server_db_id}")],
             [InlineKeyboardButton(text=f"✅ تایید تمدید ({fmt_price(monthly_price)})", callback_data=f"rncf_{server_db_id}")],
             [InlineKeyboardButton(text="🔙 انصراف", callback_data="back_main")],
         ]
@@ -4262,8 +4264,58 @@ async def server_renew_start(call: CallbackQuery):
     await call.answer()
 
 
+@router.callback_query(F.data.startswith("rncoupon_"))
+async def server_renew_coupon_start(call: CallbackQuery, state: FSMContext):
+    try:
+        sid = int(call.data.replace("rncoupon_", ""))
+    except (TypeError, ValueError):
+        return await call.answer("شناسه سرور نامعتبر است.", show_alert=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute("SELECT user_id FROM servers WHERE id=?", (sid,))).fetchone()
+    if not row or row[0] != call.from_user.id:
+        return await call.answer("دسترسی غیرمجاز", show_alert=True)
+    await state.set_state(RenewCoupon.waiting)
+    await state.update_data(server_id=sid)
+    await call.message.answer("🎟 کد تخفیف را ارسال کنید؛ کد کمپین: CLOUD7")
+    await call.answer()
+
+
+@router.message(RenewCoupon.waiting)
+async def server_renew_coupon_apply(message: Message, state: FSMContext):
+    data = await state.get_data()
+    sid = int(data.get("server_id") or 0)
+    code = (message.text or "").strip().upper()
+    if not sid or not code:
+        return await message.answer("کد تخفیف معتبر نیست. دوباره ارسال کنید.")
+    preview_id = time.time_ns() % 9000000000000000000
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        row = await (await db.execute("SELECT user_id,monthly_price FROM servers WHERE id=?", (sid,))).fetchone()
+        if not row or row[0] != message.from_user.id or not row[1] or float(row[1]) <= 0:
+            await db.rollback()
+            await state.clear()
+            return await message.answer("سرور یا قیمت تمدید معتبر نیست. دوباره از فهرست سرورها اقدام کنید.")
+        discount, coupon_id, error = await reserve_discount_coupon(
+            db, code, "server_renewal", message.from_user.id, float(row[1]), "server_renewal_preview", preview_id
+        )
+        if error:
+            await db.rollback()
+            return await message.answer("❌ " + error + " دوباره کد را ارسال کنید.")
+        await finalize_coupon_redemption(db, "server_renewal_preview", preview_id, success=False)
+        await db.commit()
+    await state.clear()
+    await state.update_data(server_id=sid, coupon_code=code)
+    await message.answer(
+        f"✅ کد {html.escape(code)} معتبر است.\nمبلغ تمدید: {fmt_price(float(row[1]))}\nتخفیف: {fmt_price(discount)}\nمبلغ قابل پرداخت: {fmt_price(float(row[1])-discount)}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ تأیید تمدید با تخفیف", callback_data=f"rncf_{sid}")],
+            [InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_main")],
+        ])
+    )
+
+
 @router.callback_query(F.data.startswith("rncf_"))
-async def server_renew_confirm(call: CallbackQuery):
+async def server_renew_confirm(call: CallbackQuery, state: FSMContext):
     try:
         server_db_id = int(call.data.replace("rncf_", ""))
     except (TypeError, ValueError):
@@ -4305,11 +4357,25 @@ async def server_renew_confirm(call: CallbackQuery):
             await call.answer("اتصال API این سرور در دسترس نیست.", show_alert=True)
             return
 
+        renewal_data = await state.get_data()
+        coupon_code = str(renewal_data.get("coupon_code") or "").strip().upper() if int(renewal_data.get("server_id") or 0) == server_db_id else ""
+        coupon_discount = 0.0
+        renewal_order_id = time.time_ns() % 9000000000000000000
+        if coupon_code:
+            coupon_discount, coupon_id, coupon_error = await reserve_discount_coupon(
+                db, coupon_code, "server_renewal", owner_id, float(monthly_price), "server_renewal", renewal_order_id
+            )
+            if coupon_error:
+                await db.rollback()
+                await state.clear()
+                await call.answer(coupon_error, show_alert=True)
+                return
+        payable_amount = max(0.0, float(monthly_price) - coupon_discount)
         bal = await (await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,))).fetchone()
-        if not bal or float(bal[0] or 0) < float(monthly_price):
+        if not bal or float(bal[0] or 0) < payable_amount:
             await db.rollback()
             await call.message.edit_text(
-                f"❌ موجودی کافی نیست. موجودی فعلی: {fmt_price(bal[0] if bal else 0)}\\nلطفاً ابتدا کیف پول خود را شارژ کنید."
+                f"❌ موجودی کافی نیست. مبلغ لازم: {fmt_price(payable_amount)} | موجودی فعلی: {fmt_price(bal[0] if bal else 0)}\\nلطفاً ابتدا کیف پول خود را شارژ کنید."
             )
             await call.answer()
             return
@@ -4328,7 +4394,7 @@ async def server_renew_confirm(call: CallbackQuery):
 
         debit = await db.execute(
             "UPDATE users SET balance=balance-? WHERE telegram_id=? AND balance>=?",
-            (float(monthly_price), owner_id, float(monthly_price)),
+            (payable_amount, owner_id, payable_amount),
         )
         if debit.rowcount != 1:
             await db.rollback()
@@ -4337,7 +4403,7 @@ async def server_renew_confirm(call: CallbackQuery):
         try:
             await db.execute(
                 "INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",
-                (owner_id, -float(monthly_price), "server_renewal", renewal_ref, datetime.utcnow().isoformat()),
+                (owner_id, -payable_amount, "server_renewal", renewal_ref, datetime.utcnow().isoformat()),
             )
         except Exception:
             await db.rollback()
@@ -4353,20 +4419,25 @@ async def server_renew_confirm(call: CallbackQuery):
             (new_expiry.isoformat(), deletion_pending_reason or "", deletion_pending_reason or "",
              datetime.utcnow().isoformat(), server_db_id, owner_id),
         )
+        if coupon_code:
+            await finalize_coupon_redemption(db, "server_renewal", renewal_order_id, success=True)
         await db.commit()
 
+    await state.clear()
     if (expired_off_at or traffic_off or deletion_pending_reason):
         try:
             await make_provider_api(provider_type, token).power_action(hetzner_id, "poweron")
         except Exception:
             logger.exception("Renewal succeeded but power-on failed for server %s", server_db_id)
 
-    balance_after = float(bal[0] or 0) - float(monthly_price)
+    balance_after = float(bal[0] or 0) - payable_amount
     poweron_note = "\\n▶️ درخواست روشن‌کردن مجدد سرور ارسال شد." if (expired_off_at or traffic_off or deletion_pending_reason) else ""
     await call.message.edit_text(
         f"✅ سرویس «{html.escape(name)}» با موفقیت تمدید شد.\\n"
         f"مدت تمدید: {RENEWAL_PERIOD_DAYS} روز\\n"
-        f"مبلغ کسرشده: {fmt_price(monthly_price)}\\n"
+        f"مبلغ اصلی: {fmt_price(monthly_price)}\\n"
+        f"تخفیف: {fmt_price(coupon_discount)}\\n"
+        f"مبلغ کسرشده: {fmt_price(payable_amount)}\\n"
         f"مانده کیف پول: {fmt_price(balance_after)}\\n"
         f"مهلت جدید: {iran_time(new_expiry).strftime('%Y-%m-%d %H:%M')} (به وقت ایران){poweron_note}"
     )
