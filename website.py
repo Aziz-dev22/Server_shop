@@ -3,10 +3,28 @@
 Run: uvicorn website:app --host 127.0.0.1 --port 8080
 Customer-facing routes are isolated from the admin panel process.
 """
-from panel import *  # shared DB, settings, customer-session and storefront rendering helpers
+import os
+import re
+import hashlib
+import hmac
+import secrets
+import math
+import httpx
+import aiosqlite
+from pathlib import Path
+from datetime import datetime, timedelta
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+import bot as core
+from website_common import *
 
 app = FastAPI(title="CLOUD_CENTER Storefront")
 app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="static")
+
+@app.on_event("startup")
+async def website_startup():
+    await core.init_db()
 
 def _zarinpal_endpoints(sandbox):
     if sandbox:
