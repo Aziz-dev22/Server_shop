@@ -510,6 +510,7 @@ async def web_server_checkout(request:Request):
             images=await core.deduplicate_images(await core.images_for_plan(provider,api,plan[2]))
             if str(image) not in {str(x.get("id")) for x in images}:raise ValueError("OS image invalid")
         except Exception:return storefront_page("سیستم‌عامل",'<div class="card">سیستم‌عامل انتخاب‌شده معتبر نیست.</div>',customer)
+        await db.execute("BEGIN IMMEDIATE")
         coupon_temp=-int(datetime.utcnow().timestamp()*1000000)
         coupon_discount,coupon_id,coupon_error=await core.reserve_discount_coupon(db,coupon_code,"server_purchase",customer["user_id"],float(price),"server",coupon_temp)
         if coupon_error:return storefront_page("کد تخفیف",'<div class="card">'+esc(coupon_error)+'</div>',customer)
@@ -522,7 +523,6 @@ async def web_server_checkout(request:Request):
         else:wallet_used=0.0
         gateway_method=method.split("_",1)[1] if method.startswith("mixed_") else method
         due=max(0,round(payable-wallet_used,2))
-        await db.execute("BEGIN IMMEDIATE")
         due_toman=int(round(due*rate)) if gateway_method=="zarinpal" else 0
         cur=await db.execute("INSERT INTO web_server_orders(user_id,provider_type,location,plan_id,plan_title,server_type,image,price_usd,wallet_used_usd,gateway_method,gateway_due_usd,gateway_due_toman,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(customer["user_id"],provider,location,plan_id,plan[1],plan[2],image,float(price),wallet_used,gateway_method,due,due_toman,"pending_payment",datetime.utcnow().isoformat()))
         oid=cur.lastrowid
