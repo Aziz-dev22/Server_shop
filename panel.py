@@ -99,6 +99,7 @@ def page(title: str, body: str, path: str = "") -> HTMLResponse:
     <a class="logout" href="/logout">🚪 <span>خروج از حساب</span></a>
   </div>
   <div class="content">
+    <div class="page-back"><a href="/admin" onclick="if(history.length>1){history.back();return false}">🔙 بازگشت به صفحه قبل</a></div>
     {body}
     {os.getenv("ENAMAD_WIDGET_HTML", "")}
   </div>
@@ -110,6 +111,9 @@ def page(title: str, body: str, path: str = "") -> HTMLResponse:
 
 BASE_CSS = """
   * { box-sizing: border-box; }
+  .page-back{display:flex;justify-content:flex-start;margin:0 0 16px}
+  .page-back a{display:inline-flex;align-items:center;gap:8px;padding:9px 15px;border:1px solid var(--border);border-radius:12px;background:rgba(47,155,240,.10);color:var(--txt);text-decoration:none;font-weight:700}
+  .page-back a:hover{background:rgba(47,155,240,.20)}
   :root {
     --bg-1:#0a1628; --bg-2:#0f2544; --card:#12294a; --card-2:#173a68; --border:#26466e;
     --txt:#eef4fc; --txt-dim:#93aed0; --accent:#2f9bf0; --accent-2:#5ec3ff; --accent-3:#8fe0ff;
