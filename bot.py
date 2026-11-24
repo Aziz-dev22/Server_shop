@@ -296,7 +296,7 @@ async def init_db():
         # کد کمپین CLOUD7 واحد است و برای خرید و تمدید سرور معتبر می‌ماند.
         await db.execute("""INSERT INTO discount_coupons(code,applies_to,discount_type,discount_value,min_order_usd,active,created_at)
             VALUES('CLOUD7','server_purchase,server_renewal','percent',7,0,1,?)
-            ON CONFLICT(code) DO UPDATE SET applies_to='server_purchase,server_renewal',discount_type='percent',discount_value=7,active=1""",
+            ON CONFLICT(code) DO UPDATE SET applies_to='server_purchase,server_renewal',discount_type='percent',discount_value=7""",
             (datetime.utcnow().isoformat(),))
         # سازگاری با نصب‌های قبلی (اضافه کردن ستون‌های جدید در صورت نبود)
         await _safe_add_column(db, "provider", "label TEXT")
