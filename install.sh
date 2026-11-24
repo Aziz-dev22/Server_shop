@@ -276,14 +276,18 @@ write_service_file() {
   cat > /etc/systemd/system/${SERVICE_NAME}.service <<EOF
 [Unit]
 Description=Hetzner Shop Telegram Bot
-After=network.target
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 WorkingDirectory=${APP_DIR}
+Environment=PYTHONUNBUFFERED=1
 ExecStart=${APP_DIR}/venv/bin/python3 ${APP_DIR}/bot.py
 Restart=always
 RestartSec=5
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target
