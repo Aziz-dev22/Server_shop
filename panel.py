@@ -30,6 +30,7 @@ import aiosqlite
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from aiogram import Bot
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
@@ -2055,7 +2056,21 @@ async def broadcast_form(request: Request):
     <div class="card">
       <form method="post" action="/broadcast/send">
         <label>متن پیام</label>
-        <textarea name="text" rows="6" required></textarea>
+        <textarea name="text" rows="8" required>☁️ <b>CLOUD_CENTER</b>
+
+🔥 <b>جشنواره تخفیف ویژه سرورها شروع شد!</b>
+
+🎁 با کد تخفیف زیر، از <b>۷٪ تخفیف</b> بهره‌مند شوید:
+
+🏷 <b>کد تخفیف: <code>CLOUD7</code></b>
+
+✅ شامل خرید سرور جدید و تمدید سرورهای فعال
+
+💎 سرور خود را با هزینه کمتر تهیه یا تمدید کنید.
+⏳ فرصت استفاده از این تخفیف را از دست ندهید!
+
+🚀 <b>CLOUD_CENTER | قدرت، سرعت و اطمینان</b></textarea>
+        <label><input type="checkbox" name="add_buy_button" value="1" checked> افزودن دکمه «🛒 خرید سرور» زیر پیام</label>
         <button class="btn" type="submit">ارسال به همه کاربران</button>
       </form>
     </div>
@@ -2077,9 +2092,10 @@ async def broadcast_send(request: Request):
         users = await cur.fetchall()
     bot = Bot(token=core.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     sent = 0
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛒 خرید سرور", url="https://t.me/Cloud_center_bot")]]) if form.get("add_buy_button") == "1" else None
     for (uid,) in users:
         try:
-            await bot.send_message(uid, text)
+            await bot.send_message(uid, text, reply_markup=keyboard)
             sent += 1
         except Exception:
             pass
@@ -2624,7 +2640,7 @@ async def wallet_rate_settings_save(request:Request):
 @app.get("/coupons", response_class=HTMLResponse)
 async def coupons_admin(request: Request):
     if not get_session(request): return RedirectResponse("/login")
-    labels = {"server_purchase":"خرید سرور","server_renewal":"تمدید سرور","product_purchase":"خرید اکانت / محصول","wallet_topup":"شارژ کیف پول"}
+    labels = {"server_purchase":"خرید سرور","server_renewal":"تمدید سرور","server_purchase,server_renewal":"خرید و تمدید سرور","product_purchase":"خرید اکانت / محصول","wallet_topup":"شارژ کیف پول"}
     async with aiosqlite.connect(DB_PATH) as db:
         rows = await (await db.execute(
             "SELECT c.id,c.code,c.applies_to,c.discount_type,c.discount_value,c.min_order_usd,c.max_uses,c.max_uses_per_user,c.starts_at,c.expires_at,c.active,"
@@ -2648,7 +2664,8 @@ async def coupons_admin(request: Request):
       <label>روش ساخت کد</label><select name="code_mode"><option value="manual">کد دلخواه خودم</option><option value="random">تولید تصادفی</option></select>
       <label>کد دلخواه (در حالت تصادفی خالی بگذارید)</label><input name="code" maxlength="32" placeholder="مثلاً CLOUD20">
       <label>قابل استفاده برای</label><select name="applies_to">
-        <option value="server_purchase">خرید سرور</option><option value="server_renewal">تمدید سرور</option>
+        <option value="server_purchase,server_renewal">خرید و تمدید سرور (یک کد مشترک)</option>
+        <option value="server_purchase">فقط خرید سرور</option><option value="server_renewal">فقط تمدید سرور</option>
         <option value="product_purchase">خرید اکانت / محصول</option><option value="wallet_topup">شارژ کیف پول</option>
       </select>
       <label>نوع تخفیف</label><select name="discount_type"><option value="percent">درصدی</option><option value="fixed">مبلغ ثابت (USD)</option></select>
@@ -2678,7 +2695,7 @@ async def coupon_create(request: Request):
         max_uses=int(f.get("max_uses")) if str(f.get("max_uses","")).strip() else None
         per_user=int(f.get("max_uses_per_user")) if str(f.get("max_uses_per_user","")).strip() else None
     except Exception: return RedirectResponse("/coupons",status_code=303)
-    if not code or len(code)>32 or not code.replace("-","").replace("_","").isalnum() or scope not in ("server_purchase","server_renewal","product_purchase","wallet_topup") or kind not in ("percent","fixed") or value<=0 or minimum<0 or (kind=="percent" and value>100) or (max_uses is not None and max_uses<1) or (per_user is not None and per_user<1):
+    if not code or len(code)>32 or not code.replace("-","").replace("_","").isalnum() or scope not in ("server_purchase","server_renewal","server_purchase,server_renewal","product_purchase","wallet_topup") or kind not in ("percent","fixed") or value<=0 or minimum<0 or (kind=="percent" and value>100) or (max_uses is not None and max_uses<1) or (per_user is not None and per_user<1):
         return RedirectResponse("/coupons",status_code=303)
     def parse_dt(v):
         v=str(v or "").strip()
