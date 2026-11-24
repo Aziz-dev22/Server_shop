@@ -3470,7 +3470,7 @@ async def telegram_product_detail(call: CallbackQuery):
     except: await call.answer("محصول نامعتبر",show_alert=True); return
     async with aiosqlite.connect(DB_PATH) as db:
         row=await (await db.execute("SELECT name,description,price_usd,stock,delivery_mode FROM products WHERE id=? AND active=1",(pid,))).fetchone()
-        rate=float(await get_usdt_toman_rate(db, require_fresh=True))
+        rate=float(await get_usdt_toman_rate(db))
         user=await ensure_user(db,call.from_user.id,call.from_user.username,call.from_user.full_name)
     if not row or row[3]<1:
         await call.answer("موجودی این محصول تمام شده است.",show_alert=True); return
@@ -3495,7 +3495,7 @@ async def telegram_product_wallet_buy(call: CallbackQuery):
         await db.execute("BEGIN IMMEDIATE")
         prod=await (await db.execute("SELECT name,price_usd,stock FROM products WHERE id=? AND active=1",(pid,))).fetchone()
         user=await ensure_user(db,call.from_user.id,call.from_user.username,call.from_user.full_name)
-        rate=float(await get_setting(db,"wallet_usd_to_toman","100000") or 100000)
+        rate=float(await get_usdt_toman_rate(db, require_fresh=True))
         if not prod or prod[2]<1 or rate<=0:
             await db.rollback();await call.answer("موجودی محصول تمام شده است.",show_alert=True);return
         amount=math.ceil(float(prod[1])*1_000_000)/1_000_000
