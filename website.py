@@ -151,7 +151,7 @@ async def customer_account(request: Request):
             "AND NOT EXISTS (SELECT 1 FROM servers d WHERE d.provider_type IS s.provider_type AND d.provider_id IS s.provider_id "
             "AND d.hetzner_id=s.hetzner_id AND d.user_id=s.user_id AND d.id<s.id) ORDER BY s.id DESC LIMIT 30",(sess["user_id"],))).fetchall()
         server_orders=await (await db.execute("SELECT id,plan_title,location,price_usd,status,created_at,server_db_id FROM web_server_orders WHERE user_id=? ORDER BY id DESC LIMIT 30",(sess["user_id"],))).fetchall()
-        rate=float(await core.get_setting(db,"wallet_usd_to_toman","100000") or 100000)
+        rate=float(await core.get_usdt_toman_rate(db))
     if not u: return RedirectResponse("/customer/login",status_code=303)
     tr=''.join('<tr><td>#'+str(o[0])+'</td><td>'+esc(o[1])+' ×'+str(o[2])+'</td><td>'+f'${float(o[3] or 0):.2f} USD'+'</td><td>'+esc(o[4])+'</td><td>'+('<a href="/account/order/'+str(o[0])+'">جزئیات / تحویل</a>' if o[5] else '-')+'</td></tr>' for o in orders)
     body='<h1>حساب کاربری</h1><div class="card"><p>ایمیل: '+esc(u[3] or '-')+' | وضعیت: '+('تأییدشده' if u[4] else 'تأیید نشده')+'</p><h2>موجودی کیف پول: $'+f'{float(u[2] or 0):.2f}'+'</h2><p>نرخ فعلی: هر ۱ دلار = '+f'{rate:,.0f}'+' تومان</p><p><a class="btn" href="/shop">فروشگاه</a> <a class="btn gray" href="/servers/buy">خرید سرور</a> <a href="/customer/login?link=telegram">اتصال تلگرام</a> <a href="/customer/logout">خروج</a></p></div><div class="card"><h2>سفارش‌های من</h2><table><tr><th>سفارش</th><th>محصول</th><th>مبلغ</th><th>وضعیت</th><th>تحویل</th></tr>'+ (tr or '<tr><td colspan="5">هنوز سفارشی ندارید.</td></tr>') + '</table></div>'
@@ -235,7 +235,7 @@ async def shop_product(request: Request, pid:int):
     customer=get_customer_session(request)
     async with aiosqlite.connect(DB_PATH) as db:
         r=await (await db.execute("SELECT id,name,description,image_url,price_usd,stock FROM products WHERE id=? AND active=1",(pid,))).fetchone()
-        rate=float(await core.get_setting(db,"wallet_usd_to_toman","100000") or 100000)
+        rate=float(await core.get_usdt_toman_rate(db))
         user=await (await db.execute("SELECT balance,email,full_name FROM users WHERE telegram_id=?",(customer["user_id"],))).fetchone() if customer else None
         zarin=bool(await core.get_setting(db,"zarinpal_merchant_id","")); oxapay=bool(await core.get_setting(db,"oxapay_api_key","")); nowp=bool(await core.get_setting(db,"nowpayments_api_key",""))
     if not r: return storefront_page("محصول",'<div class="card">محصول پیدا نشد.</div>',customer)
@@ -294,7 +294,7 @@ async def shop_checkout(request: Request,pid:int):
         await db.execute("BEGIN IMMEDIATE")
         prod=await (await db.execute("SELECT name,price_usd,stock FROM products WHERE id=? AND active=1",(pid,))).fetchone()
         user=await (await db.execute("SELECT balance,email,full_name FROM users WHERE telegram_id=?",(customer["user_id"],))).fetchone()
-        rate=float(await core.get_setting(db,"wallet_usd_to_toman","100000") or 100000)
+        rate=float(await core.get_usdt_toman_rate(db, require_fresh=True))
         if not prod or not user or prod[2]<qty or rate<=0:
             await db.rollback();return storefront_page("موجودی",'<div class="card">محصول یا موجودی کافی نیست.</div>',customer)
         total=round(float(prod[1])*qty, 6); wallet_balance=float(user[0] or 0); wallet_used=0.0
@@ -350,11 +350,12 @@ async def shop_payment_callback(request:Request):
         if not order:
             server_order=await (await db.execute("SELECT id,gateway_due_usd,status,gateway_due_toman FROM web_server_orders WHERE authority=?",(authority,))).fetchone()
         merchant=await core.get_setting(db,"zarinpal_merchant_id",""); sandbox=(await core.get_setting(db,"zarinpal_sandbox","0")) in ("1","true","yes")
-        rate=float(await core.get_setting(db,"wallet_usd_to_toman","100000") or 100000)
+        
     if not order and not server_order:return storefront_page("سفارش",'<div class="card">سفارش یافت نشد.</div>')
     is_server=server_order is not None
     if is_server:
-        oid,due_usd,st,due=server_order; due=int(due or round(float(due_usd)*rate))
+        oid,due_usd,st,due=server_order; due=int(due or 0)
+        if due<=0:return storefront_page("پرداخت",'<div class="card">مبلغ ریالی این سفارش در زمان ثبت ذخیره نشده است؛ برای جلوگیری از دریافت مبلغ اشتباه، پرداخت خودکار متوقف شد. با پشتیبانی تماس بگیرید.</div>')
     else:
         oid,due,st,total_toman=order
         due=int(due or total_toman)
@@ -431,7 +432,7 @@ async def web_server_buy(request: Request):
     img_opts=''.join(f'<option value="{esc(i.get("id"))}">{esc(i.get("name") or i.get("description") or i.get("id"))}</option>' for i in images)
     async with aiosqlite.connect(DB_PATH) as db:
         user=await (await db.execute("SELECT balance FROM users WHERE telegram_id=?",(customer["user_id"],))).fetchone()
-        rate=float(await core.get_setting(db,"wallet_usd_to_toman","100000") or 100000)
+        rate=float(await core.get_usdt_toman_rate(db))
         zarin=bool(await core.get_setting(db,"zarinpal_merchant_id",""));oxa=bool(await core.get_setting(db,"oxapay_api_key",""));nowp=bool(await core.get_setting(db,"nowpayments_api_key",""))
     methods='<option value="wallet">فقط کیف پول</option>'
     if zarin:methods+='<option value="zarinpal">زرین‌پال</option><option value="mixed_zarinpal">کیف پول + مابه‌التفاوت زرین‌پال</option>'
@@ -453,7 +454,7 @@ async def web_server_checkout(request:Request):
         token=await core.get_active_token_for(db,provider);api=core.make_provider_api(provider,token) if token else None
         plan=await (await db.execute("SELECT id,title,server_type,markup_percent FROM plans WHERE id=? AND active=1 AND provider_type=? AND (location IS NULL OR location='' OR location=?)",(plan_id,provider,location))).fetchone()
         user=await (await db.execute("SELECT balance FROM users WHERE telegram_id=?",(customer["user_id"],))).fetchone()
-        rate=float(await core.get_setting(db,"wallet_usd_to_toman","100000") or 100000)
+        rate=float(await core.get_usdt_toman_rate(db, require_fresh=True))
         pricing=None;types=None
         if provider=="hetzner":
             providers=await core.get_active_providers(db,provider)
