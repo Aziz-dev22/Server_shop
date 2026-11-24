@@ -190,6 +190,12 @@ async def public_home(request: Request):
     body = """
     <section class="cc-hero">
       <div class="cc-kicker">CLOUD INFRASTRUCTURE • CLOUD_CENTER</div>
+      <div class="cc-visual" aria-label="نمایش گرافیکی متحرک زیرساخت ابری">
+        <div class="cc-orbit"><i></i></div><div class="cc-orbit two"><i></i></div>
+        <div class="cc-globe"><div class="cc-globe-grid"></div></div>
+        <div class="cc-float-card left"><b><span class="cc-pulse-dot"></span>شبکه ابری فعال</b><small>Cloud Network</small></div>
+        <div class="cc-float-card right"><b>دیتاسنترهای جهانی</b><small>Global Infrastructure</small></div>
+      </div>
       <h1>زیرساخت ابری <span>هوشمند</span></h1>
       <p>سرور مجازی و محصولات دیجیتال را با چند مرحله ساده تهیه کنید؛ از انتخاب دیتاسنتر و سیستم‌عامل تا پرداخت و مدیریت سفارش، همه‌چیز در یک پنل.</p>
       <a class="cc-primary" href="/servers/buy">ساخت سرور <span>‹</span></a>
