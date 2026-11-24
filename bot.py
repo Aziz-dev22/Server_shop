@@ -97,13 +97,6 @@ async def universal_fsm_cancel(message: Message, state: FSMContext):
     await message.answer("❌ عملیات لغو شد. به منوی اصلی برگشتید.", reply_markup=main_menu_kb(is_admin(message.from_user.id)))
 
 
-@router.callback_query(F.data == "cancel_fsm")
-async def universal_callback_cancel(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await call.message.answer("❌ عملیات لغو شد.", reply_markup=main_menu_kb(is_admin(call.from_user.id)))
-    await call.answer()
-
-
 class AdminSupportSettings(StatesGroup):
     waiting_id = State()
     waiting_message = State()
@@ -1896,7 +1889,6 @@ def main_menu_kb(admin: bool):
         [KeyboardButton(text="💰 کیف پول"), KeyboardButton(text="👤 پروفایل")],
         [KeyboardButton(text="🆘 پشتیبانی")],
     ]
-    rows.append([KeyboardButton(text="❌ لغو عملیات")])
     if admin:
         rows.append([KeyboardButton(text="⚙️ پنل مدیریت")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
@@ -2795,7 +2787,6 @@ async def buy_start(message: Message, state: FSMContext):
         [InlineKeyboardButton(text=PROVIDER_LABELS.get(p, p), callback_data=f"buyprov_{p}")] for p in enabled
     ]
     kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_main")])
-    kb_rows.append([InlineKeyboardButton(text="❌ لغو عملیات", callback_data="cancel_fsm")])
     await state.set_state(BuyFlow.provider)
     await message.answer("🌍 کدام سرویس‌دهنده را می‌خواهید؟", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
@@ -2851,7 +2842,6 @@ async def _buy_show_locations(message: Message, state: FSMContext, provider_type
         for loc in locations
     ]
     kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_main")])
-    kb_rows.append([InlineKeyboardButton(text="❌ لغو عملیات", callback_data="cancel_fsm")])
     await state.set_state(BuyFlow.location)
     text = "📍 یک دیتاسنتر انتخاب کنید:"
     if edit:
@@ -2997,7 +2987,6 @@ async def _render_location_plans(call: CallbackQuery, state: FSMContext, locatio
     await state.update_data(location=location, pricing=pricing, types_list=types_list)
     kb_rows.append([InlineKeyboardButton(text="🔄 همگام‌سازی موجودی", callback_data=f"stock_sync_{location}")])
     kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت به لوکیشن‌ها", callback_data="back_buy_locations")])
-    kb_rows.append([InlineKeyboardButton(text="❌ لغو عملیات", callback_data="cancel_fsm")])
     await state.set_state(BuyFlow.plan)
     text = "📦 پلن موردنظر را انتخاب کنید (قیمت ماهانه زنده است):"
     if call.message.text:
@@ -3070,7 +3059,6 @@ async def buy_plan(call: CallbackQuery, state: FSMContext):
         return
     kb_rows = [[InlineKeyboardButton(text=f"{img.get('name')}", callback_data=f"img_{img['id']}")] for img in images[:100]]
     kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت به پلن‌ها", callback_data="back_buy_plan")])
-    kb_rows.append([InlineKeyboardButton(text="❌ لغو عملیات", callback_data="cancel_fsm")])
     await state.set_state(BuyFlow.image)
     await call.message.edit_text("💿 سیستم‌عامل را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
     await call.answer()
@@ -3107,7 +3095,6 @@ async def back_buy_image(call: CallbackQuery, state: FSMContext):
         return
     rows = [[InlineKeyboardButton(text=img.get("name", "سیستم‌عامل"), callback_data=f"img_{img['id']}")] for img in images[:100]]
     rows.append([InlineKeyboardButton(text="🔙 بازگشت به پلن‌ها", callback_data="back_buy_plan")])
-    rows.append([InlineKeyboardButton(text="❌ لغو عملیات", callback_data="cancel_fsm")])
     await state.set_state(BuyFlow.image)
     await call.message.edit_text("💿 سیستم‌عامل را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await call.answer()
@@ -3142,7 +3129,6 @@ async def buy_image(call: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="✅ خرید با کیف پول", callback_data="confirm_buy")],
             [InlineKeyboardButton(text="💳 پرداخت مستقیم یا ترکیبی با درگاه", callback_data="webpay_server")],
             [InlineKeyboardButton(text="🔙 بازگشت به سیستم‌عامل‌ها", callback_data="back_buy_image")],
-            [InlineKeyboardButton(text="❌ لغو عملیات", callback_data="cancel_fsm")],
         ]
     )
     await state.set_state(BuyFlow.confirm)
@@ -3329,24 +3315,20 @@ async def _buy_confirm_impl(call: CallbackQuery, state: FSMContext):
 # ---------------------------------------------------------------------------
 # سرورهای من (کاربر) - و پایه مشترک برای پنل ادمین
 # ---------------------------------------------------------------------------
-def server_actions_kb(server_id: int, back_callback: str = "my_servers_list", restricted: bool = False):
+def server_actions_kb(server_id: int, back_callback: str = "my_servers_list", restricted: bool = False, admin_owned: bool = False):
+    delete_button = (InlineKeyboardButton(text="🗑 حذف سرور خودم", callback_data=f"svadmin_del_{server_id}") if admin_owned else InlineKeyboardButton(text="🗑 درخواست حذف", callback_data=f"sv_del_{server_id}"))
     if restricted and back_callback != "adm_servers":
         return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⏳ تمدید", callback_data=f"sv_renew_{server_id}"),
-             InlineKeyboardButton(text="🗑 درخواست حذف", callback_data=f"sv_del_{server_id}")],
+            [InlineKeyboardButton(text="⏳ تمدید", callback_data=f"sv_renew_{server_id}"), delete_button],
             [InlineKeyboardButton(text="🔙 بازگشت به فهرست", callback_data=back_callback)],
         ])
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="▶️ روشن", callback_data=f"sv_on_{server_id}"),
-         InlineKeyboardButton(text="⏹ خاموش", callback_data=f"sv_off_{server_id}"),
-         InlineKeyboardButton(text="🔄 ریبوت", callback_data=f"sv_reboot_{server_id}")],
-        [InlineKeyboardButton(text="🔑 تغییر پسورد", callback_data=f"sv_pass_{server_id}"),
-         InlineKeyboardButton(text="🛠 نصب مجدد", callback_data=f"sv_rebuild_{server_id}")],
-        [InlineKeyboardButton(text="🌐 تغییر IP", callback_data=f"sv_ipchange_{server_id}"),
-         InlineKeyboardButton(text="⏳ تمدید", callback_data=f"sv_renew_{server_id}")],
+        [InlineKeyboardButton(text="▶️ روشن", callback_data=f"sv_on_{server_id}"), InlineKeyboardButton(text="⏹ خاموش", callback_data=f"sv_off_{server_id}"), InlineKeyboardButton(text="🔄 ریبوت", callback_data=f"sv_reboot_{server_id}")],
+        [InlineKeyboardButton(text="🔑 تغییر پسورد", callback_data=f"sv_pass_{server_id}"), InlineKeyboardButton(text="🛠 نصب مجدد", callback_data=f"sv_rebuild_{server_id}")],
+        [InlineKeyboardButton(text="🌐 تغییر IP", callback_data=f"sv_ipchange_{server_id}"), InlineKeyboardButton(text="⏳ تمدید", callback_data=f"sv_renew_{server_id}")],
         *([[InlineKeyboardButton(text="🛠 تمدید مدیریتی (۱/۳/۷/۳۰ روز)", callback_data=f"admsvrenew_{server_id}")]] if back_callback == "adm_servers" else []),
         [InlineKeyboardButton(text="📊 نمایش زمان و حجم", callback_data=f"svstats_{server_id}")],
-        [InlineKeyboardButton(text="🗑 درخواست حذف", callback_data=f"sv_del_{server_id}")],
+        [delete_button],
         *([[InlineKeyboardButton(text="👤 تعیین / انتقال مالکیت", callback_data=f"admsvowner_{server_id}")]] if back_callback == "adm_servers" else []),
         [InlineKeyboardButton(text="🔙 بازگشت به فهرست", callback_data=back_callback)],
     ])
@@ -3647,7 +3629,7 @@ async def server_stats_sync(call: CallbackQuery):
 async def show_server_details(call: CallbackQuery):
     sid = int(call.data.rsplit("_", 1)[1])
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id, name, ip, location, plan_title, status, created_at, expires_at, traffic_in_bytes, traffic_out_bytes, traffic_included_bytes, traffic_synced_at, deletion_pending_reason, provider_type FROM servers WHERE id=?", (sid,))
+        cur = await db.execute("SELECT user_id, name, ip, location, plan_title, status, created_at, expires_at, traffic_in_bytes, traffic_out_bytes, traffic_included_bytes, traffic_synced_at, deletion_pending_reason, provider_type, COALESCE(is_admin_owned,0) FROM servers WHERE id=?", (sid,))
         row = await cur.fetchone()
     if not row or (row[0] != call.from_user.id and not is_admin(call.from_user.id)):
         await call.answer("سرور پیدا نشد یا دسترسی ندارید.", show_alert=True)
@@ -3694,7 +3676,7 @@ async def show_server_details(call: CallbackQuery):
     )
     if row[12]:
         text += f"\\n⚠️ درخواست حذف در انتظار ادمین: {row[12]}"
-    await call.message.edit_text(text, reply_markup=server_actions_kb(sid, "adm_servers" if is_admin(call.from_user.id) else "my_servers_list", restricted=bool(row[12]) or bool(row[7] and row[7] <= datetime.utcnow().isoformat())))
+    await call.message.edit_text(text, reply_markup=server_actions_kb(sid, "my_servers_list", restricted=bool(row[12]) or bool(row[7] and row[7] <= datetime.utcnow().isoformat()), admin_owned=is_admin(call.from_user.id) and bool(row[14]) and row[0] == call.from_user.id))
     await call.answer()
 
 
@@ -3797,6 +3779,52 @@ async def server_action(call: CallbackQuery):
     except Exception as e:
         await call.message.answer(f"❌ خطا: {e}")
         await call.answer()
+
+
+@router.callback_query(F.data.startswith("svadmin_del_"))
+async def admin_own_server_delete_prompt(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("دسترسی غیرمجاز", show_alert=True)
+        return
+    sid = int(call.data.rsplit("_", 1)[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute("SELECT name,user_id,COALESCE(is_admin_owned,0),COALESCE(is_protected,0) FROM servers WHERE id=?", (sid,))).fetchone()
+    if not row or row[1] != call.from_user.id or not row[2] or not row[3]:
+        await call.answer("این سرور در مالکیت محافظت‌شده حساب ادمین شما نیست.", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚠️ بله، حذف دائمی سرور", callback_data=f"svadmin_delconfirm_{sid}")],
+        [InlineKeyboardButton(text="🔙 بازگشت به سرور", callback_data=f"svshow_{sid}")],
+    ])
+    await call.message.edit_text(f"⚠️ حذف دائمی سرور «{row[0]}»؟\\nاین عملیات سرور را از ارائه‌دهنده حذف می‌کند و قابل بازگشت نیست.", reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("svadmin_delconfirm_"))
+async def admin_own_server_delete_confirm(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("دسترسی غیرمجاز", show_alert=True)
+        return
+    sid = int(call.data.rsplit("_", 1)[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute("SELECT user_id,hetzner_id,name,provider_type,COALESCE(is_admin_owned,0),COALESCE(is_protected,0) FROM servers WHERE id=?", (sid,))).fetchone()
+        if not row or row[0] != call.from_user.id or not row[4] or not row[5]:
+            await call.answer("مالکیت سرور تأیید نشد؛ حذف انجام نشد.", show_alert=True)
+            return
+        token = await get_token_for_server(db, sid, row[3] or "hetzner")
+    if not token:
+        await call.answer("اتصال API مالک سرور پیدا نشد؛ حذف انجام نشد.", show_alert=True)
+        return
+    try:
+        await make_provider_api(row[3] or "hetzner", token).delete_server(row[1])
+    except Exception as exc:
+        await call.answer(f"حذف از ارائه‌دهنده ناموفق بود: {str(exc)[:150]}", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM servers WHERE id=? AND user_id=? AND is_admin_owned=1 AND is_protected=1", (sid, call.from_user.id))
+        await db.commit()
+    await call.message.edit_text(f"✅ سرور مدیریتی «{row[2]}» حذف شد.")
+    await call.answer("حذف انجام شد")
 
 
 @router.callback_query(F.data.startswith("delapprove_"))
