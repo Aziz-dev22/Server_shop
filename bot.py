@@ -5846,8 +5846,26 @@ async def maintenance_poller(bot: Bot):
 
 
 # ---------------------------------------------------------------------------
-# اجرا
+# اجرا و بازیابی خودکار وظایف پس‌زمینه
 # ---------------------------------------------------------------------------
+async def supervise_background_worker(name, worker_factory):
+    """اگر یکی از کارهای دوره‌ای با خطای پیش‌بینی‌نشده متوقف شد، آن را دوباره اجرا کن."""
+    delay = 5
+    while True:
+        try:
+            logger.info("Background worker starting: %s", name)
+            await worker_factory()
+            logger.warning("Background worker exited unexpectedly: %s", name)
+            delay = 5
+        except asyncio.CancelledError:
+            logger.info("Background worker cancelled: %s", name)
+            raise
+        except Exception:
+            logger.exception("Background worker crashed: %s", name)
+            delay = min(max(delay * 2, 5), 60)
+        await asyncio.sleep(delay)
+
+
 async def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN تنظیم نشده است. فایل .env را بررسی کنید.")
@@ -5857,12 +5875,32 @@ async def main():
     dp.include_router(router)
     router.message.middleware(MembershipMiddleware())
     router.callback_query.middleware(MembershipMiddleware())
-    asyncio.create_task(automatic_backup_poller(bot))
-    asyncio.create_task(oxapay_poller(bot))
-    asyncio.create_task(maintenance_poller(bot))
-    asyncio.create_task(ip_cleanup_poller())
-    logger.info("Bot started.")
-    await dp.start_polling(bot)
+
+    workers = [
+        asyncio.create_task(supervise_background_worker("automatic_backup", lambda: automatic_backup_poller(bot))),
+        asyncio.create_task(supervise_background_worker("payment_status", lambda: oxapay_poller(bot))),
+        asyncio.create_task(supervise_background_worker("server_maintenance", lambda: maintenance_poller(bot))),
+        asyncio.create_task(supervise_background_worker("ip_cleanup", ip_cleanup_poller)),
+    ]
+    delay = 5
+    try:
+        while True:
+            try:
+                logger.info("Telegram polling starting.")
+                await dp.start_polling(bot)
+                logger.error("Telegram polling stopped unexpectedly; retrying.")
+                delay = 5
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Telegram polling crashed; retrying.")
+                delay = min(max(delay * 2, 5), 60)
+            await asyncio.sleep(delay)
+    finally:
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        await bot.session.close()
 
 
 if __name__ == "__main__":
