@@ -101,7 +101,7 @@ EOF
   echo
   echo "[5/5] ساخت و اجرای سرویس‌های systemd (ربات + پنل تحت وب)..."
   echo "[بررسی] اعتبارسنجی کدهای پایتون..."
-  ./venv/bin/python -m py_compile bot.py panel.py website.py
+  ./venv/bin/python -m py_compile bot.py panel.py website.py website_common.py
   write_service_file
   write_panel_service_file
   write_website_service_file
@@ -151,10 +151,9 @@ do_update() {
     exit 1
   fi
   echo "[1/4] دریافت آخرین نسخه کد؛ سرویس‌های فعلی تا پایان بررسی فعال می‌مانند..."
-  echo "[2/4] دریافت آخرین نسخه کد..."
   git -C "$APP_DIR" pull --ff-only
 
-  echo "[3/4] بروزرسانی کتابخانه‌ها..."
+  echo "[2/4] بروزرسانی کتابخانه‌ها..."
   cd "$APP_DIR"
   if [ ! -f "venv/bin/pip" ]; then
     echo "محیط مجازی قبلی ناقص/خراب بود؛ در حال بازسازی با یک نسخه پایتون سازگار..."
@@ -389,6 +388,8 @@ echo
 echo "دستورات مفید مدیریت سرویس‌ها:"
 echo "  وضعیت ربات      : systemctl status ${SERVICE_NAME}"
 echo "  لاگ ربات         : journalctl -u ${SERVICE_NAME} -f"
-echo "  وضعیت پنل تحت وب : systemctl status ${PANEL_SERVICE_NAME}"
-echo "  لاگ پنل تحت وب    : journalctl -u ${PANEL_SERVICE_NAME} -f"
+echo "  وضعیت پنل مدیریت  : systemctl status ${PANEL_SERVICE_NAME}"
+echo "  لاگ پنل مدیریت     : journalctl -u ${PANEL_SERVICE_NAME} -f"
+echo "  وضعیت فروشگاه     : systemctl status ${WEBSITE_SERVICE_NAME}"
+echo "  لاگ فروشگاه        : journalctl -u ${WEBSITE_SERVICE_NAME} -f"
 echo "  ری‌استارت هر سه    : systemctl restart ${SERVICE_NAME} ${PANEL_SERVICE_NAME} ${WEBSITE_SERVICE_NAME}"
