@@ -2172,6 +2172,36 @@ async def broadcast_send(request: Request):
 def _shop_page(title, body):
     return page(title, body, "/products")
 
+@app.get("/products",response_class=HTMLResponse)
+async def products_admin(request:Request):
+    if not get_session(request): return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cats=await (await db.execute("SELECT id,name,active FROM product_categories ORDER BY name")).fetchall()
+        prods=await (await db.execute("SELECT p.id,p.name,c.name,p.price_usd,p.stock,p.active,p.delivery_mode FROM products p LEFT JOIN product_categories c ON c.id=p.category_id WHERE p.active=1 ORDER BY p.id DESC")).fetchall()
+    opts=''.join(f'<option value="{c[0]}">{esc(c[1])}</option>' for c in cats)
+    catrows=''.join(f'<tr><td>{esc(c[1])}</td><td>{"فعال" if c[2] else "غیرفعال"}</td><td><form method="post" action="/product-categories/{c[0]}/toggle"><button class="btn small gray">تغییر وضعیت</button></form></td></tr>' for c in cats)
+    rows=''.join(f'<tr><td>#{r[0]}</td><td>{esc(r[1])}</td><td>{esc(r[2] or "-")}</td><td>${float(r[3]):.2f}</td><td>{r[4]}</td><td>{"تحویل خودکار" if r[6]=="automatic" else "دستی"}</td><td>{"فعال" if r[5] else "غیرفعال"}</td><td><a class="btn small" href="/products/{r[0]}/inventory">مدیریت اکانت‌ها</a> <a class="btn small" href="/products/{r[0]}/edit">ویرایش</a> <form style="display:inline" method="post" action="/products/{r[0]}/toggle"><button class="btn small gray">تغییر وضعیت</button></form></td></tr>' for r in prods)
+    body=f'''<h1>مدیریت فروشگاه</h1><div class="grid"><div class="card"><h3>دسته جدید</h3><form method="post" action="/product-categories/add"><input name="name" required placeholder="نام دسته"><button class="btn">ثبت</button></form></div><div class="card"><h3>محصول جدید</h3><form method="post" action="/products/add"><label>نام</label><input name="name" required><label>دسته</label><select name="category_id"><option value="">بدون دسته</option>{opts}</select><label>توضیحات</label><textarea name="description"></textarea><label>آدرس تصویر</label><input name="image_url"><label>قیمت دلار (USD)</label><input type="number" name="price" min="0.01" step="0.01" required><label>موجودی اولیه (برای تحویل دستی)</label><input type="number" name="stock" min="0" value="1" required><label>روش تحویل</label><select name="delivery_mode"><option value="manual">دستی</option><option value="automatic">خودکار از موجودی اکانت‌های آماده</option></select><button class="btn green">ذخیره محصول</button></form></div></div><div class="card"><h3>دسته‌بندی‌ها</h3><table>{catrows}</table></div><div class="card"><h3>محصولات</h3><table><tr><th>شناسه</th><th>نام</th><th>دسته</th><th>قیمت</th><th>موجودی</th><th>تحویل</th><th>وضعیت</th><th>عملیات</th></tr>{rows}</table></div>'''
+    return page("فروشگاه",body,"/products")
+
+@app.post("/product-categories/add")
+async def category_add(request:Request):
+    if not get_session(request): return RedirectResponse("/login")
+    f=await request.form(); name=str(f.get("name","")).strip()[:80]
+    if name:
+        async with aiosqlite.connect(DB_PATH) as db: await db.execute("INSERT OR IGNORE INTO product_categories(name,created_at) VALUES(?,?)",(name,datetime.utcnow().isoformat())); await db.commit()
+    return RedirectResponse("/products",status_code=303)
+
+@app.post("/product-categories/{cid}/toggle")
+async def category_toggle(request:Request,cid:int):
+    if not get_session(request): return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db: await db.execute("UPDATE product_categories SET active=1-active WHERE id=?",(cid,)); await db.commit()
+    return RedirectResponse("/products",status_code=303)
+
+@app.post("/products/add")
+async def product_add(request:Request):
+    if not get_session(request): return RedirectResponse("/login")
+    f=await request.form(); name=str(f.get("name","")).strip()[:150]; desc=str(f.get("description", ""))[:5000]; img=str(f.get("image_url", ""))[:1000]; mode=str(f.get("delivery_mode","manual")); mode=mode if mode in ("manual","automatic") else "manual"
     try: price=float(f.get("price",0)); stock=int(f.get("stock",1)); cid=int(f.get("category_id")) if f.get("category_id") else None
     except: return RedirectResponse("/products",status_code=303)
     if name and price>0 and stock>=0:
