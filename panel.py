@@ -63,6 +63,7 @@ NAV_ITEMS = [
     ("/wallet-requests", "💳 درخواست‌های شارژ"),
     ("/orders", "📦 سفارش‌ها"),
     ("/products", "🛍 فروشگاه محصولات"),
+    ("/coupons", "🎟 کدهای تخفیف"),
     ("/product-orders", "🧾 سفارش‌های فروشگاه"),
     ("/admin-wallet-purchase", "🛒 خرید مدیریتی از کیف پول"),
     ("/web-server-orders", "🖥 سفارش‌های سرور وب"),
@@ -2617,6 +2618,106 @@ async def wallet_rate_settings_save(request:Request):
             await core.set_setting(db,"wallet_rate_mode","manual")
     return RedirectResponse("/settings/wallet-rate",status_code=303)
 
+
+
+
+@app.get("/coupons", response_class=HTMLResponse)
+async def coupons_admin(request: Request):
+    if not get_session(request): return RedirectResponse("/login")
+    labels = {"server_purchase":"خرید سرور","server_renewal":"تمدید سرور","product_purchase":"خرید اکانت / محصول","wallet_topup":"شارژ کیف پول"}
+    async with aiosqlite.connect(DB_PATH) as db:
+        rows = await (await db.execute(
+            "SELECT c.id,c.code,c.applies_to,c.discount_type,c.discount_value,c.min_order_usd,c.max_uses,c.max_uses_per_user,c.starts_at,c.expires_at,c.active,"
+            "(SELECT COUNT(*) FROM coupon_redemptions r WHERE r.coupon_id=c.id AND r.status='used'),"
+            "(SELECT COUNT(*) FROM coupon_redemptions r WHERE r.coupon_id=c.id AND r.status='reserved') "
+            "FROM discount_coupons c ORDER BY c.id DESC"
+        )).fetchall()
+    table = "".join(
+        "<tr><td><b>"+esc(x[1])+"</b></td><td>"+esc(labels.get(x[2],x[2]))+"</td><td>"+
+        (str(x[4])+"%" if x[3]=="percent" else "$"+format(float(x[4]),".2f"))+
+        "</td><td>$"+format(float(x[5] or 0),".2f")+"</td><td>"+str(x[11])+" استفاده"+
+        (" (در انتظار "+str(x[12])+")" if x[12] else "")+"</td><td>"+("فعال" if x[10] else "غیرفعال")+
+        "</td><td><form method='post' action='/coupons/"+str(x[0])+"/toggle' style='display:inline'><button class='btn small'>تغییر وضعیت</button></form> "+
+        "<form method='post' action='/coupons/"+str(x[0])+"/delete' style='display:inline' onsubmit='return confirm(\"حذف کد؟\")'><button class='btn small danger'>حذف</button></form></td></tr>"
+        for x in rows
+    ) or "<tr><td colspan='7'>هنوز کد تخفیفی ایجاد نشده است.</td></tr>"
+    body = """
+    <h1>🎟 مدیریت کدهای تخفیف</h1>
+    <div class="card"><h2>ایجاد کد جدید</h2>
+    <form method="post" action="/coupons">
+      <label>روش ساخت کد</label><select name="code_mode"><option value="manual">کد دلخواه خودم</option><option value="random">تولید تصادفی</option></select>
+      <label>کد دلخواه (در حالت تصادفی خالی بگذارید)</label><input name="code" maxlength="32" placeholder="مثلاً CLOUD20">
+      <label>قابل استفاده برای</label><select name="applies_to">
+        <option value="server_purchase">خرید سرور</option><option value="server_renewal">تمدید سرور</option>
+        <option value="product_purchase">خرید اکانت / محصول</option><option value="wallet_topup">شارژ کیف پول</option>
+      </select>
+      <label>نوع تخفیف</label><select name="discount_type"><option value="percent">درصدی</option><option value="fixed">مبلغ ثابت (USD)</option></select>
+      <label>مقدار تخفیف</label><input name="discount_value" type="number" min="0.01" step="0.01" required>
+      <label>حداقل مبلغ سفارش (USD)</label><input name="min_order_usd" type="number" min="0" step="0.01" value="0">
+      <label>حداکثر کل استفاده (خالی = نامحدود)</label><input name="max_uses" type="number" min="1">
+      <label>حداکثر استفاده برای هر مشتری (خالی = نامحدود)</label><input name="max_uses_per_user" type="number" min="1">
+      <label>شروع اعتبار (اختیاری)</label><input name="starts_at" type="datetime-local">
+      <label>پایان اعتبار (اختیاری)</label><input name="expires_at" type="datetime-local">
+      <button class="btn green">ایجاد کد تخفیف</button>
+    </form></div>
+    <div class="card"><h2>کدهای ساخته‌شده</h2><div class="table-wrap"><table><thead><tr><th>کد</th><th>نوع خرید</th><th>تخفیف</th><th>حداقل سفارش</th><th>استفاده</th><th>وضعیت</th><th>عملیات</th></tr></thead><tbody>""" + table + """</tbody></table></div></div>
+    """
+    return page("کدهای تخفیف", body, "/coupons")
+
+
+@app.post("/coupons")
+async def coupon_create(request: Request):
+    if not get_session(request): return RedirectResponse("/login")
+    f = await request.form()
+    mode = str(f.get("code_mode","manual"))
+    code = ("CC-"+secrets.token_hex(4)).upper() if mode=="random" else str(f.get("code","")).strip().upper()
+    scope = str(f.get("applies_to",""))
+    kind = str(f.get("discount_type","percent"))
+    try:
+        value=float(f.get("discount_value",0)); minimum=float(f.get("min_order_usd",0) or 0)
+        max_uses=int(f.get("max_uses")) if str(f.get("max_uses","")).strip() else None
+        per_user=int(f.get("max_uses_per_user")) if str(f.get("max_uses_per_user","")).strip() else None
+    except Exception: return RedirectResponse("/coupons",status_code=303)
+    if not code or len(code)>32 or not code.replace("-","").replace("_","").isalnum() or scope not in ("server_purchase","server_renewal","product_purchase","wallet_topup") or kind not in ("percent","fixed") or value<=0 or minimum<0 or (kind=="percent" and value>100) or (max_uses is not None and max_uses<1) or (per_user is not None and per_user<1):
+        return RedirectResponse("/coupons",status_code=303)
+    def parse_dt(v):
+        v=str(v or "").strip()
+        return datetime.fromisoformat(v).isoformat() if v else None
+    try:
+        starts=parse_dt(f.get("starts_at")); expires=parse_dt(f.get("expires_at"))
+        if starts and expires and starts>=expires: return RedirectResponse("/coupons",status_code=303)
+    except Exception: return RedirectResponse("/coupons",status_code=303)
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute("INSERT INTO discount_coupons(code,applies_to,discount_type,discount_value,min_order_usd,max_uses,max_uses_per_user,starts_at,expires_at,active,created_at) VALUES(?,?,?,?,?,?,?,?,?,1,?)",
+                (code,scope,kind,value,minimum,max_uses,per_user,starts,expires,datetime.utcnow().isoformat()))
+            await db.commit()
+        except Exception:
+            await db.rollback()
+    return RedirectResponse("/coupons",status_code=303)
+
+
+@app.post("/coupons/{coupon_id}/toggle")
+async def coupon_toggle(request: Request, coupon_id: int):
+    if not get_session(request): return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE discount_coupons SET active=CASE WHEN active=1 THEN 0 ELSE 1 END WHERE id=?",(coupon_id,))
+        await db.commit()
+    return RedirectResponse("/coupons",status_code=303)
+
+
+@app.post("/coupons/{coupon_id}/delete")
+async def coupon_delete(request: Request, coupon_id: int):
+    if not get_session(request): return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        used=await (await db.execute("SELECT COUNT(*) FROM coupon_redemptions WHERE coupon_id=? AND status IN ('reserved','used')",(coupon_id,))).fetchone()
+        if not used[0]:
+            await db.execute("DELETE FROM discount_coupons WHERE id=?",(coupon_id,))
+            await db.commit()
+        else:
+            await db.execute("UPDATE discount_coupons SET active=0 WHERE id=?",(coupon_id,))
+            await db.commit()
+    return RedirectResponse("/coupons",status_code=303)
 
 @app.on_event("startup")
 async def on_startup():
