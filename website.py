@@ -190,22 +190,40 @@ async def public_home(request: Request):
     body = """
     <section class="cc-hero">
       <div class="cc-kicker">CLOUD INFRASTRUCTURE • CLOUD_CENTER</div>
-      <h1>قدرت میزبانی <span>هوشمند</span></h1>
-      <p>سرورهای مجازی و اکانت‌های معتبر با تحویل سریع، مدیریت آسان و پشتیبانی حرفه‌ای؛ همه‌چیز برای شروع یک زیرساخت مطمئن.</p>
+      <h1>زیرساخت ابری <span>هوشمند</span></h1>
+      <p>سرور مجازی و محصولات دیجیتال را با چند مرحله ساده تهیه کنید؛ از انتخاب دیتاسنتر و سیستم‌عامل تا پرداخت و مدیریت سفارش، همه‌چیز در یک پنل.</p>
       <a class="cc-primary" href="/servers/buy">ساخت سرور <span>‹</span></a>
       <div class="cc-metrics">
-        <div class="cc-metric"><strong>تحویل سریع</strong><small>فرآیند سفارش خودکار</small></div>
-        <div class="cc-metric"><strong>مدیریت آسان</strong><small>پنل اختصاصی مشتریان</small></div>
-        <div class="cc-metric"><strong>پرداخت منعطف</strong><small>کیف پول و درگاه پرداخت</small></div>
-        <div class="cc-metric"><strong>پشتیبانی حرفه‌ای</strong><small>همراه شما در تمام مراحل</small></div>
+        <div class="cc-metric"><div><strong>تحویل خودکار</strong><small>شروع فرایند پس از تأیید پرداخت</small></div></div>
+        <div class="cc-metric"><div><strong>مدیریت مشتری</strong><small>پیگیری سفارش‌ها و سرورها</small></div></div>
+        <div class="cc-metric"><div><strong>پرداخت منعطف</strong><small>کیف پول و درگاه‌های فعال</small></div></div>
+        <div class="cc-metric"><div><strong>پشتیبانی</strong><small>همراهی در مراحل خرید و استفاده</small></div></div>
       </div>
     </section>
     <section class="cc-section">
-      <div class="cc-section-title"><h2>خدمات CLOUD_CENTER</h2><p>زیرساخت موردنیازت را در چند مرحله انتخاب و تهیه کن.</p></div>
+      <div class="cc-section-title"><h2>خدمات CLOUD_CENTER</h2><p>سرویس موردنیازتان را انتخاب کنید و در چند قدم سفارش دهید.</p></div>
       <div class="cc-feature-grid">
-        <a class="cc-feature" href="/servers/buy" style="text-decoration:none"><span class="cc-glow">▣</span><b>خرید سرور مجازی</b><p>انتخاب پلن، موقعیت و سیستم‌عامل و ثبت سفارش از فروشگاه.</p></a>
-        <a class="cc-feature" href="/shop" style="text-decoration:none"><span class="cc-glow">◈</span><b>فروشگاه اکانت</b><p>مشاهده محصولات دیجیتال، موجودی و جزئیات پیش از خرید.</p></a>
-        <a class="cc-feature" href="/account" style="text-decoration:none"><span class="cc-glow">⌘</span><b>حساب کاربری</b><p>پیگیری سفارش‌ها، سرورها و موجودی کیف پول در یک داشبورد.</p></a>
+        <a class="cc-feature" href="/servers/buy"><span class="cc-glow">▣</span><b>ساخت سرور مجازی</b><p>انتخاب سرویس‌دهنده، دیتاسنتر، پلن و سیستم‌عامل؛ سپس پرداخت و پیگیری سفارش.</p></a>
+        <a class="cc-feature" href="/shop"><span class="cc-glow">◈</span><b>فروشگاه اکانت و محصولات</b><p>مشاهده دسته‌بندی‌ها، بررسی توضیحات و موجودی و دریافت خودکار محصولات دیجیتال.</p></a>
+        <a class="cc-feature" href="/account"><span class="cc-glow">⌘</span><b>پنل امن مشتری</b><p>مدیریت سرورها، مشاهده سفارش‌ها، پیگیری وضعیت و بررسی موجودی کیف پول.</p></a>
+      </div>
+    </section>
+    <section class="cc-section">
+      <div class="cc-section-title"><h2>از انتخاب تا راه‌اندازی</h2><p>مسیر خرید سرور به‌صورت مرحله‌به‌مرحله</p></div>
+      <div class="cc-process">
+        <div class="cc-step"><i>۱</i><b>انتخاب موقعیت</b><p>دیتاسنتر و منطقه مناسب پروژه خود را انتخاب کنید.</p></div>
+        <div class="cc-step"><i>۲</i><b>انتخاب پلن</b><p>منابع سرور و پلن متناسب با نیازتان را بررسی کنید.</p></div>
+        <div class="cc-step"><i>۳</i><b>پرداخت امن</b><p>از کیف پول یا درگاه پرداخت فعال استفاده کنید.</p></div>
+        <div class="cc-step"><i>۴</i><b>دریافت سرور</b><p>پس از تأیید پرداخت، وضعیت سفارش را در حساب ببینید.</p></div>
+      </div>
+      <div class="cc-planet" aria-hidden="true"></div>
+    </section>
+    <section class="cc-section">
+      <div class="cc-section-title"><h2>آماده شروع هستید؟</h2><p>پلن مناسب خود را انتخاب کنید یا محصولات دیجیتال فروشگاه را ببینید.</p></div>
+      <div class="cc-feature-grid">
+        <a class="cc-feature" href="/servers/buy"><span class="cc-glow">⚡</span><b>مشاهده پلن‌های سرور</b><p>انتخاب سرویس‌دهنده و موقعیت و بررسی پلن‌های فعال.</p></a>
+        <a class="cc-feature" href="/shop"><span class="cc-glow">🛍</span><b>ورود به فروشگاه</b><p>مشاهده محصولات موجود و ثبت سفارش آنلاین.</p></a>
+        <a class="cc-feature" href="/customer/login"><span class="cc-glow">♙</span><b>ورود به حساب</b><p>برای مشاهده سفارش‌ها و مدیریت سرویس‌ها وارد شوید.</p></a>
       </div>
     </section>
     """
