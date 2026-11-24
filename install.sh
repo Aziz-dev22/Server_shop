@@ -350,9 +350,8 @@ server {
     }
 }
 EOF
-  if [ -L /etc/nginx/sites-enabled/default ]; then
-    mv /etc/nginx/sites-enabled/default /etc/nginx/sites-enabled/default.disabled
-  fi
+  # فایل default.disabled نیز با الگوی پیش‌فرض nginx لود می‌شود؛ آن را از sites-enabled خارج می‌کنیم.
+  rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-enabled/default.disabled
   ln -sfn /etc/nginx/sites-available/cloud-center /etc/nginx/sites-enabled/cloud-center
   nginx -t
   systemctl enable nginx
