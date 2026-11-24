@@ -5887,7 +5887,7 @@ async def main():
         while True:
             try:
                 logger.info("Telegram polling starting.")
-                await dp.start_polling(bot)
+                await dp.start_polling(bot, handle_signals=False)
                 logger.error("Telegram polling stopped unexpectedly; retrying.")
                 delay = 5
             except asyncio.CancelledError:
