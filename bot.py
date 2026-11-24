@@ -199,9 +199,85 @@ CREATE TABLE IF NOT EXISTS customer_web_tokens (id INTEGER PRIMARY KEY AUTOINCRE
 CREATE TABLE IF NOT EXISTS wallet_transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, amount_usd REAL NOT NULL, kind TEXT NOT NULL, reference TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS admin_server_renewals (id INTEGER PRIMARY KEY AUTOINCREMENT, server_id INTEGER NOT NULL, owner_id INTEGER NOT NULL, admin_id INTEGER NOT NULL, days INTEGER NOT NULL, amount_usd REAL NOT NULL, balance_after REAL NOT NULL, created_at TEXT NOT NULL, reference TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS admin_wallet_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, admin_actor TEXT NOT NULL, target_user_id INTEGER NOT NULL, action TEXT NOT NULL, amount_usd REAL NOT NULL, reference TEXT NOT NULL UNIQUE, details TEXT DEFAULT '', created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS discount_coupons (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ code TEXT NOT NULL UNIQUE COLLATE NOCASE,
+ applies_to TEXT NOT NULL,
+ discount_type TEXT NOT NULL,
+ discount_value REAL NOT NULL,
+ min_order_usd REAL NOT NULL DEFAULT 0,
+ max_uses INTEGER,
+ max_uses_per_user INTEGER,
+ starts_at TEXT,
+ expires_at TEXT,
+ active INTEGER NOT NULL DEFAULT 1,
+ created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS coupon_redemptions (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ coupon_id INTEGER NOT NULL,
+ user_id INTEGER NOT NULL,
+ order_type TEXT NOT NULL,
+ order_id INTEGER NOT NULL,
+ discount_usd REAL NOT NULL,
+ status TEXT NOT NULL DEFAULT 'reserved',
+ created_at TEXT NOT NULL,
+ UNIQUE(order_type,order_id)
+);
 CREATE TABLE IF NOT EXISTS web_server_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, provider_type TEXT NOT NULL, location TEXT NOT NULL, plan_id INTEGER NOT NULL, plan_title TEXT NOT NULL, server_type TEXT NOT NULL, image TEXT NOT NULL, price_usd REAL NOT NULL, wallet_used_usd REAL DEFAULT 0, wallet_refunded INTEGER DEFAULT 0, gateway_method TEXT DEFAULT 'wallet', gateway_track_id TEXT, authority TEXT UNIQUE, gateway_due_usd REAL DEFAULT 0, gateway_due_toman INTEGER DEFAULT 0, status TEXT DEFAULT 'pending_payment', server_db_id INTEGER, created_at TEXT NOT NULL, paid_at TEXT);
 
 """
+
+
+async def reserve_discount_coupon(db, code, applies_to, user_id, subtotal_usd, order_type, order_id):
+    """Validate a coupon and reserve its usage atomically inside the caller's transaction."""
+    code = str(code or "").strip().upper()
+    if not code:
+        return 0, None, ""
+    now = datetime.utcnow().isoformat()
+    row = await (await db.execute(
+        "SELECT id,code,applies_to,discount_type,discount_value,min_order_usd,max_uses,max_uses_per_user,starts_at,expires_at,active "
+        "FROM discount_coupons WHERE code=? COLLATE NOCASE", (code,)
+    )).fetchone()
+    if not row or not row[10]:
+        return 0, None, "کد تخفیف معتبر یا فعال نیست."
+    cid, saved_code, scope, kind, value, minimum, max_uses, per_user, starts, expires, active = row
+    if scope != applies_to:
+        return 0, None, "این کد تخفیف برای این نوع خرید قابل استفاده نیست."
+    if starts and now < starts:
+        return 0, None, "زمان شروع اعتبار این کد هنوز نرسیده است."
+    if expires and now > expires:
+        return 0, None, "اعتبار این کد تخفیف به پایان رسیده است."
+    subtotal = max(0.0, float(subtotal_usd or 0))
+    if subtotal + 1e-8 < float(minimum or 0):
+        return 0, None, "حداقل مبلغ سفارش برای این کد $" + format(float(minimum), ".2f") + " است."
+    used = await (await db.execute(
+        "SELECT COUNT(*) FROM coupon_redemptions WHERE coupon_id=? AND status IN ('reserved','used')", (cid,)
+    )).fetchone()
+    if max_uses is not None and int(used[0]) >= int(max_uses):
+        return 0, None, "ظرفیت استفاده از این کد تخفیف تکمیل شده است."
+    personal = await (await db.execute(
+        "SELECT COUNT(*) FROM coupon_redemptions WHERE coupon_id=? AND user_id=? AND status IN ('reserved','used')",
+        (cid, user_id)
+    )).fetchone()
+    if per_user is not None and int(personal[0]) >= int(per_user):
+        return 0, None, "سقف استفاده شما از این کد تخفیف تکمیل شده است."
+    discount = subtotal * float(value) / 100.0 if kind == "percent" else float(value)
+    discount = min(subtotal, max(0.0, discount))
+    if discount <= 0:
+        return 0, None, "مقدار تخفیف این کد معتبر نیست."
+    await db.execute(
+        "INSERT INTO coupon_redemptions(coupon_id,user_id,order_type,order_id,discount_usd,status,created_at) VALUES(?,?,?,?,?,'reserved',?)",
+        (cid, user_id, order_type, order_id, round(discount, 6), now)
+    )
+    return round(discount, 6), cid, ""
+
+async def finalize_coupon_redemption(db, order_type, order_id, success=True):
+    status = "used" if success else "released"
+    await db.execute(
+        "UPDATE coupon_redemptions SET status=? WHERE order_type=? AND order_id=? AND status='reserved'",
+        (status, order_type, order_id)
+    )
 
 
 async def _safe_add_column(db, table, coldef):
@@ -214,6 +290,8 @@ async def _safe_add_column(db, table, coldef):
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_coupon_redemptions_coupon ON coupon_redemptions(coupon_id,status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_coupon_redemptions_user ON coupon_redemptions(coupon_id,user_id,status)")
         # سازگاری با نصب‌های قبلی (اضافه کردن ستون‌های جدید در صورت نبود)
         await _safe_add_column(db, "provider", "label TEXT")
         await _safe_add_column(db, "provider", "active INTEGER DEFAULT 0")
