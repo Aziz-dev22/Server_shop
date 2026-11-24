@@ -150,11 +150,7 @@ do_update() {
     echo "نصب نشده است. ابتدا گزینه «نصب» را انتخاب کنید."
     exit 1
   fi
-  echo "[1/4] توقف موقت سرویس‌ها..."
-  systemctl stop ${SERVICE_NAME} 2>/dev/null || true
-  systemctl stop ${PANEL_SERVICE_NAME} 2>/dev/null || true
-  systemctl stop ${WEBSITE_SERVICE_NAME} 2>/dev/null || true
-
+  echo "[1/4] دریافت آخرین نسخه کد؛ سرویس‌های فعلی تا پایان بررسی فعال می‌مانند..."
   echo "[2/4] دریافت آخرین نسخه کد..."
   git -C "$APP_DIR" pull --ff-only
 
@@ -188,6 +184,11 @@ do_update() {
 
   echo "[بررسی] اعتبارسنجی کدهای پایتون..."
   ./venv/bin/python -m py_compile bot.py panel.py website.py
+
+  echo "[توقف] کد جدید بدون خطای نحوی است؛ سرویس‌ها برای راه‌اندازی مجدد متوقف می‌شوند..."
+  systemctl stop ${SERVICE_NAME} 2>/dev/null || true
+  systemctl stop ${PANEL_SERVICE_NAME} 2>/dev/null || true
+  systemctl stop ${WEBSITE_SERVICE_NAME} 2>/dev/null || true
   echo "[4/4] بازسازی سرویس‌ها و ری‌استارت..."
   write_service_file
   write_panel_service_file
