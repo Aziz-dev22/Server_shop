@@ -322,37 +322,57 @@ async def shop_checkout(request: Request,pid:int):
     try: qty=int(form.get("quantity",1))
     except: qty=0
     if not name or not mobile.isdigit() or len(mobile)!=11 or not mobile.startswith("09") or qty<1 or qty>100:return storefront_page("خطا",'<div class="card">اطلاعات واردشده معتبر نیست.</div>',customer)
-    order_id=None; due_usd=0.0; due_toman=0; rate=100000; email=email
+    order_id=None; due_usd=0.0; due_toman=0; rate=100000
+    admin_free=int(customer["user_id"]) in core.ADMIN_IDS
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
         prod=await (await db.execute("SELECT name,price_usd,stock FROM products WHERE id=? AND active=1",(pid,))).fetchone()
         user=await (await db.execute("SELECT balance,email,full_name FROM users WHERE telegram_id=?",(customer["user_id"],))).fetchone()
-        rate=float(await core.get_usdt_toman_rate(db, require_fresh=True))
-        if not prod or not user or prod[2]<qty or rate<=0:
+        if not prod or not user or prod[2]<qty:
             await db.rollback();return storefront_page("موجودی",'<div class="card">محصول یا موجودی کافی نیست.</div>',customer)
-        total=round(float(prod[1])*qty, 6)
-        coupon_temp=-int(datetime.utcnow().timestamp()*1000000)
-        coupon_discount,coupon_id,coupon_error=await core.reserve_discount_coupon(db,form.get("coupon_code",""),"product_purchase",customer["user_id"],total,"product",coupon_temp)
-        if coupon_error:
-            await db.rollback();return storefront_page("کد تخفیف",'<div class="card">'+esc(coupon_error)+'</div>',customer)
-        total=round(total-coupon_discount,6)
-        wallet_balance=float(user[0] or 0); wallet_used=0.0
-        if method=="wallet":
-            needed=math.ceil(total*1_000_000)/1_000_000
-            if wallet_balance+0.0000001<needed:
-                await db.rollback();return storefront_page("موجودی کیف پول",f'<div class="card">موجودی کافی نیست. برای پرداخت ترکیبی، روش «کیف پول + مابه‌التفاوت» را انتخاب کنید. مبلغ لازم: ${needed:.2f}</div>',customer)
-            wallet_used=needed
-        elif method.startswith("mixed_"):
-            needed=math.ceil(total*1_000_000)/1_000_000
-            wallet_used=min(max(wallet_balance,0.0),needed)
-        due_usd=max(0.0,round(total-wallet_used,6))
-        gateway_method=method.split("_",1)[1] if method.startswith("mixed_") else method
-        due_toman=int(round(due_usd*rate)) if gateway_method=="zarinpal" else 0
-        if due_usd>0 and method=="wallet":
-            await db.rollback();return storefront_page("خطا",'<div class="card">پرداخت کیف پول کامل نیست.</div>',customer)
-        if due_usd>0 and gateway_method not in ("zarinpal","oxapay","nowpayments"):
-            await db.rollback();return storefront_page("خطا",'<div class="card">درگاه پرداخت انتخاب نشده است.</div>',customer)
-        cur=await db.execute("INSERT INTO product_orders(product_id,product_name,quantity,customer_name,mobile,email,amount_usd,amount_toman,status,created_at,user_id,wallet_used_usd,gateway_method,gateway_due_toman,currency_rate) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(pid,prod[0],qty,name,mobile,email or user[1] or "",total,int(round(total*rate)),"pending_payment",datetime.utcnow().isoformat(),customer["user_id"],wallet_used,gateway_method if due_usd else "wallet",due_toman,rate))
+        try:
+            rate=float(await core.get_setting(db,"wallet_usd_to_toman","100000") or 100000)
+        except (TypeError,ValueError):
+            rate=100000.0
+        if rate<=0: rate=100000.0
+        listed_total=round(float(prod[1])*qty,6)
+        coupon_id=None
+        if admin_free:
+            total=0.0
+            wallet_used=0.0
+            due_usd=0.0
+            gateway_method="admin_free"
+        else:
+            total=listed_total
+            coupon_temp=-int(datetime.utcnow().timestamp()*1000000)
+            coupon_discount,coupon_id,coupon_error=await core.reserve_discount_coupon(
+                db,form.get("coupon_code",""),"product_purchase",customer["user_id"],total,"product",coupon_temp
+            )
+            if coupon_error:
+                await db.rollback();return storefront_page("کد تخفیف",'<div class="card">'+esc(coupon_error)+'</div>',customer)
+            total=round(total-coupon_discount,6)
+            wallet_balance=float(user[0] or 0); wallet_used=0.0
+            if method=="wallet":
+                needed=math.ceil(total*1_000_000)/1_000_000
+                if wallet_balance+0.0000001<needed:
+                    await db.rollback();return storefront_page("موجودی کیف پول",f'<div class="card">موجودی کافی نیست. برای پرداخت ترکیبی، روش «کیف پول + مابه‌التفاوت» را انتخاب کنید. مبلغ لازم: ${needed:.2f}</div>',customer)
+                wallet_used=needed
+            elif method.startswith("mixed_"):
+                needed=math.ceil(total*1_000_000)/1_000_000
+                wallet_used=min(max(wallet_balance,0.0),needed)
+            due_usd=max(0.0,round(total-wallet_used,6))
+            gateway_method=method.split("_",1)[1] if method.startswith("mixed_") else method
+            due_toman=int(round(due_usd*rate)) if gateway_method=="zarinpal" else 0
+            if due_usd>0 and method=="wallet":
+                await db.rollback();return storefront_page("خطا",'<div class="card">پرداخت کیف پول کامل نیست.</div>',customer)
+            if due_usd>0 and gateway_method not in ("zarinpal","oxapay","nowpayments"):
+                await db.rollback();return storefront_page("خطا",'<div class="card">درگاه پرداخت انتخاب نشده است.</div>',customer)
+        cur=await db.execute(
+            "INSERT INTO product_orders(product_id,product_name,quantity,customer_name,mobile,email,amount_usd,amount_toman,status,created_at,user_id,wallet_used_usd,gateway_method,gateway_due_toman,currency_rate) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (pid,prod[0],qty,name,mobile,email or user[1] or "",total,int(round(total*rate)) if not admin_free else 0,
+             "pending_payment",datetime.utcnow().isoformat(),customer["user_id"],wallet_used,
+             gateway_method if due_usd else ("admin_free" if admin_free else "wallet"),due_toman,rate),
+        )
         order_id=cur.lastrowid
         if coupon_id:
             await db.execute("UPDATE coupon_redemptions SET order_id=? WHERE order_type='product' AND order_id=?",(order_id,coupon_temp))
@@ -360,20 +380,23 @@ async def shop_checkout(request: Request,pid:int):
             balcur=await db.execute("UPDATE users SET balance=balance-? WHERE telegram_id=? AND balance>=?",(wallet_used,customer["user_id"],wallet_used))
             if balcur.rowcount!=1:
                 await db.rollback();return storefront_page("کیف پول",'<div class="card">موجودی کیف پول تغییر کرده است؛ دوباره تلاش کنید.</div>',customer)
-            await db.execute("INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",(customer["user_id"],-wallet_used,"product_purchase",f"product-order-{order_id}-debit",datetime.utcnow().isoformat()))
+            await db.execute(
+                "INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",
+                (customer["user_id"],-wallet_used,"product_purchase",f"product-order-{order_id}-debit",datetime.utcnow().isoformat())
+            )
         await db.commit()
     if due_usd==0:
-        token=await core.complete_product_order(order_id,"WALLET")
+        token=await core.complete_product_order(order_id,"ADMIN_FREE" if admin_free else "WALLET")
         if token:
-            base=os.getenv("PUBLIC_BASE_URL",str(request.base_url).rstrip("/")).rstrip("/")
-            return storefront_page("خرید موفق",f'<div class="card"><h1>خرید و تحویل موفق</h1><p>سفارش #{order_id} با کیف پول پرداخت شد.</p><a class="btn green" href="/account/order/{order_id}">مشاهده اطلاعات اکانت</a></div>',customer)
-        return storefront_page("ثبت سفارش",f'<div class="card">پرداخت انجام شد اما موجودی تحویل نیازمند بررسی پشتیبانی است. شماره سفارش #{order_id}</div>',customer)
+            return storefront_page("خرید موفق",f'<div class="card"><h1>خرید و تحویل موفق</h1><p>سفارش #{order_id} {"به‌صورت رایگان برای مدیر" if admin_free else "با کیف پول"} ثبت شد.</p><a class="btn green" href="/account/order/{order_id}">مشاهده اطلاعات اکانت</a></div>',customer)
+        return storefront_page("ثبت سفارش",f'<div class="card">سفارش #{order_id} {"رایگان برای مدیر ثبت شد" if admin_free else "پرداخت شد"} اما تحویل موجودی نیازمند بررسی پشتیبانی است.</div>',customer)
     try:
         return await _create_product_gateway_payment(request,order_id,gateway_method,due_usd,due_toman,rate,email)
     except Exception as exc:
         await core.refund_product_wallet(order_id)
         async with aiosqlite.connect(DB_PATH) as db: await db.execute("UPDATE product_orders SET status='payment_failed' WHERE id=? AND status='pending_payment'",(order_id,)); await db.commit()
         return storefront_page("خطای درگاه",f'<div class="card">ایجاد پرداخت انجام نشد. سهم کیف پول به حساب شما برگشت داده شد. سفارش #{order_id}<p>{esc(str(exc)[:250])}</p></div>',customer)
+
 
 @app.get("/shop/payment/callback",response_class=HTMLResponse)
 async def shop_payment_callback(request:Request):
