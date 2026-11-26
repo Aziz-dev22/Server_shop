@@ -1210,8 +1210,9 @@ async def server_renew_form(request: Request, server_id: int):
         return RedirectResponse("/servers")
     name, expires_at, monthly_price, owner_id, pending_reason = row
     admin_free_renewal = owner_id in core.ADMIN_IDS if owner_id is not None else False
-    if not expires_at or monthly_price is None or float(monthly_price) <= 0:
+    if not expires_at or (not admin_free_renewal and (monthly_price is None or float(monthly_price) <= 0)):
         return page("تمدید سرویس", f"<h1><span class='page-icon icon-blue'>⏳</span> تمدید سرویس</h1><div class='card'>قیمت تمدید سرور «{esc(name)}» هنوز به پلن فعال متصل نشده است؛ ابتدا پلن و قیمت آن را در مدیریت بررسی کنید.</div>", "/servers")
+    monthly_price = float(monthly_price or 0)
     exp_dt = datetime.fromisoformat(expires_at)
     body = f"""
     <h1><span class="page-icon icon-blue">⏳</span> تمدید سرویس «{esc(name)}»</h1>
@@ -1242,11 +1243,12 @@ async def server_renew_do(request: Request, server_id: int):
         if not row:
             return RedirectResponse("/servers")
         owner_id, hetzner_id, expires_at, monthly_price, expired_off_at, provider_type, traffic_off, deletion_pending_reason = row
-        if not expires_at or monthly_price is None or float(monthly_price) <= 0:
+        admin_free_renewal = owner_id in core.ADMIN_IDS if owner_id is not None else False
+        if not expires_at or (not admin_free_renewal and (monthly_price is None or float(monthly_price) <= 0)):
             return RedirectResponse("/servers?err=" + urllib.parse.quote("قیمت تمدید سرور به پلن فعال متصل نشده است"), status_code=303)
+        monthly_price = float(monthly_price or 0)
         cur2 = await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,)) if owner_id is not None else None
         bal_row = await cur2.fetchone() if cur2 else None
-        admin_free_renewal = owner_id in core.ADMIN_IDS if owner_id is not None else False
         # تمدید مالک ادمین رایگان است؛ برای سایر کاربران طبق روال مالی ثبت می‌شود.
         if owner_id is not None and float(monthly_price) > 0 and not bal_row:
             await db.rollback()
@@ -1259,7 +1261,7 @@ async def server_renew_do(request: Request, server_id: int):
         new_expiry = base + timedelta(days=core.RENEWAL_PERIOD_DAYS)
         was_expired_off = bool(expired_off_at)
         balance_after = float(bal_row[0] or 0) if bal_row else 0.0
-        if owner_id is not None and monthly_price > 0:
+        if owner_id is not None and (monthly_price > 0 or admin_free_renewal):
             if not bal_row:
                 await db.rollback()
                 return RedirectResponse("/servers?err=" + urllib.parse.quote("حساب کیف پول مالک پیدا نشد"), status_code=303)
