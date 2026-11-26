@@ -259,12 +259,21 @@ async def shop_product(request: Request, pid:int):
     customer=get_customer_session(request)
     async with aiosqlite.connect(DB_PATH) as db:
         r=await (await db.execute("SELECT id,name,description,image_url,price_usd,stock FROM products WHERE id=? AND active=1",(pid,))).fetchone()
+        inventory_images=await (await db.execute(
+            "SELECT image_url FROM product_inventory WHERE product_id=? AND status='available' AND image_url IS NOT NULL AND image_url!='' ORDER BY id DESC LIMIT 12",
+            (pid,),
+        )).fetchall()
         rate=float(await core.get_usdt_toman_rate(db))
         user=await (await db.execute("SELECT balance,email,full_name FROM users WHERE telegram_id=?",(customer["user_id"],))).fetchone() if customer else None
         zarin=bool(await core.get_setting(db,"zarinpal_merchant_id","")); oxapay=bool(await core.get_setting(db,"oxapay_api_key","")); nowp=bool(await core.get_setting(db,"nowpayments_api_key",""))
     if not r: return storefront_page("محصول",'<div class="card">محصول پیدا نشد.</div>',customer)
+    gallery=''.join(
+        f'<img src="{esc(x[0])}" alt="تصویر جزئیات اکانت" loading="lazy" style="width:100%;max-width:230px;max-height:190px;object-fit:contain;border-radius:12px;background:#08172b;padding:8px">'
+        for x in inventory_images
+    )
+    gallery_html=f'<div class="card"><h3>تصاویر جزئیات اکانت‌های آماده</h3><div style="display:flex;flex-wrap:wrap;gap:12px">{gallery}</div></div>' if gallery else ''
     if not customer:
-        return storefront_page(r[1],f'<div class="card"><h1>{esc(r[1])}</h1><p>{esc(r[2])}</p><h2>${float(r[4]):.2f}</h2><p>برای خرید ابتدا وارد حساب شوید.</p><a class="btn" href="/customer/login">ورود / ثبت‌نام</a></div>',None)
+        return storefront_page(r[1],f'<div class="card"><h1>{esc(r[1])}</h1><p>{esc(r[2])}</p><h2>${float(r[4]):.2f}</h2></div>{gallery_html}<div class="card"><p>برای خرید ابتدا وارد حساب شوید.</p><a class="btn" href="/customer/login">ورود / ثبت‌نام</a></div>',None)
     img=f'<img src="{esc(r[3])}" style="max-width:100%;max-height:300px">' if r[3] else ''
     methods='<option value="wallet">فقط کیف پول</option>'
     if zarin: methods+='<option value="zarinpal">زرین‌پال (ریالی)</option><option value="mixed_zarinpal">کیف پول + مابه‌التفاوت زرین‌پال</option>'
@@ -272,7 +281,7 @@ async def shop_product(request: Request, pid:int):
     if nowp: methods+='<option value="nowpayments">NOWPayments (ارزی)</option><option value="mixed_nowpayments">کیف پول + مابه‌التفاوت NOWPayments</option>'
     balance=float(user[0] or 0) if user else 0
     body=f'''<h1>{esc(r[1])}</h1><div class="card">{img}<p>{esc(r[2])}</p><h2>${float(r[4]):.2f}</h2><p>موجودی: {r[5]}</p><p>کیف پول شما: ${balance:.2f} | نرخ تبدیل: هر ۱ دلار = {rate:,.0f} تومان</p><form method="post" action="/shop/{pid}/checkout"><label>نام خریدار</label><input name="customer_name" value="{esc((user[2] or '') if user and user[2] != user[1] else '')}" required><label>موبایل</label><input name="mobile" required pattern="09[0-9]{{9}}" placeholder="09123456789"><label>ایمیل</label><input name="email" type="email" value="{esc((user[1] or '') if user else '')}"><label>تعداد</label><input name="quantity" type="number" min="1" max="{r[5]}" value="1"><label>کد تخفیف (اختیاری)</label><input name="coupon_code" maxlength="32" placeholder="مثلاً CLOUD20"><label>روش پرداخت</label><select name="payment_method">{methods}</select><button class="btn green">ثبت سفارش و ادامه پرداخت</button></form></div>'''
-    return storefront_page(r[1],body,customer)
+    return storefront_page(r[1],body+gallery_html,customer)
 
 
 async def _create_product_gateway_payment(request: Request, order_id: int, method: str, due_usd: float, due_toman: int, rate: float, email: str):
