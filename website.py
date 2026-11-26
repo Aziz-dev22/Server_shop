@@ -94,9 +94,12 @@ async def customer_email_request(request: Request):
 async def customer_email_verify(request: Request):
     form=await request.form(); email=str(form.get("email"," ")).strip().lower(); code=str(form.get("code"," ")).strip()
     async with aiosqlite.connect(DB_PATH) as db:
+        # قفل نوشتن پیش از خواندن شمارنده، تا درخواست‌های هم‌زمان سقف ۵ تلاش را دور نزنند.
+        await db.execute("BEGIN IMMEDIATE")
         row=await (await db.execute("SELECT id,code_hash,expires_at,attempts FROM customer_login_codes WHERE email=? ORDER BY id DESC LIMIT 1",(email,))).fetchone()
         if not row or row[3]>=5 or datetime.fromisoformat(row[2])<datetime.utcnow() or not hmac.compare_digest(row[1],hashlib.sha256(code.encode()).hexdigest()):
-            if row: await db.execute("UPDATE customer_login_codes SET attempts=attempts+1 WHERE id=?",(row[0],)); await db.commit()
+            if row: await db.execute("UPDATE customer_login_codes SET attempts=attempts+1 WHERE id=?",(row[0],))
+            await db.commit()
             return storefront_page("کد نامعتبر", '<div class="card">کد اشتباه یا منقضی شده است. دوباره درخواست کد کنید.</div>')
         user=await (await db.execute("SELECT telegram_id FROM users WHERE lower(email)=?",(email,))).fetchone()
         if user: uid=int(user[0]); await db.execute("UPDATE users SET email_verified=1 WHERE telegram_id=?",(uid,))
