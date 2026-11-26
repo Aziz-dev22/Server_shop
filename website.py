@@ -579,7 +579,7 @@ async def web_server_checkout(request:Request):
         await db.commit()
     if due==0:
         server_id=await core.complete_web_server_order(oid,"WALLET")
-        if server_id:return storefront_page("خرید سرور",f'<div class="card"><h1>سرور ساخته شد</h1><p>سفارش #{oid} | شناسه سرور #{server_id}</p><a class="btn" href="/account">حساب کاربری</a></div>',customer)
+        if server_id:return storefront_page("خرید سرور",f'<div class="card"><h1>سرور ساخته شد</h1><p>سفارش #{oid} | شناسه سرور #{server_id}</p><p>{"🎁 خرید رایگان ویژه مدیر" if admin_free else "پرداخت با موفقیت ثبت شد."}</p><a class="btn" href="/account">حساب کاربری</a></div>',customer)
         return storefront_page("ساخت سرور",f'<div class="card">پرداخت از کیف پول انجام شد اما ساخت سرور ناموفق بود. سهم کیف پول برگشت داده شده است. شماره سفارش #{oid}</div>',customer)
     try:
         if gateway_method=="zarinpal":
