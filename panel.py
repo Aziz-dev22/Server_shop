@@ -1190,6 +1190,7 @@ async def server_renew_form(request: Request, server_id: int):
     if not row:
         return RedirectResponse("/servers")
     name, expires_at, monthly_price, owner_id, pending_reason = row
+    admin_free_renewal = owner_id in core.ADMIN_IDS if owner_id is not None else False
     if not expires_at or monthly_price is None or float(monthly_price) <= 0:
         return page("تمدید سرویس", f"<h1><span class='page-icon icon-blue'>⏳</span> تمدید سرویس</h1><div class='card'>قیمت تمدید سرور «{esc(name)}» هنوز به پلن فعال متصل نشده است؛ ابتدا پلن و قیمت آن را در مدیریت بررسی کنید.</div>", "/servers")
     exp_dt = datetime.fromisoformat(expires_at)
@@ -1197,7 +1198,7 @@ async def server_renew_form(request: Request, server_id: int):
     <h1><span class="page-icon icon-blue">⏳</span> تمدید سرویس «{esc(name)}»</h1>
     <div class="card">
       <p>مهلت فعلی تا: <b>{core.iran_time(exp_dt).strftime('%Y-%m-%d %H:%M')} (به وقت ایران)</b></p>
-      <p>هزینه تمدید {core.RENEWAL_PERIOD_DAYS} روز دیگر: <b>{core.fmt_price(monthly_price)}</b> (از کیف پول کاربر {owner_id or '-'} کسر می‌شود)</p>
+      <p>هزینه تمدید {core.RENEWAL_PERIOD_DAYS} روز دیگر: <b>{core.fmt_price(0 if admin_free_renewal else monthly_price)}</b> {"(رایگان ویژه مدیر)" if admin_free_renewal else f"(از کیف پول کاربر {owner_id or '-'} کسر می‌شود)"}</p>
       {f"<p class='msg err'>درخواست حذف در انتظار بررسی: {esc(pending_reason)}</p>" if pending_reason else ""}
       <form method="post" action="/servers/{server_id}/renew">
         <button class="btn green" type="submit">✅ تایید و تمدید</button>
