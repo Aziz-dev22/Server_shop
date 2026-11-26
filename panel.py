@@ -42,6 +42,8 @@ DB_PATH = core.DB_PATH
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory=str(Path(__file__).resolve().parent / "static")), name="static")
+UPLOAD_DIR = Path(__file__).resolve().parent / "static" / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 SESSIONS: dict[str, dict] = {}
 SESSION_TTL_HOURS = 12
 
@@ -2176,31 +2178,157 @@ async def product_toggle(request:Request,pid:int):
     async with aiosqlite.connect(DB_PATH) as db: await db.execute("UPDATE products SET active=1-active,updated_at=? WHERE id=?",(datetime.utcnow().isoformat(),pid)); await db.commit()
     return RedirectResponse("/products",status_code=303)
 
+async def _store_inventory_photo(photo: UploadFile | None) -> str:
+    if not photo or not photo.filename:
+        return ""
+    allowed = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+    }
+    ext = allowed.get((photo.content_type or "").lower())
+    if not ext:
+        raise ValueError("فرمت تصویر باید JPG، PNG، WEBP یا GIF باشد.")
+    raw = await photo.read(5 * 1024 * 1024 + 1)
+    if not raw or len(raw) > 5 * 1024 * 1024:
+        raise ValueError("حجم تصویر باید حداکثر ۵ مگابایت باشد.")
+    filename = secrets.token_hex(16) + ext
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    (UPLOAD_DIR / filename).write_bytes(raw)
+    return "/static/uploads/" + filename
+
+
 @app.get("/products/{pid}/inventory",response_class=HTMLResponse)
 async def product_inventory_page(request:Request,pid:int):
-    if not get_session(request): return RedirectResponse("/login")
+    if not get_session(request):
+        return RedirectResponse("/login")
     async with aiosqlite.connect(DB_PATH) as db:
         product=await (await db.execute("SELECT name,delivery_mode FROM products WHERE id=?",(pid,))).fetchone()
-        rows=await (await db.execute("SELECT id,status,order_id,created_at FROM product_inventory WHERE product_id=? ORDER BY id DESC LIMIT 200",(pid,))).fetchall()
-        count=await (await db.execute("SELECT COUNT(*) FROM product_inventory WHERE product_id=? AND status='available'",(pid,))).fetchone()
-    if not product:return RedirectResponse("/products")
-    tr=''.join(f'<tr><td>#{r[0]}</td><td>{"آماده فروش" if r[1]=="available" else "فروخته‌شده"}</td><td>{r[2] or "-"}</td><td>{esc(r[3])}</td></tr>' for r in rows)
-    body=f'''<h1>موجودی اقلام دیجیتال آماده: {esc(product[0])}</h1><div class="card"><p>اقلام آماده برای تحویل: <b>{count[0]}</b> | روش تحویل: {"خودکار" if product[1]=="automatic" else "دستی (برای فعال‌سازی، محصول را ویرایش کنید)"}</p><p>تمام متن داخل این کادر به‌عنوان مشخصات یک اکانت واحد ذخیره می‌شود؛ می‌توانید هر فرمتی که می‌خواهید وارد کنید. اطلاعات محرمانه‌اند و پس از فروش از موجودی خارج می‌شوند.</p><form method="post" action="/products/{pid}/inventory/add"><label>افزودن اکانت، کد یا لینک</label><textarea name="items" rows="10" required placeholder="هر نوع مشخصاتی که می‌خواهید؛ متن، نام کاربری، رمز، لینک و..."></textarea><button class="btn green">ذخیره اکانت‌ها</button></form></div><div class="card"><h3>آخرین موارد موجودی</h3><table><tr><th>شناسه</th><th>وضعیت</th><th>سفارش</th><th>زمان ثبت</th></tr>{tr}</table></div><p><a href="/products">بازگشت به فروشگاه</a></p>'''
-    return page("موجودی اکانت‌ها",body,"/products")
+        rows=await (await db.execute(
+            "SELECT id,payload,status,order_id,created_at,image_url FROM product_inventory "
+            "WHERE product_id=? ORDER BY id DESC LIMIT 300",(pid,)
+        )).fetchall()
+        count=await (await db.execute(
+            "SELECT COUNT(*) FROM product_inventory WHERE product_id=? AND status='available'",(pid,)
+        )).fetchone()
+    if not product:
+        return RedirectResponse("/products")
+    tr=[]
+    for r in rows:
+        photo=f'<a href="{esc(r[5])}" target="_blank"><img src="{esc(r[5])}" style="width:76px;height:60px;object-fit:contain;border-radius:8px"></a>' if r[5] else "—"
+        payload_preview=esc((r[1] or "")[:180])
+        if r[2]=="available":
+            actions=f'''
+            <details><summary class="btn small">ویرایش اکانت</summary>
+              <form method="post" enctype="multipart/form-data" action="/products/{pid}/inventory/{r[0]}/edit">
+                <label>مشخصات اکانت</label><textarea name="payload" rows="5" required>{esc(r[1])}</textarea>
+                <label>آدرس تصویر (اختیاری)</label><input name="image_url" value="{esc(r[5] or "")}">
+                <label>یا بارگذاری تصویر جدید</label><input type="file" name="photo" accept="image/png,image/jpeg,image/webp,image/gif">
+                <button class="btn green">ذخیره تغییرات</button>
+              </form>
+            </details>
+            <form method="post" action="/products/{pid}/inventory/{r[0]}/delete" onsubmit="return confirm('این اکانت از موجودی حذف شود؟')">
+              <button class="btn small gray">حذف اکانت</button>
+            </form>'''
+        else:
+            actions='<span>ثبت‌شده در سفارش؛ برای حفظ سوابق قابل ویرایش یا حذف نیست</span>'
+        tr.append(
+            f'<tr><td>#{r[0]}</td><td>{photo}</td><td><pre style="white-space:pre-wrap;max-width:320px">{payload_preview}</pre></td>'
+            f'<td>{"آماده فروش" if r[2]=="available" else "فروخته‌شده"}</td><td>{r[3] or "-"}</td>'
+            f'<td>{esc(r[4] or "")}</td><td>{actions}</td></tr>'
+        )
+    body=f'''<h1>مدیریت اکانت‌های: {esc(product[0])}</h1>
+    <div class="card"><p>اکانت‌های آماده فروش: <b>{count[0]}</b> | هر ردیف یک اکانت مستقل است. تصویر هر اکانت جداگانه در صفحه جزئیات فروشگاه نمایش داده می‌شود.</p>
+    <form method="post" enctype="multipart/form-data" action="/products/{pid}/inventory/add">
+      <label>مشخصات کامل یک اکانت</label>
+      <textarea name="items" rows="7" required maxlength="10000" placeholder="نام کاربری، رمز عبور، توضیحات و جزئیات اکانت"></textarea>
+      <label>آدرس تصویر (اختیاری)</label><input name="image_url" maxlength="1000" placeholder="https://...">
+      <label>یا بارگذاری تصویر جزئیات (حداکثر ۵ مگابایت)</label>
+      <input type="file" name="photo" accept="image/png,image/jpeg,image/webp,image/gif">
+      <button class="btn green">ثبت اکانت جدید</button>
+    </form></div>
+    <div class="card"><h3>فهرست اکانت‌ها</h3><div style="overflow-x:auto"><table>
+    <tr><th>شناسه</th><th>تصویر</th><th>مشخصات (بخشی)</th><th>وضعیت</th><th>سفارش</th><th>زمان ثبت</th><th>عملیات</th></tr>
+    {''.join(tr) or '<tr><td colspan="7">هنوز اکانتی ثبت نشده است.</td></tr>'}
+    </table></div></div><p><a href="/products">بازگشت به فروشگاه</a></p>'''
+    return page("مدیریت اکانت‌ها",body,"/products")
+
 
 @app.post("/products/{pid}/inventory/add")
-async def product_inventory_add(request:Request,pid:int):
-    if not get_session(request): return RedirectResponse("/login")
-    f=await request.form(); payload=str(f.get("items", "")).strip()
+async def product_inventory_add(request:Request,pid:int,photo:UploadFile|None=File(default=None)):
+    if not get_session(request):
+        return RedirectResponse("/login")
+    f=await request.form()
+    payload=str(f.get("items","")).strip()
+    image_url=str(f.get("image_url","")).strip()[:1000]
     if not payload or len(payload)>10000:
         return RedirectResponse(f"/products/{pid}/inventory",status_code=303)
+    try:
+        uploaded=await _store_inventory_photo(photo)
+        if uploaded:
+            image_url=uploaded
+    except ValueError:
+        return page("تصویر نامعتبر",'<div class="card">فرمت یا حجم تصویر معتبر نیست. حداکثر ۵ مگابایت مجاز است.</div>',f"/products/{pid}/inventory")
     async with aiosqlite.connect(DB_PATH) as db:
         exists=await (await db.execute("SELECT id FROM products WHERE id=?",(pid,))).fetchone()
         if exists:
             now=datetime.utcnow().isoformat()
-            await db.execute("INSERT INTO product_inventory(product_id,payload,status,created_at) VALUES(?,?,'available',?)",(pid,payload,now))
-            await db.execute("UPDATE products SET stock=(SELECT COUNT(*) FROM product_inventory WHERE product_id=? AND status='available'),delivery_mode='automatic',updated_at=? WHERE id=?",(pid,now,pid))
+            await db.execute(
+                "INSERT INTO product_inventory(product_id,payload,status,created_at,image_url) VALUES(?,?,'available',?,?)",
+                (pid,payload,now,image_url),
+            )
+            await db.execute(
+                "UPDATE products SET stock=(SELECT COUNT(*) FROM product_inventory WHERE product_id=? AND status='available'),delivery_mode='automatic',active=1,updated_at=? WHERE id=?",
+                (pid,now,pid),
+            )
             await db.commit()
+    return RedirectResponse(f"/products/{pid}/inventory",status_code=303)
+
+
+@app.post("/products/{pid}/inventory/{item_id}/edit")
+async def product_inventory_edit(request:Request,pid:int,item_id:int,photo:UploadFile|None=File(default=None)):
+    if not get_session(request):
+        return RedirectResponse("/login")
+    f=await request.form()
+    payload=str(f.get("payload","")).strip()
+    image_url=str(f.get("image_url","")).strip()[:1000]
+    if not payload or len(payload)>10000:
+        return RedirectResponse(f"/products/{pid}/inventory",status_code=303)
+    try:
+        uploaded=await _store_inventory_photo(photo)
+        if uploaded:
+            image_url=uploaded
+    except ValueError:
+        return page("تصویر نامعتبر",'<div class="card">فرمت یا حجم تصویر معتبر نیست.</div>',f"/products/{pid}/inventory")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE product_inventory SET payload=?,image_url=? WHERE id=? AND product_id=? AND status='available'",
+            (payload,image_url,item_id,pid),
+        )
+        await db.commit()
+    return RedirectResponse(f"/products/{pid}/inventory",status_code=303)
+
+
+@app.post("/products/{pid}/inventory/{item_id}/delete")
+async def product_inventory_delete(request:Request,pid:int,item_id:int):
+    if not get_session(request):
+        return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        now=datetime.utcnow().isoformat()
+        await db.execute(
+            "DELETE FROM product_inventory WHERE id=? AND product_id=? AND status='available'",
+            (item_id,pid),
+        )
+        await db.execute(
+            "UPDATE products SET stock=(SELECT COUNT(*) FROM product_inventory WHERE product_id=? AND status='available'),updated_at=? WHERE id=?",
+            (pid,now,pid),
+        )
+        await db.execute(
+            "UPDATE products SET active=0 WHERE id=? AND stock<=0",
+            (pid,),
+        )
+        await db.commit()
     return RedirectResponse(f"/products/{pid}/inventory",status_code=303)
 
 
