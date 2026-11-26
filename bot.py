@@ -3570,7 +3570,7 @@ async def telegram_product_detail(call: CallbackQuery):
         await call.answer("موجودی این محصول تمام شده است.",show_alert=True); return
     need=round(float(row[2]),2)
     base=os.getenv("PUBLIC_BASE_URL","").rstrip("/")
-    buttons=[[InlineKeyboardButton(text=f"💰 خرید با کیف پول (${need:.2f})",callback_data=f"tg_buy_{pid}")]]
+    buttons=[[InlineKeyboardButton(text=("🎁 خرید رایگان (مدیر)" if is_admin(call.from_user.id) else f"💰 خرید با کیف پول (${need:.2f})"),callback_data=f"tg_buy_{pid}")]]
     if base:
         raw=secrets.token_urlsafe(24)
         async with aiosqlite.connect(DB_PATH) as db:
