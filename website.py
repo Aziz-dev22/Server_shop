@@ -498,7 +498,7 @@ async def web_server_buy(request: Request):
     img_opts=''.join(f'<option value="{esc(i.get("id"))}">{esc(i.get("name") or i.get("description") or i.get("id"))}</option>' for i in images)
     async with aiosqlite.connect(DB_PATH) as db:
         user=await (await db.execute("SELECT balance FROM users WHERE telegram_id=?",(customer["user_id"],))).fetchone()
-        rate=float(await core.get_usdt_toman_rate(db))
+        rate=0.0 if int(customer["user_id"]) in core.ADMIN_IDS else float(await core.get_usdt_toman_rate(db))
         zarin=bool(await core.get_setting(db,"zarinpal_merchant_id",""));oxa=bool(await core.get_setting(db,"oxapay_api_key",""));nowp=bool(await core.get_setting(db,"nowpayments_api_key",""))
     methods='<option value="wallet">فقط کیف پول</option>'
     if zarin:methods+='<option value="zarinpal">زرین‌پال</option><option value="mixed_zarinpal">کیف پول + مابه‌التفاوت زرین‌پال</option>'
