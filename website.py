@@ -520,7 +520,8 @@ async def web_server_checkout(request:Request):
         token=await core.get_active_token_for(db,provider);api=core.make_provider_api(provider,token) if token else None
         plan=await (await db.execute("SELECT id,title,server_type,markup_percent FROM plans WHERE id=? AND active=1 AND provider_type=? AND (location IS NULL OR location='' OR location=?)",(plan_id,provider,location))).fetchone()
         user=await (await db.execute("SELECT balance FROM users WHERE telegram_id=?",(customer["user_id"],))).fetchone()
-        rate=float(await core.get_usdt_toman_rate(db, require_fresh=True))
+        admin_free = int(customer["user_id"]) in core.ADMIN_IDS
+        rate = 0.0 if admin_free else float(await core.get_usdt_toman_rate(db, require_fresh=True))
         pricing=None;types=None
         if provider=="hetzner":
             providers=await core.get_active_providers(db,provider)
@@ -537,23 +538,34 @@ async def web_server_checkout(request:Request):
         else:
             types=await api.server_types() if api else []
             price=core.compute_price_generic(types,plan[2],plan[3]) if plan else None
-        if not plan or price is None or not image or rate<=0:return storefront_page("خطا",'<div class="card">اطلاعات پلن، قیمت یا سیستم‌عامل معتبر نیست.</div>',customer)
+        if not plan or price is None or not image or (not admin_free and rate<=0):return storefront_page("خطا",'<div class="card">اطلاعات پلن، قیمت یا سیستم‌عامل معتبر نیست.</div>',customer)
         try:
             images=await core.deduplicate_images(await core.images_for_plan(provider,api,plan[2]))
             if str(image) not in {str(x.get("id")) for x in images}:raise ValueError("OS image invalid")
         except Exception:return storefront_page("سیستم‌عامل",'<div class="card">سیستم‌عامل انتخاب‌شده معتبر نیست.</div>',customer)
         await db.execute("BEGIN IMMEDIATE")
-        coupon_temp=-int(datetime.utcnow().timestamp()*1000000)
-        coupon_discount,coupon_id,coupon_error=await core.reserve_discount_coupon(db,coupon_code,"server_purchase",customer["user_id"],float(price),"server",coupon_temp)
-        if coupon_error:return storefront_page("کد تخفیف",'<div class="card">'+esc(coupon_error)+'</div>',customer)
-        payable=max(0.0,round(float(price)-coupon_discount,2))
+        coupon_id = None
+        coupon_temp = None
+        coupon_discount = 0.0
+        if not admin_free:
+            coupon_temp=-int(datetime.utcnow().timestamp()*1000000)
+            coupon_discount,coupon_id,coupon_error=await core.reserve_discount_coupon(db,coupon_code,"server_purchase",customer["user_id"],float(price),"server",coupon_temp)
+            if coupon_error:return storefront_page("کد تخفیف",'<div class="card">'+esc(coupon_error)+'</div>',customer)
+        payable = 0.0 if admin_free else max(0.0,round(float(price)-coupon_discount,2))
         wallet_balance=float(user[0] or 0) if user else 0
-        if method=="wallet":
+        if admin_free:
+            wallet_used = 0.0
+            gateway_method = "admin_free"
+        elif method=="wallet":
             if wallet_balance+0.000001<payable:return storefront_page("کیف پول",f'<div class="card">موجودی کافی نیست؛ مبلغ پس از تخفیف ${payable:.2f} است. روش پرداخت ترکیبی را انتخاب کنید.</div>',customer)
             wallet_used=round(payable,2)
-        elif method.startswith("mixed_"):wallet_used=min(max(wallet_balance,0.0),round(payable,2))
-        else:wallet_used=0.0
-        gateway_method=method.split("_",1)[1] if method.startswith("mixed_") else method
+            gateway_method = method
+        elif method.startswith("mixed_"):
+            wallet_used=min(max(wallet_balance,0.0),round(payable,2))
+            gateway_method=method.split("_",1)[1]
+        else:
+            wallet_used=0.0
+            gateway_method=method
         due=max(0,round(payable-wallet_used,2))
         due_toman=int(round(due*rate)) if gateway_method=="zarinpal" else 0
         cur=await db.execute("INSERT INTO web_server_orders(user_id,provider_type,location,plan_id,plan_title,server_type,image,price_usd,wallet_used_usd,gateway_method,gateway_due_usd,gateway_due_toman,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(customer["user_id"],provider,location,plan_id,plan[1],plan[2],image,float(price),wallet_used,gateway_method,due,due_toman,"pending_payment",datetime.utcnow().isoformat()))
