@@ -2400,6 +2400,8 @@ async def admin_wallet_purchase_do(request: Request):
         if total <= 0:
             await db.rollback()
             return page("خطا", '<div class="card">قیمت محصول معتبر نیست.</div>', "/admin-wallet-purchase")
+        admin_free = user_id in core.ADMIN_IDS
+        charge_total = 0.0 if admin_free else total
         # خرید مدیریتی از کیف پول دلاری است؛ نرخ ذخیره‌شده فقط برای گزارش معادل ریالی استفاده می‌شود.
         try:
             rate = float(await core.get_setting(db, "wallet_usd_to_toman", "100000") or 100000)
@@ -2411,21 +2413,22 @@ async def admin_wallet_purchase_do(request: Request):
         cur = await db.execute(
             "INSERT INTO product_orders(product_id,product_name,quantity,customer_name,mobile,email,amount_usd,amount_toman,status,created_at,user_id,wallet_used_usd,gateway_method,gateway_due_toman,currency_rate) "
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (product_id, product[0], quantity, user[1] or str(user_id), "", user[2] or "", total,
-             int(round(total * rate)), "pending_payment", now, user_id, total, "wallet", 0, rate),
+            (product_id, product[0], quantity, user[1] or str(user_id), "", user[2] or "", charge_total,
+             int(round(charge_total * rate)), "pending_payment", now, user_id, charge_total,
+             "admin_free" if admin_free else "wallet", 0, rate),
         )
         order_id = cur.lastrowid
         reference = f"admin-product-order-{order_id}-debit"
-        balance_after = float(user[0] or 0) - total
-        await db.execute("UPDATE users SET balance=balance-? WHERE telegram_id=?", (total, user_id))
+        balance_after = float(user[0] or 0) - charge_total
+        await db.execute("UPDATE users SET balance=balance-? WHERE telegram_id=?", (charge_total, user_id))
         await db.execute(
             "INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",
-            (user_id, -total, "admin_product_purchase", reference, now),
+            (user_id, -charge_total, "admin_free_product_purchase" if admin_free else "admin_product_purchase", reference, now),
         )
         await db.execute(
             "INSERT INTO admin_wallet_actions(admin_actor,target_user_id,action,amount_usd,reference,details,created_at) VALUES(?,?,?,?,?,?,?)",
-            (str(sess.get("username") or PANEL_USERNAME), user_id, "product_purchase", total, reference,
-             f"product_id={product_id};product={product[0]};quantity={quantity};order_id={order_id};balance_after={balance_after:.6f}", now),
+            (str(sess.get("username") or PANEL_USERNAME), user_id, "product_purchase_free" if admin_free else "product_purchase", charge_total, reference,
+             f"product_id={product_id};product={product[0]};quantity={quantity};order_id={order_id};admin_free={int(admin_free)};balance_after={balance_after:.6f}", now),
         )
         await db.commit()
     try:
@@ -2470,7 +2473,7 @@ async def admin_wallet_purchase_do(request: Request):
     message = (
         f'<div class="card"><h2>سفارش مدیریتی #{order_id} ثبت شد</h2>'
         f'<p>مشتری: {user_id} | محصول: {esc(product[0])} × {quantity}</p>'
-        f'<p>مبلغ کسرشده: ${total:.2f} | مانده جدید: ${balance_after:.2f}</p>'
+        f'<p>مبلغ کسرشده: ${charge_total:.2f}{" (خرید رایگان مدیر)" if admin_free else ""} | مانده جدید: ${balance_after:.2f}</p>'
         f'<p>وضعیت سفارش: {esc(status)}</p>'
         f'<p>ثبت مالی و نام ادمین در گزارش تراکنش‌ها ذخیره شد.</p>{delivery_notice}</div>{delivery_html}'
     )
