@@ -82,6 +82,7 @@ do_install() {
     read -rp "رمز عبور دلخواه برای ورود به پنل تحت وب: " PANEL_PASSWORD
   done
 
+  umask 077
   cat > .env <<EOF
 BOT_TOKEN=${BOT_TOKEN}
 ADMIN_IDS=${ADMIN_IDS}
@@ -89,6 +90,7 @@ DB_PATH=shop.db
 PANEL_USERNAME=${PANEL_USERNAME}
 PANEL_PASSWORD=${PANEL_PASSWORD}
 EOF
+  chmod 600 .env
 
   echo
   echo "[4/5] ساخت محیط مجازی پایتون و نصب کتابخانه‌ها..."
@@ -180,9 +182,10 @@ do_update() {
     read -rp "رمز عبور دلخواه برای ورود به پنل تحت وب جدید: " NEW_PANEL_PASSWORD
     echo "PANEL_PASSWORD=${NEW_PANEL_PASSWORD}" >> .env
   fi
+  chmod 600 .env
 
   echo "[بررسی] اعتبارسنجی کدهای پایتون..."
-  ./venv/bin/python -m py_compile bot.py panel.py website.py
+  ./venv/bin/python -m py_compile bot.py panel.py website.py website_common.py
 
   echo "[توقف] کد جدید بدون خطای نحوی است؛ سرویس‌ها برای راه‌اندازی مجدد متوقف می‌شوند..."
   systemctl stop ${SERVICE_NAME} 2>/dev/null || true
