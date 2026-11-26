@@ -303,6 +303,7 @@ async def init_db():
         await _safe_add_column(db, "provider", "active INTEGER DEFAULT 0")
         await _safe_add_column(db, "plans", "markup_percent REAL DEFAULT 20")
         await _safe_add_column(db, "products", "delivery_mode TEXT DEFAULT 'manual'")
+        await _safe_add_column(db, "product_inventory", "image_url TEXT DEFAULT ''")
         await _safe_add_column(db, "products", "price_usd REAL NOT NULL DEFAULT 0")
         await _safe_add_column(db, "product_orders", "amount_usd REAL NOT NULL DEFAULT 0")
         await _safe_add_column(db, "product_orders", "delivery_token_hash TEXT")
