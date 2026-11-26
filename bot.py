@@ -4336,16 +4336,18 @@ async def server_renew_start(call: CallbackQuery, state: FSMContext):
         await call.answer()
         return
     exp_dt = datetime.fromisoformat(expires_at)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🎟 وارد کردن کد تخفیف", callback_data=f"rncoupon_{server_db_id}")],
-            [InlineKeyboardButton(text=f"✅ تایید تمدید ({fmt_price(monthly_price)})", callback_data=f"rncf_{server_db_id}")],
-            [InlineKeyboardButton(text="🔙 انصراف", callback_data="back_main")],
-        ]
-    )
+    renewal_free = owner_id in ADMIN_IDS
+    renewal_buttons = []
+    if not renewal_free:
+        renewal_buttons.append([InlineKeyboardButton(text="🎟 وارد کردن کد تخفیف", callback_data=f"rncoupon_{server_db_id}")])
+    renewal_buttons.extend([
+        [InlineKeyboardButton(text="✅ تایید تمدید (رایگان ویژه مدیر)" if renewal_free else f"✅ تایید تمدید ({fmt_price(monthly_price)})", callback_data=f"rncf_{server_db_id}")],
+        [InlineKeyboardButton(text="🔙 انصراف", callback_data="back_main")],
+    ])
+    kb = InlineKeyboardMarkup(inline_keyboard=renewal_buttons)
     await call.message.answer(
         f"سرویس «{html.escape(name)}» تا تاریخ {iran_time(exp_dt).strftime('%Y-%m-%d %H:%M')} (به وقت ایران) اعتبار دارد.\n"
-        f"هزینه تمدید {RENEWAL_PERIOD_DAYS} روز دیگر: {fmt_price(monthly_price) if monthly_price else 'رایگان'}",
+        + (f"هزینه تمدید {RENEWAL_PERIOD_DAYS} روز دیگر: رایگان ویژه مدیر" if renewal_free else f"هزینه تمدید {RENEWAL_PERIOD_DAYS} روز دیگر: {fmt_price(monthly_price)}"),
         reply_markup=kb,
     )
     await call.answer()
@@ -5009,19 +5011,23 @@ async def admin_server_renew_menu(call: CallbackQuery):
     if price <= 0:
         await call.answer("قیمت ماهانه این سرور مشخص نیست؛ ابتدا پلن و قیمت آن را در پنل بررسی کنید.", show_alert=True)
         return
+    owner_is_admin = row[0] in ADMIN_IDS
     nonce = secrets.token_hex(5)
+    day1 = "۱ روز · رایگان" if owner_is_admin else f"۱ روز · {fmt_price(price/30)}"
+    day3 = "۳ روز · رایگان" if owner_is_admin else f"۳ روز · {fmt_price(price*3/30)}"
+    day7 = "۷ روز · رایگان" if owner_is_admin else f"۷ روز · {fmt_price(price*7/30)}"
+    day30 = "۳۰ روز · رایگان" if owner_is_admin else f"۳۰ روز · {fmt_price(price)}"
     buttons = [
-        [InlineKeyboardButton(text=f"۱ روز · {fmt_price(price/30)}", callback_data=f"admsvrenewdo_{sid}_1_{nonce}"),
-         InlineKeyboardButton(text=f"۳ روز · {fmt_price(price*3/30)}", callback_data=f"admsvrenewdo_{sid}_3_{nonce}")],
-        [InlineKeyboardButton(text=f"۷ روز · {fmt_price(price*7/30)}", callback_data=f"admsvrenewdo_{sid}_7_{nonce}"),
-         InlineKeyboardButton(text=f"۳۰ روز · {fmt_price(price)}", callback_data=f"admsvrenewdo_{sid}_30_{nonce}")],
+        [InlineKeyboardButton(text=day1, callback_data=f"admsvrenewdo_{sid}_1_{nonce}"),
+         InlineKeyboardButton(text=day3, callback_data=f"admsvrenewdo_{sid}_3_{nonce}")],
+        [InlineKeyboardButton(text=day7, callback_data=f"admsvrenewdo_{sid}_7_{nonce}"),
+         InlineKeyboardButton(text=day30, callback_data=f"admsvrenewdo_{sid}_30_{nonce}")],
         [InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"admsvshow_{sid}")],
     ]
     await call.message.edit_text(
         f"🛠 تمدید مدیریتی سرور «{html.escape(row[1] or str(sid))}»\n"
-        f"مالک: {row[0]}\nقیمت ماهانه: {fmt_price(price)}\n\n"
-        "تمدید مدیریتی از کیف پول مالک کسر می‌شود؛ در صورت ناکافی‌بودن موجودی، مانده می‌تواند منفی شود. "
-        "این استثنا فقط برای ادمین است.",
+        f"مالک: {row[0]}\nقیمت ماهانه: {'رایگان ویژه مدیر' if owner_is_admin else fmt_price(price)}\n\n"
+        + ("این سرور متعلق به حساب ادمین است و تمدید آن رایگان ثبت می‌شود." if owner_is_admin else "تمدید مدیریتی از کیف پول مالک کسر می‌شود؛ در صورت ناکافی‌بودن موجودی، مانده می‌تواند منفی شود. این استثنا فقط برای ادمین است."),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
     await call.answer()
