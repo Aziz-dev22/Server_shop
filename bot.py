@@ -5315,7 +5315,7 @@ async def complete_web_server_order(order_id: int, reference: str = ""):
         if not root_password: root_password="از طریق بخش مدیریت سرورها امکان تغییر رمز وجود دارد"
         ip=extract_server_ip(ptype,server); expires=(datetime.utcnow()+timedelta(days=30)).isoformat()
         data={"location":location,"plan_title":plan_title}
-        server_db_id=await _save_purchase(user_id,server,server_name,ip,root_password,image,data,float(price),expires,ptype,provider_id,charge_wallet=False)
+        server_db_id=await _save_purchase(user_id,server,server_name,ip,root_password,image,data,float(price),expires,ptype,provider_id,charge_wallet=False,order_amount=0.0 if user_id in ADMIN_IDS else float(price))
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE web_server_orders SET status='completed',server_db_id=? WHERE id=?",(server_db_id,order_id)); await db.commit()
         return server_db_id
