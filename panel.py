@@ -2272,7 +2272,13 @@ async def admin_wallet_purchase_do(request: Request):
         if total <= 0:
             await db.rollback()
             return page("خطا", '<div class="card">قیمت محصول معتبر نیست.</div>', "/admin-wallet-purchase")
-        rate = float(await core.get_usdt_toman_rate(db, require_fresh=True))
+        # خرید مدیریتی از کیف پول دلاری است؛ نرخ ذخیره‌شده فقط برای گزارش معادل ریالی استفاده می‌شود.
+        try:
+            rate = float(await core.get_setting(db, "wallet_usd_to_toman", "100000") or 100000)
+        except (TypeError, ValueError):
+            rate = 100000.0
+        if rate <= 0:
+            rate = 100000.0
         now = datetime.utcnow().isoformat()
         cur = await db.execute(
             "INSERT INTO product_orders(product_id,product_name,quantity,customer_name,mobile,email,amount_usd,amount_toman,status,created_at,user_id,wallet_used_usd,gateway_method,gateway_due_toman,currency_rate) "
