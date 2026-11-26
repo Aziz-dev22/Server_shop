@@ -46,6 +46,10 @@ UPLOAD_DIR = Path(__file__).resolve().parent / "static" / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 SESSIONS: dict[str, dict] = {}
 SESSION_TTL_HOURS = 12
+# محدودسازی تلاش ورود: حداکثر ۵ تلاش در هر ۱۵ دقیقه برای هر IP
+LOGIN_ATTEMPTS: dict[str, tuple[datetime, int]] = {}
+LOGIN_WINDOW = timedelta(minutes=15)
+LOGIN_MAX_ATTEMPTS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -435,17 +439,32 @@ async def login_form(request: Request):
 
 @app.post("/login")
 async def login_submit(request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    now = datetime.utcnow()
+    window_start, attempts = LOGIN_ATTEMPTS.get(client_ip, (now, 0))
+    if now - window_start >= LOGIN_WINDOW:
+        window_start, attempts = now, 0
+    if attempts >= LOGIN_MAX_ATTEMPTS:
+        LOGIN_ATTEMPTS[client_ip] = (window_start, attempts)
+        return RedirectResponse("/login?err=1", status_code=303)
+
     form = await request.form()
     username = str(form.get("username", "")).strip()
     password = str(form.get("password", ""))
     if not PANEL_PASSWORD:
         return RedirectResponse("/login?err=1", status_code=303)
-    if username == PANEL_USERNAME and password == PANEL_PASSWORD:
-        token = secrets.token_hex(24)
-        SESSIONS[token] = {"user": username, "expires": datetime.utcnow() + timedelta(hours=SESSION_TTL_HOURS)}
+    if username == PANEL_USERNAME and hmac.compare_digest(password, PANEL_PASSWORD):
+        LOGIN_ATTEMPTS.pop(client_ip, None)
+        token = secrets.token_urlsafe(48)
+        SESSIONS[token] = {"user": username, "expires": now + timedelta(hours=SESSION_TTL_HOURS)}
         resp = RedirectResponse("/admin", status_code=303)
-        resp.set_cookie("panel_session", token, httponly=True, max_age=SESSION_TTL_HOURS * 3600)
+        resp.set_cookie(
+            "panel_session", token, httponly=True,
+            secure=os.getenv("COOKIE_SECURE", "0") == "1",
+            samesite="lax", path="/", max_age=SESSION_TTL_HOURS * 3600,
+        )
         return resp
+    LOGIN_ATTEMPTS[client_ip] = (window_start, attempts + 1)
     return RedirectResponse("/login?err=1", status_code=303)
 
 
