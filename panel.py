@@ -1226,7 +1226,8 @@ async def server_renew_do(request: Request, server_id: int):
             return RedirectResponse("/servers?err=" + urllib.parse.quote("قیمت تمدید سرور به پلن فعال متصل نشده است"), status_code=303)
         cur2 = await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,)) if owner_id is not None else None
         bal_row = await cur2.fetchone() if cur2 else None
-        # تمدید از پنل توسط ادمین انجام می‌شود و باید همیشه در دفتر مالی ثبت شود.
+        admin_free_renewal = owner_id in core.ADMIN_IDS if owner_id is not None else False
+        # تمدید مالک ادمین رایگان است؛ برای سایر کاربران طبق روال مالی ثبت می‌شود.
         if owner_id is not None and float(monthly_price) > 0 and not bal_row:
             await db.rollback()
             return RedirectResponse("/servers?err=" + urllib.parse.quote("حساب کیف پول مالک پیدا نشد؛ تمدید انجام نشد"), status_code=303)
@@ -1237,22 +1238,24 @@ async def server_renew_do(request: Request, server_id: int):
             base = now
         new_expiry = base + timedelta(days=core.RENEWAL_PERIOD_DAYS)
         was_expired_off = bool(expired_off_at)
+        balance_after = float(bal_row[0] or 0) if bal_row else 0.0
         if owner_id is not None and monthly_price > 0:
             if not bal_row:
                 await db.rollback()
                 return RedirectResponse("/servers?err=" + urllib.parse.quote("حساب کیف پول مالک پیدا نشد"), status_code=303)
-            # تمدید از پنل توسط ادمین انجام می‌شود؛ موجودی می‌تواند منفی شود.
-            await db.execute("UPDATE users SET balance=balance-? WHERE telegram_id=?", (float(monthly_price), owner_id))
-            balance_after = float(bal_row[0] or 0) - float(monthly_price)
+            charged_price = 0.0 if admin_free_renewal else float(monthly_price)
+            if charged_price > 0:
+                await db.execute("UPDATE users SET balance=balance-? WHERE telegram_id=?", (charged_price, owner_id))
+            balance_after = float(bal_row[0] or 0) - charged_price
             admin_ref = f"panel-admin-server-renew:{server_id}:{expires_at}"
             await db.execute(
                 "INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",
-                (owner_id, -float(monthly_price), "admin_server_renewal", admin_ref, datetime.utcnow().isoformat()),
+                (owner_id, -charged_price, "admin_free_server_renewal" if admin_free_renewal else "admin_server_renewal", admin_ref, datetime.utcnow().isoformat()),
             )
             await db.execute(
                 "INSERT INTO admin_wallet_actions(admin_actor,target_user_id,action,amount_usd,reference,details,created_at) VALUES(?,?,?,?,?,?,?)",
-                (str(sess.get("username") or PANEL_USERNAME), owner_id, "server_renewal", float(monthly_price), admin_ref,
-                 f"server_id={server_id};days={core.RENEWAL_PERIOD_DAYS};balance_after={balance_after:.6f}",
+                (str(sess.get("username") or PANEL_USERNAME), owner_id, "server_renewal_free" if admin_free_renewal else "server_renewal", charged_price, admin_ref,
+                 f"server_id={server_id};days={core.RENEWAL_PERIOD_DAYS};admin_free={int(admin_free_renewal)};balance_after={balance_after:.6f}",
                  datetime.utcnow().isoformat()),
             )
         await db.execute(
@@ -2572,10 +2575,13 @@ async def admin_server_purchase_do(request: Request):
         if not current:
             await db.rollback()
             return page("خطا", '<div class="card">حساب مشتری پیدا نشد.</div>', "/admin-server-purchase")
-        balance_after = float(current[0] or 0) - price
-        await db.execute("UPDATE users SET balance=balance-? WHERE telegram_id=?", (price, user_id))
-        await db.execute("INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)", (user_id, -price, "admin_server_purchase", reference + ":debit", now))
-        await db.execute("INSERT INTO admin_wallet_actions(admin_actor,target_user_id,action,amount_usd,reference,details,created_at) VALUES(?,?,?,?,?,?,?)", (str(sess.get("username") or PANEL_USERNAME), user_id, "server_purchase_pending", price, reference, f"plan_id={plan_id};provider={provider};location={location};balance_after={balance_after:.6f}", now))
+        admin_free = user_id in core.ADMIN_IDS
+        charged_price = 0.0 if admin_free else price
+        balance_after = float(current[0] or 0) - charged_price
+        if charged_price > 0:
+            await db.execute("UPDATE users SET balance=balance-? WHERE telegram_id=?", (charged_price, user_id))
+        await db.execute("INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)", (user_id, -charged_price, "admin_free_server_purchase" if admin_free else "admin_server_purchase", reference + ":debit", now))
+        await db.execute("INSERT INTO admin_wallet_actions(admin_actor,target_user_id,action,amount_usd,reference,details,created_at) VALUES(?,?,?,?,?,?,?)", (str(sess.get("username") or PANEL_USERNAME), user_id, "server_purchase_free" if admin_free else "server_purchase_pending", charged_price, reference, f"plan_id={plan_id};provider={provider};location={location};admin_free={int(admin_free)};balance_after={balance_after:.6f}", now))
         await db.commit()
 
     server = None
@@ -2606,14 +2612,14 @@ async def admin_server_purchase_do(request: Request):
         if user_id > 0 and core.BOT_TOKEN:
             bot_client = Bot(token=core.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
             try:
-                await bot_client.send_message(user_id, f"سرور شما توسط مدیریت خریداری شد. شناسه: #{server_db_id} · IP: {esc(ip)} · مبلغ کسرشده: {price:.2f} USD · مانده: {balance_after:.2f} USD")
+                await bot_client.send_message(user_id, f"سرور شما توسط مدیریت خریداری شد. شناسه: #{server_db_id} · IP: {esc(ip)} · مبلغ کسرشده: {charged_price:.2f} USD" + (" · خرید رایگان ویژه مدیر" if admin_free else f" · مانده: {balance_after:.2f} USD"))
             except Exception as notify_exc:
                 notification_error = str(notify_exc)[:200]
                 core.logger.exception("Admin server purchase notification failed for user %s", user_id)
             finally:
                 await bot_client.session.close()
         notification_html = f'<p>⚠️ ارسال پیام به مشتری ناموفق بود: {esc(notification_error)}</p>' if notification_error else ""
-        return page("خرید سرور موفق", f'<div class="card"><h2>سرور برای مشتری ساخته شد</h2><p>مشتری: {user_id}</p><p>سرور: #{server_db_id} · {esc(server_name)}</p><p>IP: {esc(ip)}</p><p>مبلغ: {price:.2f} USD · مانده: {balance_after:.2f} USD</p><p>پسورد root: <code>{esc(root_password)}</code></p>{notification_html}</div>', "/admin-server-purchase")
+        return page("خرید سرور موفق", f'<div class="card"><h2>سرور برای مشتری ساخته شد</h2><p>مشتری: {user_id}</p><p>سرور: #{server_db_id} · {esc(server_name)}</p><p>IP: {esc(ip)}</p><p>مبلغ کسرشده: {charged_price:.2f} USD {"(رایگان ویژه مدیر)" if admin_free else f"· مانده: {balance_after:.2f} USD"}</p><p>پسورد root: <code>{esc(root_password)}</code></p>{notification_html}</div>', "/admin-server-purchase")
     except Exception as exc:
         if server_db_id is not None:
             core.logger.exception("Admin server purchase created and saved, but a post-save action failed: server_db_id=%s", server_db_id)
