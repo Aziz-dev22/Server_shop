@@ -2659,7 +2659,7 @@ async def admin_server_purchase_do(request: Request):
                 "Admin server purchase outcome uncertain; wallet debit retained for manual reconciliation: user=%s provider=%s reference=%s error=%s",
                 user_id, provider, reference, str(exc)[:500],
             )
-            return page("نیازمند بررسی پرداخت و سرور", f'<div class="card">نتیجه درخواست ساخت سرور قطعی نیست؛ ممکن است سرور در سرویس‌دهنده ساخته شده باشد. برای جلوگیری از ساخت تکراری، مبلغ {price:.2f} USD فعلاً به کیف پول برنگشت و درخواست برای بررسی ادمین ثبت شد. مشتری: {user_id} · سرویس‌دهنده: {esc(provider)} · نام سرور: {esc(server_name)} · کد پیگیری: {esc(reference)} · خطا: {esc(str(exc)[:300])}</div>', "/admin-server-purchase")
+            return page("نیازمند بررسی پرداخت و سرور", f'<div class="card">نتیجه درخواست ساخت سرور قطعی نیست؛ ممکن است سرور در سرویس‌دهنده ساخته شده باشد. برای جلوگیری از ساخت تکراری، مبلغ {charged_price:.2f} USD فعلاً به کیف پول برنگشت و درخواست برای بررسی ادمین ثبت شد. مشتری: {user_id} · سرویس‌دهنده: {esc(provider)} · نام سرور: {esc(server_name)} · کد پیگیری: {esc(reference)} · خطا: {esc(str(exc)[:300])}</div>', "/admin-server-purchase")
 
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("BEGIN IMMEDIATE")
@@ -2668,7 +2668,7 @@ async def admin_server_purchase_do(request: Request):
             await db.execute("INSERT OR IGNORE INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)", (user_id, charged_price, "refund" if charged_price else "admin_free_server_purchase_failed", reference + ":refund", datetime.utcnow().isoformat()))
             await db.execute("INSERT OR IGNORE INTO admin_wallet_actions(admin_actor,target_user_id,action,amount_usd,reference,details,created_at) VALUES(?,?,?,?,?,?,?)", (str(sess.get("username") or PANEL_USERNAME), user_id, "server_purchase_refund" if charged_price else "server_purchase_free_failed", charged_price, reference + ":refund", f"reason={str(exc)[:300]};debit_reference={reference}", datetime.utcnow().isoformat()))
             await db.commit()
-        return page("ساخت سرور ناموفق", f'<div class="card">ساخت سرور ناموفق بود؛ مبلغ {price:.2f} USD به کیف پول مشتری برگشت داده شد. خطا: {esc(str(exc)[:300])}</div>', "/admin-server-purchase")
+        return page("ساخت سرور ناموفق", f'<div class="card">ساخت سرور ناموفق بود؛ مبلغ {charged_price:.2f} USD به کیف پول مشتری برگشت داده شد. خطا: {esc(str(exc)[:300])}</div>', "/admin-server-purchase")
 
 
 @app.get("/product-orders",response_class=HTMLResponse)
