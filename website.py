@@ -151,7 +151,7 @@ async def customer_account(request: Request):
             "AND NOT EXISTS (SELECT 1 FROM servers d WHERE d.provider_type IS s.provider_type AND d.provider_id IS s.provider_id "
             "AND d.hetzner_id=s.hetzner_id AND d.user_id=s.user_id AND d.id<s.id) ORDER BY s.id DESC LIMIT 30",(sess["user_id"],))).fetchall()
         server_orders=await (await db.execute("SELECT id,plan_title,location,price_usd,status,created_at,server_db_id FROM web_server_orders WHERE user_id=? ORDER BY id DESC LIMIT 30",(sess["user_id"],))).fetchall()
-        rate=float(await core.get_usdt_toman_rate(db))
+        rate=0.0 if int(customer["user_id"]) in core.ADMIN_IDS else float(await core.get_usdt_toman_rate(db))
     if not u: return RedirectResponse("/customer/login",status_code=303)
     tr=''.join('<tr><td>#'+str(o[0])+'</td><td>'+esc(o[1])+' ×'+str(o[2])+'</td><td>'+f'${float(o[3] or 0):.2f} USD'+'</td><td>'+esc(o[4])+'</td><td>'+('<a href="/account/order/'+str(o[0])+'">جزئیات / تحویل</a>' if o[5] else '-')+'</td></tr>' for o in orders)
     body='<h1>حساب کاربری</h1><div class="card"><p>ایمیل: '+esc(u[3] or '-')+' | وضعیت: '+('تأییدشده' if u[4] else 'تأیید نشده')+'</p><h2>موجودی کیف پول: $'+f'{float(u[2] or 0):.2f}'+'</h2><p>نرخ فعلی: هر ۱ دلار = '+f'{rate:,.0f}'+' تومان</p><p><a class="btn" href="/shop">فروشگاه</a> <a class="btn gray" href="/servers/buy">خرید سرور</a> <a href="/customer/login?link=telegram">اتصال تلگرام</a> <a href="/customer/logout">خروج</a></p></div><div class="card"><h2>سفارش‌های من</h2><table><tr><th>سفارش</th><th>محصول</th><th>مبلغ</th><th>وضعیت</th><th>تحویل</th></tr>'+ (tr or '<tr><td colspan="5">هنوز سفارشی ندارید.</td></tr>') + '</table></div>'
