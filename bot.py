@@ -5136,7 +5136,7 @@ async def admin_server_renew_apply(call: CallbackQuery):
     report = (
         f"🛠 تمدید مدیریتی سرور «{html.escape(name or str(sid))}» انجام شد.\\n"
         f"مدت: {days} روز\\nمبلغ کسرشده: {fmt_price(amount)}" + (" (رایگان برای ادمین)\\n" if owner_is_admin else "\\n")
-        f"مانده کیف پول: {fmt_price(balance_after)}\\n"
+        + f"مانده کیف پول: {fmt_price(balance_after)}\\n"
         f"مهلت جدید: {iran_time(new_expiry).strftime('%Y-%m-%d %H:%M')} (به وقت ایران)"
         f"{power_note}"
     )
