@@ -3471,8 +3471,9 @@ async def _buy_confirm_impl(call: CallbackQuery, state: FSMContext):
         f"آی‌پی: {ip}\n"
         f"یوزر: root\n"
         f"پسورد: {root_password}\n"
-        f"مبلغ کسر شده: {fmt_price(price)}\n\n"
-        "برای مدیریت سرور به بخش «سرورهای من» بروید."
+        f"مبلغ کسر شده: {fmt_price(0 if admin_free else price)}"
+        + ("\n🎁 خرید رایگان ویژه مدیر" if admin_free else "")
+        + "\n\nبرای مدیریت سرور به بخش «سرورهای من» بروید."
     )
     await call.answer()
 
