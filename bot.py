@@ -3330,7 +3330,7 @@ async def buy_confirm(call: CallbackQuery, state: FSMContext):
         _BUY_IN_PROGRESS.discard(user_id)
 
 
-async def _save_purchase(user_id, server, server_name, ip, root_password, os_image, data, price, expires_at, provider_type, provider_id, charge_wallet=True):
+async def _save_purchase(user_id, server, server_name, ip, root_password, os_image, data, price, expires_at, provider_type, provider_id, charge_wallet=True, order_amount=None):
     """ثبت سرور و سفارش؛ در خرید وب سهم کیف پول پیش‌تر به‌صورت اتمیک رزرو شده است."""
     async with aiosqlite.connect(DB_PATH) as db:
         if charge_wallet:
@@ -3350,7 +3350,7 @@ async def _save_purchase(user_id, server, server_name, ip, root_password, os_ima
         server_db_id = (await cur.fetchone())[0]
         await db.execute(
             "INSERT INTO orders (user_id, server_id, plan_title, location, price, status, created_at) VALUES (?,?,?,?,?,?,?)",
-            (user_id, server_db_id, data["plan_title"], data["location"], price, "completed", datetime.utcnow().isoformat()),
+            (user_id, server_db_id, data["plan_title"], data["location"], price if order_amount is None else order_amount, "completed", datetime.utcnow().isoformat()),
         )
         await db.commit()
     return server_db_id
@@ -3369,7 +3369,8 @@ async def _buy_confirm_impl(call: CallbackQuery, state: FSMContext):
         if price is None:
             price = data.get("price")
         user = await get_user(db, user_id)
-        if not user or user[3] < price:
+        admin_free = user_id in ADMIN_IDS
+        if not user or (not admin_free and user[3] < price):
             base=os.getenv("PUBLIC_BASE_URL","").rstrip("/")
             if base and data.get("plan_id") and data.get("image"):
                 params=urlencode({"provider":provider_type,"location":data.get("location",""),"plan_id":data.get("plan_id"),"image":data.get("image")})
@@ -3435,7 +3436,8 @@ async def _buy_confirm_impl(call: CallbackQuery, state: FSMContext):
     for attempt in range(1, 4):
         try:
             server_db_id = await _save_purchase(
-                user_id, server, server_name, ip, root_password, os_image, data, price, expires_at, provider_type, provider_id
+                user_id, server, server_name, ip, root_password, os_image, data, price, expires_at, provider_type, provider_id,
+                charge_wallet=not admin_free, order_amount=0.0 if admin_free else price,
             )
             break
         except Exception:
@@ -4321,7 +4323,7 @@ async def server_renew_start(call: CallbackQuery, state: FSMContext):
     if not expires_at or monthly_price is None or float(monthly_price) <= 0:
         await call.answer("قیمت این سرور از پلن و قیمت‌گذاری هتزنر قابل تشخیص نیست. لطفاً نوع سرور و پلن فعال آن را در پنل مدیریت بررسی کنید.", show_alert=True)
         return
-    if is_admin(call.from_user.id):
+    if is_admin(call.from_user.id) and owner_id != call.from_user.id:
         admin_kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🛠 ادامه تمدید مدیریتی", callback_data=f"admsvrenew_{server_db_id}")],
             [InlineKeyboardButton(text="🔙 بازگشت", callback_data="adm_servers")],
@@ -4406,11 +4408,6 @@ async def server_renew_confirm(call: CallbackQuery, state: FSMContext):
         await call.answer("شناسه سرور نامعتبر است.", show_alert=True)
         return
 
-    # تمدید عادی فقط برای مالک است؛ تمدید اضطراری ادمین باید مسیر مستقل و ثبت مالی جداگانه داشته باشد.
-    if is_admin(call.from_user.id):
-        await call.answer("تمدید ادمینی باید از گزینه تمدید مدیریتی انجام شود.", show_alert=True)
-        return
-
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
         cur = await db.execute(
@@ -4441,8 +4438,9 @@ async def server_renew_confirm(call: CallbackQuery, state: FSMContext):
             await call.answer("اتصال API این سرور در دسترس نیست.", show_alert=True)
             return
 
+        admin_free = owner_id in ADMIN_IDS
         renewal_data = await state.get_data()
-        coupon_code = str(renewal_data.get("coupon_code") or "").strip().upper() if int(renewal_data.get("server_id") or 0) == server_db_id else ""
+        coupon_code = str(renewal_data.get("coupon_code") or "").strip().upper() if (not admin_free and int(renewal_data.get("server_id") or 0) == server_db_id) else ""
         coupon_discount = 0.0
         renewal_order_id = time.time_ns() % 9000000000000000000
         if coupon_code:
@@ -4454,9 +4452,9 @@ async def server_renew_confirm(call: CallbackQuery, state: FSMContext):
                 await state.clear()
                 await call.answer(coupon_error, show_alert=True)
                 return
-        payable_amount = max(0.0, float(monthly_price) - coupon_discount)
+        payable_amount = 0.0 if admin_free else max(0.0, float(monthly_price) - coupon_discount)
         bal = await (await db.execute("SELECT balance FROM users WHERE telegram_id=?", (owner_id,))).fetchone()
-        if not bal or float(bal[0] or 0) < payable_amount:
+        if not bal or (not admin_free and float(bal[0] or 0) < payable_amount):
             await db.rollback()
             await call.message.edit_text(
                 f"❌ موجودی کافی نیست. مبلغ لازم: {fmt_price(payable_amount)} | موجودی فعلی: {fmt_price(bal[0] if bal else 0)}\\nلطفاً ابتدا کیف پول خود را شارژ کنید."
@@ -4476,10 +4474,13 @@ async def server_renew_confirm(call: CallbackQuery, state: FSMContext):
         new_expiry = base + timedelta(days=RENEWAL_PERIOD_DAYS)
         renewal_ref = f"server-renew:{server_db_id}:{expires_at}"
 
-        debit = await db.execute(
-            "UPDATE users SET balance=balance-? WHERE telegram_id=? AND balance>=?",
-            (payable_amount, owner_id, payable_amount),
-        )
+        if admin_free:
+            debit = await db.execute("UPDATE users SET balance=balance WHERE telegram_id=?", (owner_id,))
+        else:
+            debit = await db.execute(
+                "UPDATE users SET balance=balance-? WHERE telegram_id=? AND balance>=?",
+                (payable_amount, owner_id, payable_amount),
+            )
         if debit.rowcount != 1:
             await db.rollback()
             await call.answer("موجودی کیف پول تغییر کرده است؛ دوباره تلاش کنید.", show_alert=True)
@@ -4487,7 +4488,7 @@ async def server_renew_confirm(call: CallbackQuery, state: FSMContext):
         try:
             await db.execute(
                 "INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",
-                (owner_id, -payable_amount, "server_renewal", renewal_ref, datetime.utcnow().isoformat()),
+                (owner_id, -payable_amount, "admin_free_server_renewal" if admin_free else "server_renewal", renewal_ref, datetime.utcnow().isoformat()),
             )
         except Exception:
             await db.rollback()
@@ -4521,8 +4522,8 @@ async def server_renew_confirm(call: CallbackQuery, state: FSMContext):
         f"مدت تمدید: {RENEWAL_PERIOD_DAYS} روز\\n"
         f"مبلغ اصلی: {fmt_price(monthly_price)}\\n"
         f"تخفیف: {fmt_price(coupon_discount)}\\n"
-        f"مبلغ کسرشده: {fmt_price(payable_amount)}\\n"
-        f"مانده کیف پول: {fmt_price(balance_after)}\\n"
+        f"مبلغ کسرشده: {fmt_price(payable_amount)}" + (" (رایگان برای ادمین)\\n" if admin_free else "\\n")
+        + f"مانده کیف پول: {fmt_price(balance_after)}\\n"
         f"مهلت جدید: {iran_time(new_expiry).strftime('%Y-%m-%d %H:%M')} (به وقت ایران){poweron_note}"
     )
     await call.answer()
@@ -5067,7 +5068,8 @@ async def admin_server_renew_apply(call: CallbackQuery):
         await call.answer("API سرور در دسترس نیست؛ تمدید انجام نشد.", show_alert=True)
         return
 
-    amount = round(float(monthly_price) * days / 30.0, 2)
+    owner_is_admin = owner_id in ADMIN_IDS
+    amount = 0.0 if owner_is_admin else round(float(monthly_price) * days / 30.0, 2)
     now = datetime.utcnow()
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -5100,7 +5102,7 @@ async def admin_server_renew_apply(call: CallbackQuery):
             await db.execute("UPDATE users SET balance=? WHERE telegram_id=?", (balance_after, owner_id))
             await db.execute(
                 "INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",
-                (owner_id, -amount, "admin_server_renewal", ref, now.isoformat()),
+                (owner_id, -amount, "admin_free_server_renewal" if owner_is_admin else "admin_server_renewal", ref, now.isoformat()),
             )
             await db.execute(
                 "INSERT INTO admin_server_renewals(server_id,owner_id,admin_id,days,amount_usd,balance_after,created_at,reference) "
@@ -5132,7 +5134,7 @@ async def admin_server_renew_apply(call: CallbackQuery):
 
     report = (
         f"🛠 تمدید مدیریتی سرور «{html.escape(name or str(sid))}» انجام شد.\\n"
-        f"مدت: {days} روز\\nمبلغ کسرشده: {fmt_price(amount)}\\n"
+        f"مدت: {days} روز\\nمبلغ کسرشده: {fmt_price(amount)}" + (" (رایگان برای ادمین)\\n" if owner_is_admin else "\\n")
         f"مانده کیف پول: {fmt_price(balance_after)}\\n"
         f"مهلت جدید: {iran_time(new_expiry).strftime('%Y-%m-%d %H:%M')} (به وقت ایران)"
         f"{power_note}"
