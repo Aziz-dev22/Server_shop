@@ -4314,16 +4314,19 @@ async def server_renew_start(call: CallbackQuery, state: FSMContext):
             await call.answer("دسترسی غیرمجاز", show_alert=True)
             return
         owner_id, name, expires_at, monthly_price, remote_id, provider_type = row
-        if monthly_price is None or float(monthly_price) <= 0:
+        renewal_free = owner_id in ADMIN_IDS
+        if (monthly_price is None or float(monthly_price) <= 0) and not renewal_free:
             monthly_price = await resolve_external_hetzner_renewal_price(
                 db, server_db_id, remote_id, provider_type or "hetzner"
             )
     if not row:
         await call.answer("سرور پیدا نشد.", show_alert=True)
         return
-    if not expires_at or monthly_price is None or float(monthly_price) <= 0:
+    renewal_free = owner_id in ADMIN_IDS
+    if not expires_at or (not renewal_free and (monthly_price is None or float(monthly_price) <= 0)):
         await call.answer("قیمت این سرور از پلن و قیمت‌گذاری هتزنر قابل تشخیص نیست. لطفاً نوع سرور و پلن فعال آن را در پنل مدیریت بررسی کنید.", show_alert=True)
         return
+    monthly_price = float(monthly_price or 0)
     if is_admin(call.from_user.id) and owner_id != call.from_user.id:
         admin_kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🛠 ادامه تمدید مدیریتی", callback_data=f"admsvrenew_{server_db_id}")],
@@ -4426,10 +4429,12 @@ async def server_renew_confirm(call: CallbackQuery, state: FSMContext):
 
         owner_id, hetzner_id, name, expires_at, monthly_price, expired_off_at, provider_type, provider_id, traffic_off, deletion_pending_reason = row
         provider_type = provider_type or "hetzner"
-        if monthly_price is None or float(monthly_price) <= 0:
+        admin_free = owner_id in ADMIN_IDS
+        if (monthly_price is None or float(monthly_price) <= 0) and not admin_free:
             await db.rollback()
             await call.answer("قیمت تمدید این سرور مشخص نیست؛ لطفاً با پشتیبانی تماس بگیرید.", show_alert=True)
             return
+        monthly_price = float(monthly_price or 0)
         if not expires_at:
             await db.rollback()
             await call.answer("تاریخ انقضای سرور مشخص نیست؛ لطفاً با پشتیبانی تماس بگیرید.", show_alert=True)
@@ -4441,7 +4446,6 @@ async def server_renew_confirm(call: CallbackQuery, state: FSMContext):
             await call.answer("اتصال API این سرور در دسترس نیست.", show_alert=True)
             return
 
-        admin_free = owner_id in ADMIN_IDS
         renewal_data = await state.get_data()
         coupon_code = str(renewal_data.get("coupon_code") or "").strip().upper() if (not admin_free and int(renewal_data.get("server_id") or 0) == server_db_id) else ""
         coupon_discount = 0.0
@@ -5005,13 +5009,14 @@ async def admin_server_renew_menu(call: CallbackQuery):
         if row[0] is None:
             await call.answer("ابتدا برای این سرور مالک تعیین کنید؛ تمدید مالی بدون مالک مجاز نیست.", show_alert=True)
             return
+        owner_is_admin = row[0] in ADMIN_IDS
         price = float(row[3] or 0)
-        if price <= 0:
+        if price <= 0 and not owner_is_admin:
             price = await resolve_external_hetzner_renewal_price(db, sid, row[4], row[5] or "hetzner")
-    if price <= 0:
+    if (price is None or float(price) <= 0) and not owner_is_admin:
         await call.answer("قیمت ماهانه این سرور مشخص نیست؛ ابتدا پلن و قیمت آن را در پنل بررسی کنید.", show_alert=True)
         return
-    owner_is_admin = row[0] in ADMIN_IDS
+    price = float(price or 0)
     nonce = secrets.token_hex(5)
     day1 = "۱ روز · رایگان" if owner_is_admin else f"۱ روز · {fmt_price(price/30)}"
     day3 = "۳ روز · رایگان" if owner_is_admin else f"۳ روز · {fmt_price(price*3/30)}"
@@ -5065,17 +5070,18 @@ async def admin_server_renew_apply(call: CallbackQuery):
         if owner_id is None:
             await call.answer("سرور هنوز مالک ندارد؛ ابتدا مالک را تعیین کنید.", show_alert=True)
             return
-        if monthly_price is None or float(monthly_price) <= 0:
+        owner_is_admin = owner_id in ADMIN_IDS
+        if (monthly_price is None or float(monthly_price) <= 0) and not owner_is_admin:
             monthly_price = await resolve_external_hetzner_renewal_price(db, sid, provider_server_id, provider_type or "hetzner")
-        if monthly_price is None or float(monthly_price) <= 0:
+        if (monthly_price is None or float(monthly_price) <= 0) and not owner_is_admin:
             await call.answer("قیمت تمدید مشخص نیست؛ تمدید انجام نشد.", show_alert=True)
             return
+        monthly_price = float(monthly_price or 0)
         token = await get_token_for_server(db, sid, provider_type or "hetzner")
     if not token:
         await call.answer("API سرور در دسترس نیست؛ تمدید انجام نشد.", show_alert=True)
         return
 
-    owner_is_admin = owner_id in ADMIN_IDS
     amount = 0.0 if owner_is_admin else round(float(monthly_price) * days / 30.0, 2)
     now = datetime.utcnow()
     try:
