@@ -3577,34 +3577,101 @@ async def telegram_product_detail(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("tg_buy_"))
 async def telegram_product_wallet_buy(call: CallbackQuery):
-    try: pid=int(call.data.rsplit("_",1)[1])
-    except: await call.answer("محصول نامعتبر",show_alert=True); return
-    order_id=None
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("BEGIN IMMEDIATE")
-        prod=await (await db.execute("SELECT name,price_usd,stock FROM products WHERE id=? AND active=1",(pid,))).fetchone()
-        user=await ensure_user(db,call.from_user.id,call.from_user.username,call.from_user.full_name)
-        rate=float(await get_usdt_toman_rate(db, require_fresh=True))
-        if not prod or prod[2]<1 or rate<=0:
-            await db.rollback();await call.answer("موجودی محصول تمام شده است.",show_alert=True);return
-        amount=math.ceil(float(prod[1])*1_000_000)/1_000_000
-        if float(user[3] or 0)<amount:
-            await db.rollback();await call.answer("موجودی کیف پول کافی نیست؛ از گزینه پرداخت ترکیبی استفاده کنید.",show_alert=True);return
-        cur=await db.execute("INSERT INTO product_orders(product_id,product_name,quantity,customer_name,mobile,email,amount_usd,amount_toman,status,created_at,user_id,wallet_used_usd,gateway_method,gateway_due_toman,currency_rate) VALUES(?,?,1,?,?,?,?,?,'pending_payment',?,?,?,'wallet',0,?)",(pid,prod[0],call.from_user.full_name or call.from_user.username or str(call.from_user.id),"", "",float(prod[1]),int(round(float(prod[1])*rate)),datetime.utcnow().isoformat(),call.from_user.id,amount,rate))
-        order_id=cur.lastrowid
-        changed=await db.execute("UPDATE users SET balance=balance-? WHERE telegram_id=? AND balance>=?",(amount,call.from_user.id,amount))
-        if changed.rowcount!=1:
-            await db.rollback();await call.answer("موجودی کیف پول تغییر کرده؛ دوباره تلاش کنید.",show_alert=True);return
-        await db.execute("INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",(call.from_user.id,-amount,"product_purchase",f"product-order-{order_id}-debit",datetime.utcnow().isoformat()))
-        await db.commit()
-    token=await complete_product_order(order_id,"TELEGRAM_WALLET")
-    if token:
-        async with aiosqlite.connect(DB_PATH) as db: items=await (await db.execute("SELECT payload FROM product_inventory WHERE order_id=? ORDER BY id",(order_id,))).fetchall()
-        payload="\n\n".join(x[0] for x in items)
-        await call.message.answer(f"✅ خرید موفق؛ سفارش #{order_id}\n\nاطلاعات محصول شما:\n<code>{html.escape(payload)}</code>")
-    else:
-        await call.message.answer(f"✅ مبلغ از کیف پول کسر شد و سفارش #{order_id} ثبت شد. برای تحویل با پشتیبانی در ارتباط باشید.")
-    await call.answer("خرید ثبت شد")
+    try:
+        pid = int(call.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        await call.answer("محصول نامعتبر است.", show_alert=True)
+        return
+
+    order_id = None
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            prod = await (await db.execute(
+                "SELECT name,price_usd,stock FROM products WHERE id=? AND active=1", (pid,)
+            )).fetchone()
+            user = await ensure_user(
+                db, call.from_user.id, call.from_user.username, call.from_user.full_name
+            )
+            if not prod or int(prod[2] or 0) < 1:
+                await db.rollback()
+                await call.answer("موجودی این محصول تمام شده است.", show_alert=True)
+                return
+
+            amount = math.ceil(float(prod[1]) * 1_000_000) / 1_000_000
+            if amount <= 0:
+                await db.rollback()
+                await call.answer("قیمت محصول معتبر نیست؛ با پشتیبانی تماس بگیرید.", show_alert=True)
+                return
+            if float(user[3] or 0) < amount:
+                await db.rollback()
+                await call.answer(
+                    "موجودی کیف پول کافی نیست؛ از گزینه پرداخت ترکیبی استفاده کنید.",
+                    show_alert=True,
+                )
+                return
+
+            # خرید کیف پولی دلاری است؛ نرخ لحظه‌ای فقط برای پرداخت ریالی لازم است.
+            try:
+                rate = float(await get_setting(db, "wallet_usd_to_toman", "100000") or 100000)
+            except (TypeError, ValueError):
+                rate = 100000.0
+            if rate <= 0:
+                rate = 100000.0
+
+            now = datetime.utcnow().isoformat()
+            cur = await db.execute(
+                "INSERT INTO product_orders(product_id,product_name,quantity,customer_name,mobile,email,amount_usd,amount_toman,status,created_at,user_id,wallet_used_usd,gateway_method,gateway_due_toman,currency_rate) "
+                "VALUES(?,?,1,?,?,?,?,?,'pending_payment',?,?,?,'wallet',0,?)",
+                (
+                    pid, prod[0], call.from_user.full_name or call.from_user.username or str(call.from_user.id),
+                    "", "", float(prod[1]), int(round(float(prod[1]) * rate)), now,
+                    call.from_user.id, amount, rate,
+                ),
+            )
+            order_id = cur.lastrowid
+            changed = await db.execute(
+                "UPDATE users SET balance=balance-? WHERE telegram_id=? AND balance>=?",
+                (amount, call.from_user.id, amount),
+            )
+            if changed.rowcount != 1:
+                await db.rollback()
+                await call.answer("موجودی کیف پول تغییر کرده؛ دوباره تلاش کنید.", show_alert=True)
+                return
+            await db.execute(
+                "INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",
+                (call.from_user.id, -amount, "product_purchase",
+                 f"product-order-{order_id}-debit", now),
+            )
+            await db.commit()
+
+        try:
+            token = await complete_product_order(order_id, "TELEGRAM_WALLET")
+        except Exception:
+            logger.exception("Telegram wallet product order completion failed: order_id=%s", order_id)
+            await refund_product_wallet(order_id)
+            await call.answer("پردازش خرید ناموفق بود؛ مبلغ به کیف پول برگشت داده شد.", show_alert=True)
+            return
+
+        if token:
+            async with aiosqlite.connect(DB_PATH) as db:
+                items = await (await db.execute(
+                    "SELECT payload FROM product_inventory WHERE order_id=? ORDER BY id", (order_id,)
+                )).fetchall()
+            payload = "\n\n".join(x[0] for x in items)
+            await call.message.answer(
+                f"✅ خرید موفق؛ سفارش #{order_id}\n\nاطلاعات محصول شما:\n"
+                f"<code>{html.escape(payload)}</code>"
+            )
+        else:
+            await call.message.answer(
+                f"✅ مبلغ از کیف پول کسر شد و سفارش #{order_id} ثبت شد. "
+                "برای تحویل با پشتیبانی در ارتباط باشید."
+            )
+        await call.answer("خرید ثبت شد")
+    except Exception:
+        logger.exception("Telegram wallet purchase failed: user_id=%s product_id=%s", call.from_user.id, pid)
+        await call.answer("خطا در ثبت خرید؛ لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.", show_alert=True)
 
 
 @router.callback_query(F.data == "tg_my_product_orders")
