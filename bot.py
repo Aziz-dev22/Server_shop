@@ -3562,6 +3562,10 @@ async def telegram_product_detail(call: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         row=await (await db.execute("SELECT name,description,price_usd,stock,delivery_mode FROM products WHERE id=? AND active=1",(pid,))).fetchone()
         user=await ensure_user(db,call.from_user.id,call.from_user.username,call.from_user.full_name)
+        inventory_images=await (await db.execute(
+            "SELECT image_url FROM product_inventory WHERE product_id=? AND status='available' AND image_url IS NOT NULL AND image_url!='' ORDER BY id DESC LIMIT 5",
+            (pid,),
+        )).fetchall()
     if not row or row[3]<1:
         await call.answer("موجودی این محصول تمام شده است.",show_alert=True); return
     need=round(float(row[2]),2)
@@ -3573,6 +3577,16 @@ async def telegram_product_detail(call: CallbackQuery):
             await db.execute("INSERT INTO customer_web_tokens(token_hash,telegram_id,redirect_path,expires_at) VALUES(?,?,?,?)",(hashlib.sha256(raw.encode()).hexdigest(),call.from_user.id,f"/shop/{pid}",(datetime.utcnow()+timedelta(minutes=15)).isoformat())); await db.commit()
         buttons.append([InlineKeyboardButton(text="💳 پرداخت ترکیبی یا با درگاه",url=f"{base}/auth/telegram/link/{raw}")])
     await call.message.answer(f"<b>{html.escape(row[0])}</b>\n{html.escape(row[1] or '')}\n\nقیمت: ${float(row[2]):.2f}\nموجودی: {row[3]}\nموجودی کیف پول: ${float(user[3] or 0):.2f}",reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    if base:
+        for image_row in inventory_images:
+            image_url = str(image_row[0] or "").strip()
+            if image_url.startswith("/"):
+                image_url = base + image_url
+            if image_url.startswith(("http://", "https://")):
+                try:
+                    await call.bot.send_photo(call.message.chat.id, photo=image_url, caption="🖼 تصویر جزئیات اکانت")
+                except Exception:
+                    logger.warning("Could not send product inventory image: product_id=%s", pid, exc_info=True)
     await call.answer()
 
 
