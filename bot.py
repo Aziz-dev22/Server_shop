@@ -3618,7 +3618,9 @@ async def telegram_product_wallet_buy(call: CallbackQuery):
                 await db.rollback()
                 await call.answer("قیمت محصول معتبر نیست؛ با پشتیبانی تماس بگیرید.", show_alert=True)
                 return
-            if float(user[3] or 0) < amount:
+            admin_free = is_admin(call.from_user.id)
+            charge_amount = 0.0 if admin_free else amount
+            if not admin_free and float(user[3] or 0) < amount:
                 await db.rollback()
                 await call.answer(
                     "موجودی کیف پول کافی نیست؛ از گزینه پرداخت ترکیبی استفاده کنید.",
@@ -3640,14 +3642,14 @@ async def telegram_product_wallet_buy(call: CallbackQuery):
                 "VALUES(?,?,1,?,?,?,?,?,'pending_payment',?,?,?,'wallet',0,?)",
                 (
                     pid, prod[0], call.from_user.full_name or call.from_user.username or str(call.from_user.id),
-                    "", "", float(prod[1]), int(round(float(prod[1]) * rate)), now,
-                    call.from_user.id, amount, rate,
+                    "", "", charge_amount, int(round(charge_amount * rate)), now,
+                    call.from_user.id, charge_amount, rate,
                 ),
             )
             order_id = cur.lastrowid
             changed = await db.execute(
                 "UPDATE users SET balance=balance-? WHERE telegram_id=? AND balance>=?",
-                (amount, call.from_user.id, amount),
+                (charge_amount, call.from_user.id, charge_amount),
             )
             if changed.rowcount != 1:
                 await db.rollback()
@@ -3655,7 +3657,7 @@ async def telegram_product_wallet_buy(call: CallbackQuery):
                 return
             await db.execute(
                 "INSERT INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)",
-                (call.from_user.id, -amount, "product_purchase",
+                (call.from_user.id, -charge_amount, "admin_free_product_purchase" if admin_free else "product_purchase",
                  f"product-order-{order_id}-debit", now),
             )
             await db.commit()
@@ -3683,7 +3685,7 @@ async def telegram_product_wallet_buy(call: CallbackQuery):
                 f"✅ مبلغ از کیف پول کسر شد و سفارش #{order_id} ثبت شد. "
                 "برای تحویل با پشتیبانی در ارتباط باشید."
             )
-        await call.answer("خرید ثبت شد")
+        await call.answer("خرید رایگان مدیر ثبت شد." if admin_free else "خرید ثبت شد")
     except Exception:
         logger.exception("Telegram wallet purchase failed: user_id=%s product_id=%s", call.from_user.id, pid)
         await call.answer("خطا در ثبت خرید؛ لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.", show_alert=True)
