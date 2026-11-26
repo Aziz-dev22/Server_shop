@@ -2601,10 +2601,10 @@ async def admin_server_purchase_do(request: Request):
             root_password = "از طریق پنل مدیریت امکان تغییر رمز وجود دارد"
         ip = core.extract_server_ip(provider, server)
         expires_at = (datetime.utcnow() + timedelta(days=30)).isoformat()
-        server_db_id = await core._save_purchase(user_id, server, server_name, ip, root_password, image_id, {"location": location, "plan_title": plan[1]}, price, expires_at, provider, provider_id, charge_wallet=False)
+        server_db_id = await core._save_purchase(user_id, server, server_name, ip, root_password, image_id, {"location": location, "plan_title": plan[1]}, price, expires_at, provider, provider_id, charge_wallet=False, order_amount=charged_price)
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE admin_wallet_actions SET action='server_purchase',details=? WHERE reference=?", (f"server_db_id={server_db_id};remote_id={server.get('id')};plan_id={plan_id};provider={provider};location={location};balance_after={balance_after:.6f}", reference))
+                await db.execute("UPDATE admin_wallet_actions SET action=?,details=? WHERE reference=?", ("server_purchase_free" if admin_free else "server_purchase", f"server_db_id={server_db_id};remote_id={server.get('id')};plan_id={plan_id};provider={provider};location={location};admin_free={int(admin_free)};balance_after={balance_after:.6f}", reference))
                 await db.commit()
         except Exception:
             core.logger.exception("Could not update admin server purchase audit row %s", reference)
@@ -2663,9 +2663,10 @@ async def admin_server_purchase_do(request: Request):
 
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("BEGIN IMMEDIATE")
-            await db.execute("UPDATE users SET balance=balance+? WHERE telegram_id=?", (price, user_id))
-            await db.execute("INSERT OR IGNORE INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)", (user_id, price, "refund", reference + ":refund", datetime.utcnow().isoformat()))
-            await db.execute("INSERT OR IGNORE INTO admin_wallet_actions(admin_actor,target_user_id,action,amount_usd,reference,details,created_at) VALUES(?,?,?,?,?,?,?)", (str(sess.get("username") or PANEL_USERNAME), user_id, "server_purchase_refund", price, reference + ":refund", f"reason={str(exc)[:300]};debit_reference={reference}", datetime.utcnow().isoformat()))
+            if charged_price > 0:
+                await db.execute("UPDATE users SET balance=balance+? WHERE telegram_id=?", (charged_price, user_id))
+            await db.execute("INSERT OR IGNORE INTO wallet_transactions(user_id,amount_usd,kind,reference,created_at) VALUES(?,?,?,?,?)", (user_id, charged_price, "refund" if charged_price else "admin_free_server_purchase_failed", reference + ":refund", datetime.utcnow().isoformat()))
+            await db.execute("INSERT OR IGNORE INTO admin_wallet_actions(admin_actor,target_user_id,action,amount_usd,reference,details,created_at) VALUES(?,?,?,?,?,?,?)", (str(sess.get("username") or PANEL_USERNAME), user_id, "server_purchase_refund" if charged_price else "server_purchase_free_failed", charged_price, reference + ":refund", f"reason={str(exc)[:300]};debit_reference={reference}", datetime.utcnow().isoformat()))
             await db.commit()
         return page("ساخت سرور ناموفق", f'<div class="card">ساخت سرور ناموفق بود؛ مبلغ {price:.2f} USD به کیف پول مشتری برگشت داده شد. خطا: {esc(str(exc)[:300])}</div>', "/admin-server-purchase")
 
