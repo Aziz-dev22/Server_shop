@@ -2300,7 +2300,21 @@ async def admin_wallet_purchase_do(request: Request):
              f"product_id={product_id};product={product[0]};quantity={quantity};order_id={order_id};balance_after={balance_after:.6f}", now),
         )
         await db.commit()
-    token = await core.complete_product_order(order_id, "ADMIN_WALLET")
+    try:
+        token = await core.complete_product_order(order_id, "ADMIN_WALLET")
+    except Exception:
+        core.logger.exception("Admin wallet product order completion failed: order_id=%s", order_id)
+        try:
+            await core.refund_product_wallet(order_id)
+        except Exception:
+            core.logger.exception("Could not refund failed admin wallet product order: order_id=%s", order_id)
+        return page(
+            "خطا در تحویل سفارش",
+            f'<div class="card"><h2>پردازش سفارش #{order_id} کامل نشد</h2>'
+            '<p>خطا ثبت شد. در صورت کسر مبلغ، سیستم تلاش کرد آن را به کیف پول مشتری برگرداند. '
+            'لطفاً وضعیت سفارش و تراکنش را بررسی کنید.</p></div>',
+            "/admin-wallet-purchase",
+        )
     async with aiosqlite.connect(DB_PATH) as db:
         order = await (await db.execute("SELECT status FROM product_orders WHERE id=?", (order_id,))).fetchone()
         items = await (await db.execute("SELECT payload FROM product_inventory WHERE order_id=? ORDER BY id", (order_id,))).fetchall()
