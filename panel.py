@@ -2078,6 +2078,7 @@ CUSTOM_BUTTON_MENUS = {
     "wallet": "کیف پول",
     "profile": "پروفایل",
     "servers": "سرورهای من",
+    "support": "پشتیبانی",
 }
 CUSTOM_BUTTON_ACTIONS = {
     "text": "نمایش متن دلخواه",
