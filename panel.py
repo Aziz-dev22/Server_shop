@@ -2079,6 +2079,8 @@ CUSTOM_BUTTON_MENUS = {
     "profile": "پروفایل",
     "servers": "سرورهای من",
     "support": "پشتیبانی",
+    "buy_server": "خرید سرور",
+    "orders": "سفارش‌های من",
 }
 CUSTOM_BUTTON_ACTIONS = {
     "text": "نمایش متن دلخواه",
