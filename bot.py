@@ -4749,6 +4749,12 @@ async def server_renew_confirm(call: CallbackQuery, state: FSMContext):
             await finalize_coupon_redemption(db, "server_renewal", renewal_order_id, success=True)
         await db.commit()
 
+    await notify_admins_sale(
+        "تمدید سرور", renewal_order_id, owner_id, name, payable_amount,
+        "رایگان ویژه ادمین" if admin_free else "کیف پول",
+        f"سرور: #{server_db_id} | مدت: {RENEWAL_PERIOD_DAYS} روز | تخفیف: {coupon_discount:.2f} USD",
+        bot=call.bot,
+    )
     await state.clear()
     if (expired_off_at or traffic_off or deletion_pending_reason):
         try:
@@ -5370,6 +5376,12 @@ async def admin_server_renew_apply(call: CallbackQuery):
         await call.answer("تمدید ثبت نشد؛ تراکنش مالی برگشت داده شد.", show_alert=True)
         return
 
+    await notify_admins_sale(
+        "تمدید مدیریتی سرور", ref, owner_id, name, amount,
+        "رایگان ویژه ادمین" if owner_is_admin else "کیف پول",
+        f"سرور: #{sid} | مدت: {days} روز | ادمین انجام‌دهنده: {call.from_user.id}",
+        bot=call.bot,
+    )
     power_note = ""
     if expired_off or traffic_off or deletion_reason:
         try:
