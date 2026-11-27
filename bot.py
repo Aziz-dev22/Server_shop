@@ -225,9 +225,19 @@ CREATE TABLE IF NOT EXISTS coupon_redemptions (
  UNIQUE(order_type,order_id)
 );
 CREATE TABLE IF NOT EXISTS web_server_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, provider_type TEXT NOT NULL, location TEXT NOT NULL, plan_id INTEGER NOT NULL, plan_title TEXT NOT NULL, server_type TEXT NOT NULL, image TEXT NOT NULL, price_usd REAL NOT NULL, wallet_used_usd REAL DEFAULT 0, wallet_refunded INTEGER DEFAULT 0, gateway_method TEXT DEFAULT 'wallet', gateway_track_id TEXT, authority TEXT UNIQUE, gateway_due_usd REAL DEFAULT 0, gateway_due_toman INTEGER DEFAULT 0, status TEXT DEFAULT 'pending_payment', server_db_id INTEGER, created_at TEXT NOT NULL, paid_at TEXT);
+CREATE TABLE IF NOT EXISTS dynamic_buttons (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ menu_key TEXT NOT NULL,
+ label TEXT NOT NULL,
+ action TEXT NOT NULL,
+ payload TEXT DEFAULT '',
+ sort_order INTEGER NOT NULL DEFAULT 0,
+ active INTEGER NOT NULL DEFAULT 1,
+ created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dynamic_buttons_menu ON dynamic_buttons(menu_key,active,sort_order,id);
 
-"""
-
+""" 
 
 async def reserve_discount_coupon(db, code, applies_to, user_id, subtotal_usd, order_type, order_id):
     """Validate a coupon and reserve its usage atomically inside the caller's transaction."""
@@ -2041,6 +2051,112 @@ async def nowpayments_available_currencies(api_key: str):
 # ---------------------------------------------------------------------------
 # کیبوردها
 # ---------------------------------------------------------------------------
+DYNAMIC_BUTTON_CACHE = {}
+
+async def refresh_dynamic_buttons_cache():
+    """Reload admin-defined buttons from the shared SQLite database."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            rows = await (await db.execute(
+                "SELECT id,menu_key,label,action,payload,sort_order FROM dynamic_buttons WHERE active=1 ORDER BY sort_order,id"
+            )).fetchall()
+        cache = {}
+        for button_id, menu_key, label, action, payload, sort_order in rows:
+            cache.setdefault(str(menu_key), []).append({
+                "id": int(button_id), "label": str(label), "action": str(action),
+                "payload": str(payload or ""), "sort_order": int(sort_order or 0)
+            })
+        DYNAMIC_BUTTON_CACHE.clear()
+        DYNAMIC_BUTTON_CACHE.update(cache)
+    except Exception:
+        logger.exception("Could not refresh dynamic buttons cache")
+
+
+def dynamic_inline_rows(menu_key: str):
+    rows = []
+    for item in DYNAMIC_BUTTON_CACHE.get(menu_key, []):
+        if item["action"] == "url":
+            rows.append([InlineKeyboardButton(text=item["label"], url=item["payload"])])
+        else:
+            rows.append([InlineKeyboardButton(text=item["label"], callback_data=f"dynbtn_{item['id']}")])
+    return rows
+
+
+async def run_dynamic_button_action(action: str, payload: str, user_id: int, message: Message, state: FSMContext = None):
+    """Only allow the fixed, reviewed actions exposed in the admin panel."""
+    if action == "text":
+        await message.answer(payload or "متنی برای این دکمه تنظیم نشده است.")
+        return
+    if action == "url":
+        safe_url = html.escape(payload, quote=True)
+        await message.answer(f'<a href="{safe_url}">برای بازکردن لینک اینجا بزنید</a>')
+        return
+    if action == "support":
+        if state is not None:
+            async with aiosqlite.connect(DB_PATH) as db:
+                enabled = await get_setting(db, "tickets_enabled", "1")
+                support_message = await get_setting(db, "support_message", "")
+            if enabled == "1":
+                await state.set_state(SupportTicket.waiting)
+                await message.answer("پیام خود را برای تیم پشتیبانی بنویسید:" + (f"\n\n{support_message}" if support_message else ""))
+            else:
+                await message.answer(support_message or "سیستم تیکت در حال حاضر غیرفعال است.")
+        return
+    if action == "shop":
+        async with aiosqlite.connect(DB_PATH) as db:
+            cats = await (await db.execute("SELECT id,name FROM product_categories WHERE active=1 ORDER BY name")).fetchall()
+            products = await (await db.execute("SELECT id,name,price_usd,stock FROM products WHERE active=1 AND stock>0 ORDER BY id DESC LIMIT 30")).fetchall()
+        buttons = [[InlineKeyboardButton(text=f"📂 {name}", callback_data=f"tgcat_{cid}")] for cid,name in cats]
+        buttons += [[InlineKeyboardButton(text=f"🛍 {name[:24]} · ${float(price):.2f}", callback_data=f"tgprod_{pid}")] for pid,name,price,stock in products]
+        buttons += dynamic_inline_rows("account_shop")
+        buttons += dynamic_inline_rows("account_shop")
+    buttons += dynamic_inline_rows("account_shop")
+    buttons.append([InlineKeyboardButton(text="📦 سفارش‌های دیجیتال من", callback_data="tg_my_product_orders")])
+        await message.answer("🛍 فروشگاه اکانت", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        return
+    if action == "stock":
+        async with aiosqlite.connect(DB_PATH) as db:
+            rows = await (await db.execute("SELECT name,stock FROM products WHERE active=1 ORDER BY name LIMIT 50")).fetchall()
+        lines = ["📦 موجودی محصولات:"]
+        lines.extend(f"• {html.escape(str(name))}: {int(stock or 0)} عدد" for name,stock in rows)
+        await message.answer("\n".join(lines) if rows else "محصول فعالی ثبت نشده است.")
+        return
+    if action == "wallet":
+        async with aiosqlite.connect(DB_PATH) as db:
+            user = await (await db.execute("SELECT balance FROM users WHERE telegram_id=?", (user_id,))).fetchone()
+        bal = float(user[0] or 0) if user else 0.0
+        buttons = dynamic_inline_rows("wallet")
+        buttons.extend([[InlineKeyboardButton(text="➕ افزایش موجودی", callback_data="wallet_charge")],
+                        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_main")]])
+        await message.answer(f"💰 موجودی فعلی شما: {fmt_price(bal)}", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        return
+    if action == "profile":
+        async with aiosqlite.connect(DB_PATH) as db:
+            user = await (await db.execute("SELECT username,full_name,balance FROM users WHERE telegram_id=?", (user_id,))).fetchone()
+            count = await (await db.execute("SELECT COUNT(*) FROM servers WHERE user_id=?", (user_id,))).fetchone()
+        if user:
+            buttons = dynamic_inline_rows("profile") + [[InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_main")]]
+            await message.answer(f"👤 پروفایل شما\nشناسه تلگرام: {user_id}\nنام: {user[1] or user[0] or '-'}\nموجودی: {fmt_price(user[2])}\nتعداد سرورها: {count[0]}", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        return
+    if action == "servers":
+        async with aiosqlite.connect(DB_PATH) as db:
+            rows = await (await db.execute(
+                "SELECT id,name,ip FROM servers WHERE user_id=? ORDER BY id DESC LIMIT 50", (user_id,)
+            )).fetchall()
+        buttons = [[InlineKeyboardButton(text=f"🖥 {str(name or 'سرور')} · {ip or '-'} · #{sid}", callback_data=f"svshow_{sid}")] for sid,name,ip in rows]
+        buttons += dynamic_inline_rows("servers")
+        buttons.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_main")])
+        await message.answer("🖥 سرورهای شما:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        return
+    await message.answer("عملیات این دکمه پشتیبانی نمی‌شود.")
+
+
+async def dynamic_buttons_poller():
+    while True:
+        await refresh_dynamic_buttons_cache()
+        await asyncio.sleep(20)
+
+
 def main_menu_kb(admin: bool):
     rows = [
         [KeyboardButton(text="🛒 خرید سرور"), KeyboardButton(text="🖥 سرورهای من")],
@@ -2048,6 +2164,8 @@ def main_menu_kb(admin: bool):
         [KeyboardButton(text="💰 کیف پول"), KeyboardButton(text="👤 پروفایل")],
         [KeyboardButton(text="🆘 پشتیبانی")],
     ]
+    for item in DYNAMIC_BUTTON_CACHE.get("main", []):
+        rows.append([KeyboardButton(text=item["label"])])
     if admin:
         rows.append([KeyboardButton(text="⚙️ پنل مدیریت")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
@@ -2555,7 +2673,7 @@ async def profile(message: Message):
         f"موجودی کیف پول: {fmt_price(user[3])}\n"
         f"تعداد سرورها: {server_count}",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🔙 بازگشت به منوی اصلی", callback_data="back_main")]]
+            inline_keyboard=dynamic_inline_rows("profile") + [[InlineKeyboardButton(text="🔙 بازگشت به منوی اصلی", callback_data="back_main")]]
         ),
     )
 
@@ -2568,7 +2686,7 @@ async def wallet_menu(message: Message):
     async with aiosqlite.connect(DB_PATH) as db:
         user = await ensure_user(db, message.from_user.id, message.from_user.username, message.from_user.full_name)
     kb = InlineKeyboardMarkup(
-        inline_keyboard=[
+        inline_keyboard=dynamic_inline_rows("wallet") + [
             [InlineKeyboardButton(text="➕ افزایش موجودی", callback_data="wallet_charge")],
             [InlineKeyboardButton(text="🔙 بازگشت به منوی اصلی", callback_data="back_main")],
         ]
@@ -3756,7 +3874,7 @@ async def my_servers(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🖥 {str(r[1] or 'سرور')} · {str(r[2] or '-')} · #{r[0]}", callback_data=f"svshow_{r[0]}")]
         for r in servers
-    ] + [[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="back_main")]])
+    ] + dynamic_inline_rows("servers") + [[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="back_main")]])
     await message.answer("🖥 سرورهای شما\nبرای مدیریت، یک سرور را انتخاب کنید:", reply_markup=kb)
 
 
@@ -5986,6 +6104,33 @@ async def adm_broadcast_send(message: Message, state: FSMContext):
     await status_msg.edit_text(f"✅ ارسال شد به {sent} کاربر ({failed} ناموفق).")
 
 
+@router.callback_query(F.data.startswith("dynbtn_"))
+async def dynamic_button_callback(call: CallbackQuery, state: FSMContext):
+    try:
+        button_id = int(call.data.split("_", 1)[1])
+    except (TypeError, ValueError):
+        await call.answer("دکمه نامعتبر است.", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute(
+            "SELECT action,payload FROM dynamic_buttons WHERE id=? AND active=1", (button_id,)
+        )).fetchone()
+    if not row:
+        await call.answer("این دکمه غیرفعال یا حذف شده است.", show_alert=True)
+        return
+    await call.answer()
+    await run_dynamic_button_action(str(row[0]), str(row[1] or ""), call.from_user.id, call.message, state)
+
+
+@router.message(F.text)
+async def dynamic_main_menu_button(message: Message, state: FSMContext):
+    label = str(message.text or "").strip()
+    match = next((x for x in DYNAMIC_BUTTON_CACHE.get("main", []) if x["label"] == label), None)
+    if not match:
+        return
+    await run_dynamic_button_action(match["action"], match["payload"], message.from_user.id, message, state)
+
+
 # ---------------------------------------------------------------------------
 # نگهداری خودکار: هر ۶ ساعت چک ترافیک مصرفی و مهلت سرویس‌ها
 # ---------------------------------------------------------------------------
@@ -6132,6 +6277,7 @@ async def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN تنظیم نشده است. فایل .env را بررسی کنید.")
     await init_db()
+    await refresh_dynamic_buttons_cache()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
@@ -6143,6 +6289,7 @@ async def main():
         asyncio.create_task(supervise_background_worker("payment_status", lambda: oxapay_poller(bot))),
         asyncio.create_task(supervise_background_worker("server_maintenance", lambda: maintenance_poller(bot))),
         asyncio.create_task(supervise_background_worker("ip_cleanup", ip_cleanup_poller)),
+        asyncio.create_task(supervise_background_worker("dynamic_buttons", dynamic_buttons_poller)),
     ]
     delay = 5
     try:
