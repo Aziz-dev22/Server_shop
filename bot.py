@@ -2114,6 +2114,24 @@ async def run_dynamic_button_action(action: str, payload: str, user_id: int, mes
             else:
                 await message.answer(support_message or "سیستم تیکت در حال حاضر غیرفعال است.")
         return
+    if action == "buy_server":
+        if state is None:
+            await message.answer("برای شروع خرید سرور، از منوی اصلی گزینه خرید سرور را انتخاب کنید.")
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            enabled = await get_enabled_provider_types(db)
+        if not enabled:
+            await message.answer("در حال حاضر امکان خرید فعال نیست؛ اتصال سرویس‌دهنده توسط مدیریت تنظیم نشده است.")
+        elif len(enabled) == 1:
+            await state.update_data(provider_type=enabled[0])
+            await _buy_show_locations(message, state, enabled[0])
+        else:
+            kb_rows = [[InlineKeyboardButton(text=PROVIDER_LABELS.get(p, p), callback_data=f"buyprov_{p}")] for p in enabled]
+            kb_rows += dynamic_inline_rows("buy_server")
+            kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_main")])
+            await state.set_state(BuyFlow.provider)
+            await message.answer("🌍 کدام سرویس‌دهنده را می‌خواهید؟", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+        return
     if action == "shop":
         async with aiosqlite.connect(DB_PATH) as db:
             cats = await (await db.execute("SELECT id,name FROM product_categories WHERE active=1 ORDER BY name")).fetchall()
@@ -6137,6 +6155,7 @@ async def dynamic_button_callback(call: CallbackQuery, state: FSMContext):
         await call.answer("این دکمه غیرفعال یا حذف شده است.", show_alert=True)
         return
     await call.answer()
+    await state.clear()
     await run_dynamic_button_action(str(row[0]), str(row[1] or ""), call.from_user.id, call.message, state)
 
 
