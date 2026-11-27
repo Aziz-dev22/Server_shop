@@ -2110,7 +2110,7 @@ async def run_dynamic_button_action(action: str, payload: str, user_id: int, mes
                 support_message = await get_setting(db, "support_message", "")
             if enabled == "1":
                 await state.set_state(SupportTicket.waiting)
-                await message.answer("پیام خود را برای تیم پشتیبانی بنویسید:" + (f"\\n\\n{support_message}" if support_message else ""))
+                await message.answer("پیام خود را برای تیم پشتیبانی بنویسید:" + (f"\n\n{support_message}" if support_message else ""))
             else:
                 await message.answer(support_message or "سیستم تیکت در حال حاضر غیرفعال است.")
         return
@@ -2129,7 +2129,7 @@ async def run_dynamic_button_action(action: str, payload: str, user_id: int, mes
             rows = await (await db.execute("SELECT name,stock FROM products WHERE active=1 ORDER BY name LIMIT 50")).fetchall()
         lines = ["📦 موجودی محصولات:"]
         lines.extend(f"• {html.escape(str(name))}: {int(stock or 0)} عدد" for name,stock in rows)
-        await message.answer("\\n".join(lines) if rows else "محصول فعالی ثبت نشده است.")
+        await message.answer("\n".join(lines) if rows else "محصول فعالی ثبت نشده است.")
         return
     if action == "wallet":
         async with aiosqlite.connect(DB_PATH) as db:
@@ -2146,7 +2146,7 @@ async def run_dynamic_button_action(action: str, payload: str, user_id: int, mes
             count = await (await db.execute("SELECT COUNT(*) FROM servers WHERE user_id=?", (user_id,))).fetchone()
         if user:
             buttons = dynamic_inline_rows("profile") + [[InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_main")]]
-            await message.answer(f"👤 پروفایل شما\\nشناسه تلگرام: {user_id}\\nنام: {user[1] or user[0] or '-'}\\nموجودی: {fmt_price(user[2])}\\nتعداد سرورها: {count[0]}", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+            await message.answer(f"👤 پروفایل شما\nشناسه تلگرام: {user_id}\nنام: {user[1] or user[0] or '-'}\nموجودی: {fmt_price(user[2])}\nتعداد سرورها: {count[0]}", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
         return
     if action == "servers":
         async with aiosqlite.connect(DB_PATH) as db:
@@ -2917,6 +2917,8 @@ async def support_start(message: Message, state: FSMContext):
         enabled = await get_setting(db, "tickets_enabled", "1")
         support_id = await get_setting(db, "support_id", "")
         support_message = await get_setting(db, "support_message", "برای ارتباط با پشتیبانی از اطلاعات زیر استفاده کنید.")
+    support_rows = dynamic_inline_rows("support")
+    support_markup = InlineKeyboardMarkup(inline_keyboard=support_rows) if support_rows else None
     if enabled != "1":
         lines = ["🆘 پشتیبانی", support_message]
         if support_id:
