@@ -2923,7 +2923,7 @@ async def support_start(message: Message, state: FSMContext):
         lines = ["🆘 پشتیبانی", support_message]
         if support_id:
             lines.append(f"شناسه پشتیبانی: {support_id}")
-        await message.answer("\n\n".join(lines))
+        await message.answer("\n\n".join(lines), reply_markup=support_markup)
         return
     await state.set_state(SupportTicket.waiting)
     lines = ["پیام خود را برای تیم پشتیبانی بنویسید:"]
@@ -2931,7 +2931,7 @@ async def support_start(message: Message, state: FSMContext):
         lines.append(support_message)
     if support_id:
         lines.append(f"ارتباط مستقیم: {support_id}")
-    await message.answer("\n\n".join(lines))
+    await message.answer("\n\n".join(lines), reply_markup=support_markup)
 
 
 @router.message(SupportTicket.waiting)
