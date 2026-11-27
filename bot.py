@@ -1686,6 +1686,60 @@ async def notify_admins(bot, text: str):
             logger.warning("Could not notify admin %s: %s", admin_id, exc)
 
 
+async def notify_admins_sale(sale_type, order_id, user_id, title, amount_usd, payment_method, details="", bot=None):
+    """Send one compact sale/renewal report to every configured administrator."""
+    if not ADMIN_IDS or (bot is None and not BOT_TOKEN):
+        return
+    owned_bot = bot is None
+    client = bot
+    try:
+        if owned_bot:
+            client = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        username = ""
+        full_name = ""
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                user = await (await db.execute(
+                    "SELECT username,full_name FROM users WHERE telegram_id=?", (user_id,)
+                )).fetchone()
+            if user:
+                username, full_name = user
+        except Exception:
+            logger.exception("Could not load customer details for sale report %s", order_id)
+        customer = html.escape(str(full_name or ""))
+        if username:
+            customer += f" (@{html.escape(str(username))})"
+        if not customer:
+            customer = "نام ثبت نشده"
+        try:
+            amount = max(0.0, float(amount_usd or 0))
+        except (TypeError, ValueError):
+            amount = 0.0
+        stamp = iran_time(datetime.utcnow())
+        stamp_text = stamp.strftime("%Y-%m-%d %H:%M:%S") if stamp else datetime.utcnow().isoformat()
+        report = (
+            "🟢 <b>گزارش فروش / تمدید موفق</b>\\n"
+            f"نوع: {html.escape(str(sale_type))}\\n"
+            f"شماره سفارش: #{html.escape(str(order_id))}\\n"
+            f"مشتری: {customer}\\n"
+            f"شناسه تلگرام: <code>{int(user_id or 0)}</code>\\n"
+            f"محصول / پلن: {html.escape(str(title or '-'))}\\n"
+            f"مبلغ ثبت‌شده: <b>\${amount:.2f}</b>\\n"
+            f"روش پرداخت: {html.escape(str(payment_method or '-'))}\\n"
+            + (f"جزئیات: {html.escape(str(details))}\\n" if details else "")
+            + f"زمان ایران: {stamp_text}"
+        )
+        await notify_admins(client, report)
+    except Exception:
+        logger.exception("Sale report notification failed: order=%s type=%s", order_id, sale_type)
+    finally:
+        if owned_bot and client is not None:
+            try:
+                await client.session.close()
+            except Exception:
+                pass
+
+
 async def report_hetzner_create_failure(call, user_id, data, exc: "HetznerCreateFailed"):
     """پیام مناسب به کاربر + گزارش کامل به ادمین (برای خطاهایی که نیاز به اقدام ادمین دارند)."""
     logger.error("Hetzner server creation failed for user %s | ref=%s | uncertain=%s | attempts=%s",
@@ -1868,27 +1922,37 @@ async def complete_product_order(order_id: int, reference: str = ""):
     """Finalize a product order atomically; inventory is reserved and delivered once."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
-        row = await (await db.execute("SELECT product_id,quantity,status FROM product_orders WHERE id=?", (order_id,))).fetchone()
+        row = await (await db.execute(
+            "SELECT product_id,quantity,status,user_id,product_name,amount_usd,gateway_method "
+            "FROM product_orders WHERE id=?", (order_id,)
+        )).fetchone()
         if not row or row[2] != "pending_payment":
             await db.commit()
             return None
-        pid, qty, _ = row
+        pid, qty, _, user_id, product_name, amount_usd, gateway_method = row
         await finalize_coupon_redemption(db, "product", order_id, True)
         product = await (await db.execute("SELECT delivery_mode FROM products WHERE id=?", (pid,))).fetchone()
         if not product:
             await db.execute("UPDATE product_orders SET status='paid_stock_issue',ref_id=?,paid_at=? WHERE id=?", (reference, datetime.utcnow().isoformat(), order_id))
-            await db.commit(); return None
+            await db.commit()
+            await notify_admins_sale("خرید اکانت / محصول", order_id, user_id, product_name, amount_usd, gateway_method,
+                                     "پرداخت موفق است اما محصول در دیتابیس پیدا نشد.")
+            return None
         token = None
         if product[0] == "automatic":
             items = await (await db.execute("SELECT id FROM product_inventory WHERE product_id=? AND status='available' ORDER BY id LIMIT ?", (pid, qty))).fetchall()
             if len(items) != qty:
                 await db.execute("UPDATE product_orders SET status='paid_stock_issue',ref_id=?,paid_at=? WHERE id=?", (reference, datetime.utcnow().isoformat(), order_id))
-                await db.commit(); return None
+                await db.commit()
+                await notify_admins_sale("خرید اکانت / محصول", order_id, user_id, product_name, amount_usd, gateway_method,
+                                         f"پرداخت موفق است اما موجودی کافی نیست؛ تعداد درخواستی: {qty}.")
+                return None
             now = datetime.utcnow().isoformat()
             for item in items:
                 cur = await db.execute("UPDATE product_inventory SET status='sold',order_id=?,delivered_at=? WHERE id=? AND status='available'", (order_id, now, item[0]))
                 if cur.rowcount != 1:
-                    await db.rollback(); return None
+                    await db.rollback()
+                    return None
             await db.execute("UPDATE products SET stock=(SELECT COUNT(*) FROM product_inventory WHERE product_id=? AND status='available') WHERE id=?", (pid, pid))
             await db.execute("UPDATE products SET active=0 WHERE id=? AND stock<=0", (pid,))
             token = secrets.token_urlsafe(32)
@@ -1901,8 +1965,13 @@ async def complete_product_order(order_id: int, reference: str = ""):
             else:
                 await db.execute("UPDATE products SET active=0 WHERE id=? AND stock<=0", (pid,))
                 await db.execute("UPDATE product_orders SET status='paid',ref_id=?,paid_at=? WHERE id=?", (reference, datetime.utcnow().isoformat(), order_id))
+        status_row = await (await db.execute("SELECT status FROM product_orders WHERE id=?", (order_id,))).fetchone()
         await db.commit()
-        return token
+    await notify_admins_sale(
+        "خرید اکانت / محصول", order_id, user_id, product_name, amount_usd, gateway_method,
+        f"تعداد: {qty} | وضعیت سفارش: {(status_row[0] if status_row else 'ثبت‌شده')}"
+    )
+    return token
 
 
 async def oxapay_poller(bot: Bot):
@@ -3480,7 +3549,7 @@ async def buy_confirm(call: CallbackQuery, state: FSMContext):
         _BUY_IN_PROGRESS.discard(user_id)
 
 
-async def _save_purchase(user_id, server, server_name, ip, root_password, os_image, data, price, expires_at, provider_type, provider_id, charge_wallet=True, order_amount=None):
+async def _save_purchase(user_id, server, server_name, ip, root_password, os_image, data, price, expires_at, provider_type, provider_id, charge_wallet=True, order_amount=None, payment_method=None, report_amount=None, bot=None):
     """ثبت سرور و سفارش؛ در خرید وب سهم کیف پول پیش‌تر به‌صورت اتمیک رزرو شده است."""
     async with aiosqlite.connect(DB_PATH) as db:
         if charge_wallet:
@@ -3498,11 +3567,21 @@ async def _save_purchase(user_id, server, server_name, ip, root_password, os_ima
         )
         cur = await db.execute("SELECT last_insert_rowid()")
         server_db_id = (await cur.fetchone())[0]
-        await db.execute(
+        order_cur = await db.execute(
             "INSERT INTO orders (user_id, server_id, plan_title, location, price, status, created_at) VALUES (?,?,?,?,?,?,?)",
             (user_id, server_db_id, data["plan_title"], data["location"], price if order_amount is None else order_amount, "completed", datetime.utcnow().isoformat()),
         )
+        order_id = order_cur.lastrowid
         await db.commit()
+    sale_amount = (price if order_amount is None else order_amount) if report_amount is None else report_amount
+    method = payment_method or ("کیف پول" if charge_wallet else "ثبت‌شده از وب / پنل")
+    if user_id in ADMIN_IDS and float(sale_amount or 0) == 0:
+        method = "رایگان ویژه ادمین"
+    await notify_admins_sale(
+        "خرید سرور", order_id, user_id, data.get("plan_title") or server_name, sale_amount, method,
+        f"سرور: #{server_db_id} | IP: {ip} | دیتاسنتر: {data.get('location') or '-'}",
+        bot=bot,
+    )
     return server_db_id
 
 
