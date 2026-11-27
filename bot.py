@@ -3667,6 +3667,7 @@ async def _buy_confirm_impl(call: CallbackQuery, state: FSMContext):
             server_db_id = await _save_purchase(
                 user_id, server, server_name, ip, root_password, os_image, data, price, expires_at, provider_type, provider_id,
                 charge_wallet=not admin_free, order_amount=0.0 if admin_free else price,
+                payment_method="رایگان ویژه ادمین" if admin_free else "کیف پول", bot=call.bot,
             )
             break
         except Exception:
@@ -5538,13 +5539,13 @@ async def complete_web_server_order(order_id: int, reference: str = ""):
     """Create a paid web server order exactly once and persist it without charging wallet twice."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
-        row=await (await db.execute("SELECT user_id,provider_type,location,plan_id,plan_title,server_type,image,price_usd,status FROM web_server_orders WHERE id=?",(order_id,))).fetchone()
+        row=await (await db.execute("SELECT user_id,provider_type,location,plan_id,plan_title,server_type,image,price_usd,status,gateway_method,wallet_used_usd,gateway_due_usd FROM web_server_orders WHERE id=?",(order_id,))).fetchone()
         if not row or row[8] != "pending_payment":
             await db.commit(); return None
         await db.execute("UPDATE web_server_orders SET status='creating',paid_at=? WHERE id=?",(datetime.utcnow().isoformat(),order_id))
         await finalize_coupon_redemption(db, "server", order_id, True)
         await db.commit()
-    user_id,ptype,location,plan_id,plan_title,server_type,image,price,_=row
+    user_id,ptype,location,plan_id,plan_title,server_type,image,price,_,gateway_method,wallet_used,gateway_due=row
     server_name=f"srv-{user_id}-{secrets.token_hex(3)}"; order_ref=secrets.token_hex(8); provider_id=None
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -5560,7 +5561,9 @@ async def complete_web_server_order(order_id: int, reference: str = ""):
         if not root_password: root_password="از طریق بخش مدیریت سرورها امکان تغییر رمز وجود دارد"
         ip=extract_server_ip(ptype,server); expires=(datetime.utcnow()+timedelta(days=30)).isoformat()
         data={"location":location,"plan_title":plan_title}
-        server_db_id=await _save_purchase(user_id,server,server_name,ip,root_password,image,data,float(price),expires,ptype,provider_id,charge_wallet=False,order_amount=0.0 if user_id in ADMIN_IDS else float(price))
+        report_amount = 0.0 if user_id in ADMIN_IDS else float(wallet_used or 0) + float(gateway_due or 0)
+         payment_label = "رایگان ویژه ادمین" if user_id in ADMIN_IDS else f"{gateway_method} + کیف پول ${float(wallet_used or 0):.2f}"
+         server_db_id=await _save_purchase(user_id,server,server_name,ip,root_password,image,data,float(price),expires,ptype,provider_id,charge_wallet=False,order_amount=0.0 if user_id in ADMIN_IDS else float(price),payment_method=payment_label,report_amount=report_amount)
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE web_server_orders SET status='completed',server_db_id=? WHERE id=?",(server_db_id,order_id)); await db.commit()
         return server_db_id
