@@ -77,6 +77,7 @@ NAV_ITEMS = [
     ("/settings", "⚙️ تنظیمات درگاه"),
     ("/settings/zarinpal", "💳 زرین‌پال"),
     ("/settings/wallet-rate", "💱 نرخ تبدیل کیف پول"),
+    ("/custom-buttons", "🔘 دکمه‌های سفارشی ربات"),
     ("/broadcast", "📢 پیام همگانی"),
 ]
 
@@ -2069,6 +2070,165 @@ async def settings_manual_address(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# مدیریت دکمه‌های سفارشی ربات
+# ---------------------------------------------------------------------------
+CUSTOM_BUTTON_MENUS = {
+    "main": "منوی اصلی",
+    "account_shop": "فروشگاه اکانت",
+    "wallet": "کیف پول",
+    "profile": "پروفایل",
+    "servers": "سرورهای من",
+}
+CUSTOM_BUTTON_ACTIONS = {
+    "text": "نمایش متن دلخواه",
+    "url": "بازکردن لینک",
+    "shop": "بازکردن فروشگاه اکانت",
+    "stock": "نمایش موجودی محصولات",
+    "wallet": "نمایش کیف پول",
+    "profile": "نمایش پروفایل",
+    "servers": "نمایش سرورهای مشتری",
+    "support": "شروع فرایند پشتیبانی",
+}
+
+
+def parse_custom_button_form(form):
+    menu_key = str(form.get("menu_key", "")).strip()
+    label = str(form.get("label", "")).strip()
+    action = str(form.get("action", "")).strip()
+    payload = str(form.get("payload", "")).strip()
+    try:
+        sort_order = int(form.get("sort_order", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    reserved = {"🛒 خرید سرور", "🖥 سرورهای من", "🛍 فروشگاه اکانت", "📦 سفارش‌های من",
+                "💰 کیف پول", "👤 پروفایل", "🆘 پشتیبانی", "⚙️ پنل مدیریت"}
+    if menu_key not in CUSTOM_BUTTON_MENUS or action not in CUSTOM_BUTTON_ACTIONS:
+        return None
+    if not label or len(label) > 60 or (menu_key == "main" and label in reserved):
+        return None
+    if len(payload) > 3000 or sort_order < 0 or sort_order > 999:
+        return None
+    if action == "text" and not payload:
+        return None
+    if action == "url" and not (payload.startswith("https://") or payload.startswith("http://")):
+        return None
+    if action not in ("text", "url") and payload:
+        return None
+    return menu_key, label, action, payload, sort_order
+
+
+@app.get("/custom-buttons", response_class=HTMLResponse)
+async def custom_buttons_admin(request: Request):
+    if not get_session(request):
+        return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        rows = await (await db.execute(
+            "SELECT id,menu_key,label,action,payload,sort_order,active FROM dynamic_buttons ORDER BY menu_key,sort_order,id"
+        )).fetchall()
+    table_rows = []
+    for row in rows:
+        bid, menu_key, label, action, payload, order, active = row
+        menu_options = "".join(
+            f'<option value="{key}" {"selected" if key == menu_key else ""}>{name}</option>'
+            for key, name in CUSTOM_BUTTON_MENUS.items()
+        )
+        action_options = "".join(
+            f'<option value="{key}" {"selected" if key == action else ""}>{name}</option>'
+            for key, name in CUSTOM_BUTTON_ACTIONS.items()
+        )
+        table_rows.append(
+            f'<tr><td>#{bid}</td><td><form method="post" action="/custom-buttons/{bid}/update">'
+            f'<label>محل نمایش</label><select name="menu_key">{menu_options}</select>'
+            f'<label>عنوان دکمه</label><input name="label" maxlength="60" value="{esc(label)}" required>'
+            f'<label>عملکرد</label><select name="action">{action_options}</select>'
+            f'<label>متن یا لینک (برای عملیات‌های دیگر خالی بماند)</label>'
+            f'<textarea name="payload" rows="3">{esc(payload or "")}</textarea>'
+            f'<label>ترتیب</label><input name="sort_order" type="number" min="0" max="999" value="{int(order or 0)}">'
+            f'<button class="btn green" type="submit">ذخیره تغییرات</button></form>'
+            f'<p><b>وضعیت:</b> {"فعال" if active else "غیرفعال"}</p>'
+            f'<form method="post" action="/custom-buttons/{bid}/toggle" style="display:inline">'
+            f'<button class="btn small" type="submit">{"غیرفعال‌کردن" if active else "فعال‌کردن"}</button></form> '
+            f'<form method="post" action="/custom-buttons/{bid}/delete" style="display:inline" onsubmit="return confirm(\'این دکمه حذف شود؟\')">'
+            f'<button class="btn small danger" type="submit">حذف</button></form></td></tr>'
+        )
+    table = "".join(table_rows) or '<tr><td>هنوز دکمه سفارشی ساخته نشده است.</td></tr>'
+    menu_options = "".join(f'<option value="{k}">{v}</option>' for k,v in CUSTOM_BUTTON_MENUS.items())
+    action_options = "".join(f'<option value="{k}">{v}</option>' for k,v in CUSTOM_BUTTON_ACTIONS.items())
+    body = f"""
+    <h1>🔘 مدیریت دکمه‌های سفارشی ربات</h1>
+    <div class="card">
+      <h2>ساخت دکمه جدید</h2>
+      <form method="post" action="/custom-buttons/create">
+        <label>محل نمایش دکمه</label><select name="menu_key">{menu_options}</select>
+        <label>عنوان دکمه</label><input name="label" maxlength="60" placeholder="مثلاً 📜 قوانین خرید اکانت" required>
+        <label>عملکرد دکمه</label><select name="action">{action_options}</select>
+        <label>متن یا لینک</label><textarea name="payload" rows="4" placeholder="برای نمایش متن، متن قوانین را وارد کنید؛ برای لینک، آدرس کامل http(s) را بنویسید. برای عملیات‌های آماده خالی بماند."></textarea>
+        <label>ترتیب نمایش (عدد کمتر = بالاتر)</label><input name="sort_order" type="number" min="0" max="999" value="10">
+        <button class="btn green" type="submit">ایجاد دکمه</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>دکمه‌های ساخته‌شده</h2>
+      <p>عملیات‌ها محدود به گزینه‌های امن و ازپیش‌تعریف‌شده هستند؛ اجرای کد دلخواه یا SQL از طریق دکمه‌ها امکان‌پذیر نیست. تغییرات حداکثر طی ۲۰ ثانیه در ربات تازه می‌شوند.</p>
+      <div class="table-wrap"><table><thead><tr><th>شناسه</th><th>تنظیمات و عملیات</th></tr></thead><tbody>{table}</tbody></table></div>
+    </div>
+    """
+    return page("دکمه‌های سفارشی", body, "/custom-buttons")
+
+
+@app.post("/custom-buttons/create")
+async def custom_button_create(request: Request):
+    if not get_session(request):
+        return RedirectResponse("/login")
+    values = parse_custom_button_form(await request.form())
+    if not values:
+        return RedirectResponse("/custom-buttons?notice=invalid", status_code=303)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO dynamic_buttons(menu_key,label,action,payload,sort_order,active,created_at) VALUES(?,?,?,?,?,1,?)",
+            (*values, datetime.utcnow().isoformat())
+        )
+        await db.commit()
+    return RedirectResponse("/custom-buttons?notice=created", status_code=303)
+
+
+@app.post("/custom-buttons/{button_id}/update")
+async def custom_button_update(request: Request, button_id: int):
+    if not get_session(request):
+        return RedirectResponse("/login")
+    values = parse_custom_button_form(await request.form())
+    if not values:
+        return RedirectResponse("/custom-buttons?notice=invalid", status_code=303)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE dynamic_buttons SET menu_key=?,label=?,action=?,payload=?,sort_order=? WHERE id=?",
+            (*values, button_id)
+        )
+        await db.commit()
+    return RedirectResponse("/custom-buttons?notice=updated", status_code=303)
+
+
+@app.post("/custom-buttons/{button_id}/toggle")
+async def custom_button_toggle(request: Request, button_id: int):
+    if not get_session(request):
+        return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE dynamic_buttons SET active=CASE WHEN active=1 THEN 0 ELSE 1 END WHERE id=?", (button_id,))
+        await db.commit()
+    return RedirectResponse("/custom-buttons", status_code=303)
+
+
+@app.post("/custom-buttons/{button_id}/delete")
+async def custom_button_delete(request: Request, button_id: int):
+    if not get_session(request):
+        return RedirectResponse("/login")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM dynamic_buttons WHERE id=?", (button_id,))
+        await db.commit()
+    return RedirectResponse("/custom-buttons", status_code=303)
+
+
+# ---------------------------------------------------------------------------
 # پیام همگانی
 # ---------------------------------------------------------------------------
 @app.get("/broadcast", response_class=HTMLResponse)
@@ -2084,20 +2244,7 @@ async def broadcast_form(request: Request):
     <div class="card">
       <form method="post" action="/broadcast/send">
         <label>متن پیام</label>
-        <textarea name="text" rows="8" required>☁️ <b>CLOUD_CENTER</b>
-
-🔥 <b>جشنواره تخفیف ویژه سرورها شروع شد!</b>
-
-🎁 با کد تخفیف زیر، از <b>۷٪ تخفیف</b> بهره‌مند شوید:
-
-🏷 <b>کد تخفیف: <code>CLOUD7</code></b>
-
-✅ شامل خرید سرور جدید و تمدید سرورهای فعال
-
-💎 سرور خود را با هزینه کمتر تهیه یا تمدید کنید.
-⏳ فرصت استفاده از این تخفیف را از دست ندهید!
-
-🚀 <b>CLOUD_CENTER | قدرت، سرعت و اطمینان</b></textarea>
+        <textarea name="text" rows="8" required placeholder="متن پیام همگانی را اینجا بنویسید..."></textarea>
         <label><input type="checkbox" name="add_buy_button" value="1" checked> افزودن دکمه «🛒 خرید سرور» زیر پیام</label>
         <button class="btn" type="submit">ارسال به همه کاربران</button>
       </form>
