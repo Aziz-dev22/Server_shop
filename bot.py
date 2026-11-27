@@ -3079,6 +3079,7 @@ async def buy_start(message: Message, state: FSMContext):
     kb_rows = [
         [InlineKeyboardButton(text=PROVIDER_LABELS.get(p, p), callback_data=f"buyprov_{p}")] for p in enabled
     ]
+    kb_rows += dynamic_inline_rows("buy_server")
     kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_main")])
     await state.set_state(BuyFlow.provider)
     await message.answer("🌍 کدام سرویس‌دهنده را می‌خواهید؟", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
@@ -3134,6 +3135,7 @@ async def _buy_show_locations(message: Message, state: FSMContext, provider_type
         [InlineKeyboardButton(text=f"{loc['city']} ({loc['country']})" if loc["country"] else loc["city"], callback_data=f"loc_{loc['name']}")]
         for loc in locations
     ]
+    kb_rows += dynamic_inline_rows("buy_server")
     kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_main")])
     await state.set_state(BuyFlow.location)
     text = "📍 یک دیتاسنتر انتخاب کنید:"
@@ -4682,7 +4684,7 @@ async def my_orders(message: Message):
         )
         orders = await cur.fetchall()
     back_kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🔙 بازگشت به منوی اصلی", callback_data="back_main")]]
+        inline_keyboard=dynamic_inline_rows("orders") + [[InlineKeyboardButton(text="🔙 بازگشت به منوی اصلی", callback_data="back_main")]]
     )
     if not orders:
         await message.answer("سفارشی ثبت نشده است.", reply_markup=back_kb)
