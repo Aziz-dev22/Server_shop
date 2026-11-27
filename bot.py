@@ -1718,15 +1718,15 @@ async def notify_admins_sale(sale_type, order_id, user_id, title, amount_usd, pa
         stamp = iran_time(datetime.utcnow())
         stamp_text = stamp.strftime("%Y-%m-%d %H:%M:%S") if stamp else datetime.utcnow().isoformat()
         report = (
-            "🟢 <b>گزارش فروش / تمدید موفق</b>\\n"
-            f"نوع: {html.escape(str(sale_type))}\\n"
-            f"شماره سفارش: #{html.escape(str(order_id))}\\n"
-            f"مشتری: {customer}\\n"
-            f"شناسه تلگرام: <code>{int(user_id or 0)}</code>\\n"
-            f"محصول / پلن: {html.escape(str(title or '-'))}\\n"
-            f"مبلغ ثبت‌شده: <b>\${amount:.2f}</b>\\n"
-            f"روش پرداخت: {html.escape(str(payment_method or '-'))}\\n"
-            + (f"جزئیات: {html.escape(str(details))}\\n" if details else "")
+            "🟢 <b>گزارش فروش / تمدید موفق</b>\n"
+            f"نوع: {html.escape(str(sale_type))}\n"
+            f"شماره سفارش: #{html.escape(str(order_id))}\n"
+            f"مشتری: {customer}\n"
+            f"شناسه تلگرام: <code>{int(user_id or 0)}</code>\n"
+            f"محصول / پلن: {html.escape(str(title or '-'))}\n"
+            f"مبلغ ثبت‌شده: <b>\${amount:.2f}</b>\n"
+            f"روش پرداخت: {html.escape(str(payment_method or '-'))}\n"
+            + (f"جزئیات: {html.escape(str(details))}\n" if details else "")
             + f"زمان ایران: {stamp_text}"
         )
         await notify_admins(client, report)
@@ -5562,8 +5562,8 @@ async def complete_web_server_order(order_id: int, reference: str = ""):
         ip=extract_server_ip(ptype,server); expires=(datetime.utcnow()+timedelta(days=30)).isoformat()
         data={"location":location,"plan_title":plan_title}
         report_amount = 0.0 if user_id in ADMIN_IDS else float(wallet_used or 0) + float(gateway_due or 0)
-         payment_label = "رایگان ویژه ادمین" if user_id in ADMIN_IDS else f"{gateway_method} + کیف پول ${float(wallet_used or 0):.2f}"
-         server_db_id=await _save_purchase(user_id,server,server_name,ip,root_password,image,data,float(price),expires,ptype,provider_id,charge_wallet=False,order_amount=0.0 if user_id in ADMIN_IDS else float(price),payment_method=payment_label,report_amount=report_amount)
+        payment_label = "رایگان ویژه ادمین" if user_id in ADMIN_IDS else f"{gateway_method} + کیف پول ${float(wallet_used or 0):.2f}"
+        server_db_id=await _save_purchase(user_id,server,server_name,ip,root_password,image,data,float(price),expires,ptype,provider_id,charge_wallet=False,order_amount=0.0 if user_id in ADMIN_IDS else float(price),payment_method=payment_label,report_amount=report_amount)
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE web_server_orders SET status='completed',server_db_id=? WHERE id=?",(server_db_id,order_id)); await db.commit()
         return server_db_id
