@@ -1293,6 +1293,13 @@ async def server_renew_do(request: Request, server_id: int):
         except Exception as exc:
             power_on_error = str(exc)[:250]
             core.logger.exception("Admin renewal succeeded but powering server %s on failed", server_id)
+    if owner_id is not None:
+        await core.notify_admins_sale(
+            "تمدید سرور", f"panel-renew:{server_id}:{expires_at}", owner_id, f"سرور #{server_id}",
+            0.0 if admin_free_renewal else monthly_price,
+            "رایگان ویژه ادمین" if admin_free_renewal else "کیف پول",
+            f"مدت: {core.RENEWAL_PERIOD_DAYS} روز | تمدید از پنل مدیریت"
+        )
     if owner_id is not None and monthly_price > 0 and core.BOT_TOKEN:
         try:
             bot_client = Bot(token=core.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -2774,7 +2781,7 @@ async def admin_server_purchase_do(request: Request):
             root_password = "از طریق پنل مدیریت امکان تغییر رمز وجود دارد"
         ip = core.extract_server_ip(provider, server)
         expires_at = (datetime.utcnow() + timedelta(days=30)).isoformat()
-        server_db_id = await core._save_purchase(user_id, server, server_name, ip, root_password, image_id, {"location": location, "plan_title": plan[1]}, price, expires_at, provider, provider_id, charge_wallet=False, order_amount=charged_price)
+        server_db_id = await core._save_purchase(user_id, server, server_name, ip, root_password, image_id, {"location": location, "plan_title": plan[1]}, price, expires_at, provider, provider_id, charge_wallet=False, order_amount=charged_price, payment_method="رایگان ویژه ادمین" if admin_free else "کیف پول (خرید از پنل)", report_amount=charged_price)
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("UPDATE admin_wallet_actions SET action=?,details=? WHERE reference=?", ("server_purchase_free" if admin_free else "server_purchase", f"server_db_id={server_db_id};remote_id={server.get('id')};plan_id={plan_id};provider={provider};location={location};admin_free={int(admin_free)};balance_after={balance_after:.6f}", reference))
