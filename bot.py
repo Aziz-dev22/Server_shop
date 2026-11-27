@@ -1724,7 +1724,7 @@ async def notify_admins_sale(sale_type, order_id, user_id, title, amount_usd, pa
             f"مشتری: {customer}\n"
             f"شناسه تلگرام: <code>{int(user_id or 0)}</code>\n"
             f"محصول / پلن: {html.escape(str(title or '-'))}\n"
-            f"مبلغ ثبت‌شده: <b>\${amount:.2f}</b>\n"
+            f"مبلغ ثبت‌شده: <b>{amount:.2f} USD</b>\n"
             f"روش پرداخت: {html.escape(str(payment_method or '-'))}\n"
             + (f"جزئیات: {html.escape(str(details))}\n" if details else "")
             + f"زمان ایران: {stamp_text}"
