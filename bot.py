@@ -301,6 +301,18 @@ async def _safe_add_column(db, table, coldef):
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
+        seed = await (await db.execute("SELECT value FROM settings WHERE key='account_rules_button_seeded'")).fetchone()
+        if not seed or seed[0] != "1":
+            await db.execute(
+                "INSERT INTO dynamic_buttons(menu_key,label,action,payload,sort_order,active,created_at) VALUES(?,?,?,?,?,1,?)",
+                ("account_shop", "📜 قوانین خرید اکانت", "text",
+                 "قوانین خرید اکانت هنوز توسط مدیریت تکمیل نشده است. لطفاً پیش از خرید، با پشتیبانی هماهنگ کنید.",
+                 0, datetime.utcnow().isoformat())
+            )
+            await db.execute(
+                "INSERT INTO settings(key,value) VALUES('account_rules_button_seeded','1') "
+                "ON CONFLICT(key) DO UPDATE SET value='1'"
+            )
         await db.execute("CREATE INDEX IF NOT EXISTS idx_coupon_redemptions_coupon ON coupon_redemptions(coupon_id,status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_coupon_redemptions_user ON coupon_redemptions(coupon_id,user_id,status)")
         # کد کمپین CLOUD7 واحد است و برای خرید و تمدید سرور معتبر می‌ماند.
@@ -2098,7 +2110,7 @@ async def run_dynamic_button_action(action: str, payload: str, user_id: int, mes
                 support_message = await get_setting(db, "support_message", "")
             if enabled == "1":
                 await state.set_state(SupportTicket.waiting)
-                await message.answer("پیام خود را برای تیم پشتیبانی بنویسید:" + (f"\n\n{support_message}" if support_message else ""))
+                await message.answer("پیام خود را برای تیم پشتیبانی بنویسید:" + (f"\\n\\n{support_message}" if support_message else ""))
             else:
                 await message.answer(support_message or "سیستم تیکت در حال حاضر غیرفعال است.")
         return
@@ -2109,9 +2121,7 @@ async def run_dynamic_button_action(action: str, payload: str, user_id: int, mes
         buttons = [[InlineKeyboardButton(text=f"📂 {name}", callback_data=f"tgcat_{cid}")] for cid,name in cats]
         buttons += [[InlineKeyboardButton(text=f"🛍 {name[:24]} · ${float(price):.2f}", callback_data=f"tgprod_{pid}")] for pid,name,price,stock in products]
         buttons += dynamic_inline_rows("account_shop")
-        buttons += dynamic_inline_rows("account_shop")
-    buttons += dynamic_inline_rows("account_shop")
-    buttons.append([InlineKeyboardButton(text="📦 سفارش‌های دیجیتال من", callback_data="tg_my_product_orders")])
+        buttons.append([InlineKeyboardButton(text="📦 سفارش‌های دیجیتال من", callback_data="tg_my_product_orders")])
         await message.answer("🛍 فروشگاه اکانت", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
         return
     if action == "stock":
@@ -2119,7 +2129,7 @@ async def run_dynamic_button_action(action: str, payload: str, user_id: int, mes
             rows = await (await db.execute("SELECT name,stock FROM products WHERE active=1 ORDER BY name LIMIT 50")).fetchall()
         lines = ["📦 موجودی محصولات:"]
         lines.extend(f"• {html.escape(str(name))}: {int(stock or 0)} عدد" for name,stock in rows)
-        await message.answer("\n".join(lines) if rows else "محصول فعالی ثبت نشده است.")
+        await message.answer("\\n".join(lines) if rows else "محصول فعالی ثبت نشده است.")
         return
     if action == "wallet":
         async with aiosqlite.connect(DB_PATH) as db:
@@ -2136,7 +2146,7 @@ async def run_dynamic_button_action(action: str, payload: str, user_id: int, mes
             count = await (await db.execute("SELECT COUNT(*) FROM servers WHERE user_id=?", (user_id,))).fetchone()
         if user:
             buttons = dynamic_inline_rows("profile") + [[InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_main")]]
-            await message.answer(f"👤 پروفایل شما\nشناسه تلگرام: {user_id}\nنام: {user[1] or user[0] or '-'}\nموجودی: {fmt_price(user[2])}\nتعداد سرورها: {count[0]}", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+            await message.answer(f"👤 پروفایل شما\\nشناسه تلگرام: {user_id}\\nنام: {user[1] or user[0] or '-'}\\nموجودی: {fmt_price(user[2])}\\nتعداد سرورها: {count[0]}", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
         return
     if action == "servers":
         async with aiosqlite.connect(DB_PATH) as db:
@@ -3635,6 +3645,7 @@ async def telegram_shop(message: Message):
                 await db.execute("INSERT INTO customer_web_tokens(token_hash,telegram_id,redirect_path,expires_at) VALUES(?,?,?,?)", (hashlib.sha256(raw.encode()).hexdigest(),message.from_user.id,f"/shop/{pid}",(datetime.utcnow()+timedelta(minutes=15)).isoformat()))
                 await db.commit()
             buttons.append([InlineKeyboardButton(text="💳 پرداخت ترکیبی / درگاه", url=f"{base}/auth/telegram/link/{raw}")])
+    buttons += dynamic_inline_rows("account_shop")
     buttons.append([InlineKeyboardButton(text="📦 سفارش‌های دیجیتال من", callback_data="tg_my_product_orders")])
     await message.answer("🛍 فروشگاه اکانت\nدسته‌بندی‌ها حتی در صورت اتمام موجودی نیز نمایش داده می‌شوند:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
@@ -3651,6 +3662,7 @@ async def telegram_category_products(call: CallbackQuery):
         await call.answer("دسته‌بندی پیدا نشد", show_alert=True); return
     buttons = [[InlineKeyboardButton(text=f"🛍 {name[:24]} · ${float(price):.2f}", callback_data=f"tgprod_{pid}")] for pid,name,price,stock in rows]
     if not buttons: buttons = []
+    buttons += dynamic_inline_rows("account_shop")
     buttons.append([InlineKeyboardButton(text="🔙 بازگشت به دسته‌بندی‌ها", callback_data="tg_shop_home")])
     await call.message.edit_text(f"📂 {cat[0]}\nمحصولات موجود:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await call.answer()
@@ -3671,6 +3683,7 @@ async def telegram_shop_home_callback(call: CallbackQuery):
                 await db.execute("INSERT INTO customer_web_tokens(token_hash,telegram_id,redirect_path,expires_at) VALUES(?,?,?,?)", (hashlib.sha256(raw.encode()).hexdigest(),call.from_user.id,f"/shop/{pid}",(datetime.utcnow()+timedelta(minutes=15)).isoformat()))
                 await db.commit()
             buttons.append([InlineKeyboardButton(text="💳 پرداخت ترکیبی / درگاه", url=f"{base}/auth/telegram/link/{raw}")])
+    buttons += dynamic_inline_rows("account_shop")
     buttons.append([InlineKeyboardButton(text="📦 سفارش‌های دیجیتال من", callback_data="tg_my_product_orders")])
     await call.message.edit_text("🛍 فروشگاه اکانت", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await call.answer()
@@ -3692,6 +3705,7 @@ async def telegram_product_detail(call: CallbackQuery):
     need=round(float(row[2]),2)
     base=os.getenv("PUBLIC_BASE_URL","").rstrip("/")
     buttons=[[InlineKeyboardButton(text=("🎁 خرید رایگان (مدیر)" if is_admin(call.from_user.id) else f"💰 خرید با کیف پول (${need:.2f})"),callback_data=f"tg_buy_{pid}")]]
+    buttons += dynamic_inline_rows("account_shop")
     if base:
         raw=secrets.token_urlsafe(24)
         async with aiosqlite.connect(DB_PATH) as db:
@@ -3891,7 +3905,7 @@ async def my_servers_list_callback(call: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🖥 {str(r[1] or 'سرور')} · {str(r[2] or '-')} · #{r[0]}", callback_data=f"svshow_{r[0]}")]
         for r in servers
-    ] + [[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="back_main")]])
+    ] + dynamic_inline_rows("servers") + [[InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="back_main")]])
     await call.message.edit_text("🖥 سرورهای شما\nیک سرور را برای مدیریت انتخاب کنید:", reply_markup=kb)
     await call.answer()
 
